@@ -221,6 +221,7 @@ def make_env(prof = None, **gen_kwargs):
         split = 2,
         n_modules = 5,
         version = "0.0.0",
+        revision = "abc1234 2026-10-10",
         lib_path = "/nowhere",
         torch_version = torch.__version__,
         model_path = "/nowhere/model",
@@ -247,6 +248,7 @@ def test_whole_report_on_a_generator_that_computes_the_same_staggered():
     text = sb.measure(env, ARGS)
 
     assert "**Attenzione**" not in text
+    assert "- Banco di prova: `stagger_bench.py` al commit abc1234 2026-10-10" in section(text, "Condizioni")
     summary = section(text, "Sintesi")
     for n in (2, 3, 4):
         assert f"\n| {n} | " in summary
@@ -263,7 +265,7 @@ def test_whole_report_on_a_generator_that_computes_the_same_staggered():
     assert len(rows) == 3 * (2 + 3 + 4)
     for row in rows:
         cells = [c.strip() for c in row.strip("|").split("|")]
-        assert cells[2:] == ["40", "40", "0", "-", "0 (identici)", "0.00000"], row
+        assert cells[2:] == ["40", "40", "0", "-", "-", "0 (identici)", "0.00000"], row
 
     # Brackets per call and card, as filed
     prof = section(text, "Dove va il tempo")
@@ -292,9 +294,10 @@ def test_a_different_staggered_computation_shows_in_the_check():
             assert cells[3] == "36"
             assert cells[4] == "4 (primo all'indice 0)"
             assert cells[5] == "0.2400"
-            assert cells[6] == "0.2500"
+            assert cells[6] == "0"                  # the probabilities differ from the first position
+            assert cells[7] == "0.2500"
         elif "rifatto" in cells[1] or "un batch contro" in cells[1]:
-            assert cells[2:] == ["40", "40", "0", "-", "0 (identici)", "0.00000"], line
+            assert cells[2:] == ["40", "40", "0", "-", "-", "0 (identici)", "0.00000"], line
 
 
 def test_a_failed_phase_is_reported_and_the_rest_survives():
@@ -326,6 +329,7 @@ def test_compare_forced():
            "tokens": {"a": [1, 3, 5]}}
     c = sb.compare_forced(ref, run, "a")
     assert c["n"] == 3 and c["flips"] == 1 and c["first_flip"] == 1 and c["on_top"] == 2
+    assert c["first_delta"] == 1
     assert c["max"] == pytest.approx(0.1) and c["mean"] == pytest.approx(0.1 / 3)
     assert c["margin"] == pytest.approx(0.05)
     assert sb.compare_forced(ref, {"probs": {}, "top": {}, "tokens": {}}, "a") is None
@@ -456,3 +460,8 @@ def test_stage_devices_are_the_cards_on_either_side_of_the_boundary():
     assert (d0.type, d0.index, d1.type, d1.index) == ("cuda", 0, "cuda", 1)
     d0, d1 = sb.stage_devices(torch, model, None)
     assert d0.index == 0 and d1 is None
+
+
+def test_the_bench_names_its_own_commit():
+    rev = sb.bench_revision()
+    assert rev and "\n" not in rev

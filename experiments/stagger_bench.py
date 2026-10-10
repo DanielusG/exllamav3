@@ -284,6 +284,26 @@ class StreamProf:
         return out
 
 
+def bench_revision() -> str:
+    """The commit of the checkout this file is in, for the report: a report must say which
+    bench wrote it (a checkout that was not updated runs the old one without a word)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(
+            ["git", "-C", here, "log", "-1", "--format=%h %cs"],
+            capture_output = True, text = True, timeout = 5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            dirty = subprocess.run(
+                ["git", "-C", here, "status", "--porcelain", "--", os.path.basename(__file__)],
+                capture_output = True, text = True, timeout = 5,
+            ).stdout.strip()
+            return out.stdout.strip() + (" (file modificato rispetto al commit)" if dirty else "")
+    except Exception:
+        pass
+    return "sconosciuto"
+
+
 def split_modules(model) -> list:
     """The MoE layers with a dynamic expert placement (empty without one)."""
     ip = getattr(getattr(model, "config", None), "infer_params", None)
@@ -473,9 +493,10 @@ class Bench:
 def compare_forced(ref: dict, run: dict, name: str):
     """
     One job of a forced run against the same job of a reference run (same forced tokens):
-    how far the probability of the forced token moved, in how many positions the most likely
-    token changed and how wide the reference's lead was where it did, and in how many positions
-    of the run the forced token is the most likely one. None when either run recorded nothing.
+    from which position and how far the probability of the forced token moved, in how many
+    positions the most likely token changed and how wide the reference's lead was where it did,
+    and in how many positions of the run the forced token is the most likely one. None when
+    either run recorded nothing.
     """
     p_r, p_x = ref["probs"].get(name, []), run["probs"].get(name, [])
     t_r, t_x = ref["top"].get(name, []), run["top"].get(name, [])
@@ -487,6 +508,7 @@ def compare_forced(ref: dict, run: dict, name: str):
     flips = [i for i in range(n) if t_r[i][0][0] != t_x[i][0][0]]
     return {
         "n": n,
+        "first_delta": next((i for i, d in enumerate(delta) if d != 0.0), None),
         "max": max(delta),
         "mean": statistics.fmean(delta),
         "flips": len(flips),
@@ -553,7 +575,7 @@ TIMING_HEADER = [
 
 def check_row(name: str, label: str, c) -> list:
     if c is None:
-        return [name, label, "nessun dato", "-", "-", "-", "-", "-"]
+        return [name, label, "nessun dato", "-", "-", "-", "-", "-", "-"]
     return [
         name,
         label,
@@ -561,6 +583,7 @@ def check_row(name: str, label: str, c) -> list:
         c["on_top"],
         c["flips"] if not c["flips"] else f"{c['flips']} (primo all'indice {c['first_flip']})",
         fmt(c["margin"], 4),
+        "-" if c["first_delta"] is None else c["first_delta"],
         "0 (identici)" if c["max"] == 0 else f"{c['max']:.4f}",
         f"{c['mean']:.5f}",
     ]
@@ -568,7 +591,7 @@ def check_row(name: str, label: str, c) -> list:
 
 CHECK_HEADER = [
     "job", "confronto", "posizioni", "token imposto più probabile", "top-1 cambiati",
-    "margine massimo dove cambia", "scarto massimo di p", "scarto medio di p",
+    "margine massimo dove cambia", "prima posizione con p diversa", "scarto massimo di p", "scarto medio di p",
 ]
 
 
@@ -774,6 +797,8 @@ def measure(env, args, gpu = None) -> str:
         "- **token imposto più probabile**: in quante posizioni del giro in esame il token imposto è anche il più probabile\n"
         "- **top-1 cambiati**: posizioni in cui il token più probabile non è lo stesso nei due giri\n"
         "- **margine massimo dove cambia**: tra quelle posizioni, il distacco più grande tra primo e secondo token nel riferimento\n"
+        "- **prima posizione con p diversa**: la prima posizione in cui la probabilità del token imposto non è "
+        "identica, bit per bit, nei due giri (`-` quando lo è ovunque)\n"
         "- **scarto di p**: differenza, in valore assoluto, tra i due giri della probabilità del token imposto\n\n"
         + ("\n\n".join(check_parts) if check_parts else "Nessun confronto completato.")
     )
@@ -827,6 +852,7 @@ def measure(env, args, gpu = None) -> str:
     head += [
         "## Condizioni",
         "",
+        f"- Banco di prova: `{os.path.basename(__file__)}` al commit {env.revision}",
         f"- ExLlamaV3 {env.version} da `{env.lib_path}`, torch {env.torch_version}",
         f"- Modello `{env.model_path}`",
         f"- Schede: {', '.join(env.devices) if env.devices else '-'}",
@@ -895,6 +921,9 @@ def main():
             "installa il fork nell'ambiente (pip install -e) e riprova."
         )
 
+    revision = bench_revision()
+    print(f" -- bench: {os.path.basename(__file__)} at commit {revision}; phases: expert placement, warm-up, "
+          "speed, same computation (forced tokens), where the time goes", flush = True)
     cfg = parse_args(server_argv)
     container = ModelContainer(cfg)
     container.load_model_sync()
@@ -957,6 +986,7 @@ def main():
         split = split,
         n_modules = len(model.fwd_modules),
         version = exl3_version,
+        revision = revision,
         lib_path = os.path.dirname(exllamav3.__file__),
         torch_version = torch.__version__,
         model_path = cfg.model_path,
