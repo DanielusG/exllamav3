@@ -231,6 +231,24 @@ def decode_rate(rec: dict, name: str, t0: float, t1: float):
     return n / (t1 - t0), n
 
 
+def longest_pause(rec: dict, name: str, t0: float, t1: float) -> float:
+    """Longest time `name` went without a new token between two times, the ends included (a
+    window in which it got nothing is one pause as long as the window). The stamps are the ends
+    of the iterations, which is when a client gets the tokens."""
+    seen = tokens_at(rec, name, t0)
+    last, worst = t0, 0.0
+    for when, toks in rec["timeline"]:
+        if when <= t0:
+            continue
+        if when > t1:
+            break
+        n = toks.get(name, 0)
+        if n > seen:
+            worst = max(worst, when - last)
+            last, seen = when, n
+    return max(worst, t1 - last)
+
+
 def whole_rate(rec: dict, name: str):
     """Tokens per second of `name` from its first token to its last, alone in the run."""
     stamps = [(t, toks.get(name, 0)) for t, toks in rec["timeline"] if toks.get(name, 0) > 0]
@@ -475,6 +493,7 @@ def measure(env, args, gpu = None) -> str:
         s = rec["side"]
         detail.append([
             label, w["chunks"], n, fmt(1000 * w["seconds"] / max(n, 1), 1) if n else "-",
+            fmt(1000 * longest_pause(rec, DECODER, w["t0"], w["t1"]), 0),
             s["beside"], s["decode_steps"], fmt(s["t_chunks"]), fmt(rec["hit"], 3),
             " + ".join(f"{u:.0f}%" for u, _, _ in g) if g else "-", fmt(sum(w_ for _, w_, _ in g), 0) if g else "-",
         ])
@@ -482,8 +501,10 @@ def measure(env, args, gpu = None) -> str:
         sections.append(
             "## La finestra di ingestione\n\nDall'accodamento di `b` al suo primo token, con `a` che genera. «Come oggi» è "
             "la libreria senza il thread: un passo di decode dopo ogni pezzo di prompt. «Col thread» i passaggi del pezzo "
-            "girano sul secondo thread e il decode continua accanto.\n\n" + table(
-                ["modo", "pezzi di prompt", "token di `a` nella finestra", "ms per token di `a`", "pezzi con decode accanto",
+            "girano sul secondo thread e il decode continua accanto. La pausa più lunga è il tempo massimo passato "
+            "senza un token nuovo per `a` dentro la finestra.\n\n" + table(
+                ["modo", "pezzi di prompt", "token di `a` nella finestra", "ms per token di `a`",
+                 "pausa più lunga di `a` (ms)", "pezzi con decode accanto",
                  "passi di decode accanto ai pezzi", "secondi di passaggi sul thread", "selezioni servite dalla VRAM",
                  "uso delle schede", "W"], detail,
             )

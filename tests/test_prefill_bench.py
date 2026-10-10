@@ -154,6 +154,12 @@ def test_reading_a_run():
     # Between the enqueue of b and its first token a went from 4 to 9 tokens
     assert PB.decode_rate(rec, "a", w["t0"], w["t1"]) == (2.5, 5)
     assert PB.whole_rate(rec, "a") == (11 - 2) / 4.0
+    # a got tokens at 3.0 and 4.0: a second without one from b's enqueue, then another
+    assert PB.longest_pause(rec, "a", w["t0"], w["t1"]) == 1.0
+    # the ends count: nothing new for a between 2.1 and 2.9, and b never waits less than its window
+    assert PB.longest_pause(rec, "a", 2.1, 2.9) == pytest.approx(0.8)
+    assert PB.longest_pause(rec, "b", 0.5, 4.0) == 3.5
+    assert PB.longest_pause(rec, "a", 0.5, 5.0) == 1.0
     assert PB.ingestion(rec, "c") is None
 
 
@@ -239,8 +245,11 @@ def test_the_report(env):
     # fit beside each chunk
     assert 8 <= int(today[2]) <= 2 * 8 + 4
     assert int(thread[2]) >= 8 * 5
-    assert (today[4], today[5]) == ("0", "0")
-    assert thread[4] == "8" and int(thread[5]) >= 8 * 5
+    assert (today[5], today[6]) == ("0", "0")
+    assert thread[5] == "8" and int(thread[6]) >= 8 * 5
+    # The longest wait of the decoder for a token: a number in both rows (the toy's steps take
+    # no time to speak of; test_reading_a_run has the arithmetic)
+    assert float(today[4]) >= 0 and float(thread[4]) >= 0
 
     check = rows_of(report, "## Stesso calcolo")
     assert len(check) == 7

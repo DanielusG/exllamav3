@@ -161,9 +161,13 @@ What it does not do, and what would:
 - Any host wait for a stream is a wait for both threads' kernels on that card.
 - `EXL3_MOE_CPU_SLOTS` (4) is split 2 for the decode and the rest for the prefill, whose window
   of outstanding jobs was 4: set 6 to keep it.
-- In the server: `--decode-slice-ms 0` with it (the gate on `job.prefill` is passed by), and
-  `tests/test_time_slice.py::test_upstream_still_offers_the_points_the_gate_hooks_into` looks
-  for the prefill call inside `iterate` (now in `_prefill_round`).
+- In the server (`--prefill-thread`, rule 24 of its `AGENTS.md`): the worker asks for the
+  thread only of a library that has `Generator.prefill_thread_state`, reads that state at
+  every iteration (off, pending, on, unavailable; `prefill_thread_reason` says why not) and,
+  while the thread is at work, opens no decode window and keeps the long chunk: the thread's
+  chunks are planned through `job._prefill_co`, so the gate it puts on `job.prefill` would
+  hold nothing. Its tests read these points off the fork's sources
+  (`tests/moe_harness/build.sh <this checkout> flash-next <dir>` in the server's repo).
 
 Tests (no GPU, no extension): `tests/test_prefill_thread.py` (the real round over the toy model
 of the staggered tests, chunks that last a given number of decode steps: same tokens as inline,
@@ -174,7 +178,8 @@ issue and collect code against a model of streams, flags and the worker's ring),
 Bench on the real model: `experiments/prefill_bench.py` (server stopped, same arguments as the
 server, report in Markdown): one job generating while another ingests a document, as upstream
 and with the thread, against each alone; forced-token probabilities of both jobs against the
-upstream path; memory of the cards.
+upstream path; the longest time the generating job went without a token during the ingestion;
+memory of the cards.
 
 First run on the machine (2026-10-10, bench at ad6dfa4, 8289-token document, chunks of 2048):
 
