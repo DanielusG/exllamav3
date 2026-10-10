@@ -618,6 +618,7 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
     }
     g._side = None
     g._side_ok = None
+    g._side_why = None
     g._side_lane = None
     g._side_pool = None
     g._side_turn = 0

@@ -445,6 +445,28 @@ def test_not_available_with_tensor_parallelism(capsys):
     assert lines == [" !! Prefill thread not available: tensor-parallel model"]
 
 
+def test_the_state_tells_a_server_where_ingestion_runs():
+    # Off: as upstream, whatever the model
+    out, g, _, _ = drive(False, PLAN)
+    assert (g.prefill_thread_state, g.prefill_thread_reason) == ("off", None)
+
+    # Asked for: nothing is set up before the first round, then the thread is at work
+    g = make_generator()
+    g.prefill_thread = True
+    assert (g.prefill_thread_state, g.prefill_thread_reason) == ("pending", None)
+    out, g, _, _ = drive(True, PLAN)
+    assert (g.prefill_thread_state, g.prefill_thread_reason) == ("on", None)
+
+    # Asked for with a model that cannot: the generator ingests inline and says why
+    out, g, _, _ = drive(True, PLAN, slots = 1)
+    assert g.prefill_thread_state == "unavailable"
+    assert g.prefill_thread_reason == "the CPU expert worker has a single slot (EXL3_MOE_CPU_SLOTS)"
+
+    # Turned off at run time
+    g.prefill_thread = False
+    assert g.prefill_thread_state == "off"
+
+
 def test_the_log_says_what_ran_beside_the_decode(capsys):
     _, g, _, _ = drive(True, PLAN)
     lines = [l for l in capsys.readouterr().out.splitlines() if "Prefill thread" in l]

@@ -300,6 +300,7 @@ class Generator:
         }
         self._side = None
         self._side_ok = None
+        self._side_why = None
         self._side_lane = None
         self._side_pool = None
         self._side_turn = 0
@@ -1238,8 +1239,34 @@ class Generator:
                 print(f" -- Prefill thread: on{extra}", flush = True)
             else:
                 print(f" !! Prefill thread not available: {why}", flush = True)
+            self._side_why = why
             self._side_ok = ok = why is None
         return ok
+
+
+    @property
+    def prefill_thread_state(self) -> str:
+        """
+        Where prompt ingestion runs, for whoever holds the generator (a server that has its
+        own answer to a prefill stalling a decode needs to know which of the two is at work):
+
+          - "off": on the generator's thread, as upstream;
+          - "pending": asked for, and the first round has yet to set the thread up;
+          - "on": on the prefill thread (_prefill_round);
+          - "unavailable": asked for, but not with this model (prefill_thread_reason says
+            why); the generator behaves as upstream.
+        """
+        if not self.prefill_thread:
+            return "off"
+        if self._side_ok is None:
+            return "pending"
+        return "on" if self._side_ok else "unavailable"
+
+
+    @property
+    def prefill_thread_reason(self) -> str | None:
+        """Why the prefill thread is not available, None when it is or is not known yet."""
+        return self._side_why
 
 
     def _side_start(self, job, results: list) -> bool:
