@@ -7,8 +7,9 @@ dice quanti token al secondo riceve `a` in quella finestra e quanto dura l'inges
 nei due modi (come oggi: un passo di decode per ogni pezzo di prefill; col thread: il decode
 continua accanto al pezzo), contro ciascuno dei due da solo. Poi controlla che il calcolo sia
 lo stesso: con token imposti, le probabilità di `a` accanto a un prefill contro `a` da solo, e
-quelle di `b` dopo un prompt ingerito accanto a un decode contro lo stesso prompt ingerito come
-oggi.
+quelle di `b` dopo un prompt ingerito sul thread (da solo, e accanto a un decode) contro lo
+stesso prompt ingerito come oggi. Ogni confronto ha accanto lo stesso giro ripetuto come oggi:
+quanto cambiano i numeri da soli è il metro.
 
 Si lancia a server FERMO, dalla directory del server, con gli stessi argomenti del server (il
 modello viene caricato come lo carica lui):
@@ -23,7 +24,9 @@ Il file di piazzamento degli esperti del server non viene scritto.
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import statistics
 import sys
 import time
 import traceback
@@ -31,7 +34,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stagger_bench import (     # noqa: E402
-    PROMPTS, GpuSampler, bench_revision, compare_forced, fmt, hit_rate, long_prompt,
+    PROMPTS, GpuSampler, bench_revision, fmt, hit_rate, long_prompt,
     placement_counts, placement_maps, table,
 )
 
@@ -49,16 +52,28 @@ class Runner:
     def __init__(self, env):
         self.env = env
 
-    def reset_cache(self):
-        """Forget every cached prompt page, so that the next run ingests its prompt again."""
+    def forget_prompts(self):
+        """
+        Make the next run ingest its prompts from their first token. A recurrent model resumes
+        a cached prompt only from a page with a stashed state checkpoint, so dropping every
+        checkpoint is enough; it goes through the library's own prune, with a page table that
+        calls them all stranded. The page table itself is left alone (the first report of this
+        bench reset it before every run, and two identical runs then differed: whether the
+        reset was why is not known, so it is gone).
+        """
         gen = self.env.gen
         assert not gen.num_remaining_jobs()
-        gen.pagetable.reset_page_table()
         rc = getattr(gen, "recurrent_cache", None)
-        if rc is not None:
+        if rc is None:
+            return
+        real = rc.pagetable
+        rc.pagetable = SimpleNamespace(is_resumable = lambda key: False)
+        try:
             rc.prune_stranded()
+        finally:
+            rc.pagetable = real
 
-    def run(self, thread: bool, decoder: dict | None, reader: dict | None, lead: int = 0, reset: bool = True):
+    def run(self, thread: bool, decoder: dict | None, reader: dict | None, lead: int = 0):
         """
         decoder / reader: dict(ids, max_new, forced = None). The decoder starts at once; the
         reader is enqueued once the decoder has generated `lead` tokens (at once without a
@@ -67,8 +82,7 @@ class Runner:
         """
         env = self.env
         torch, gen = env.torch, env.gen
-        if reset:
-            self.reset_cache()
+        self.forget_prompts()
         gen.prefill_thread = thread
         side0 = dict(gen.side_stats)
         counts0 = placement_counts(torch, env.model)
@@ -226,30 +240,80 @@ def whole_rate(rec: dict, name: str):
     return (n_b - n_a) / max(t_b - t_a, 1e-9)
 
 
-def cut(rec: dict, name: str, n: int) -> dict:
-    """The run with the tokens of `name` cut to the first n positions (compare_forced)."""
-    out = dict(rec)
-    for key in ("tokens", "probs", "top"):
-        out[key] = dict(rec[key])
-        out[key][name] = rec[key][name][:n]
-    return out
+def compare(ref: dict, run: dict, name: str, upto: int | None = None):
+    """
+    One job of a forced run against the same job of a reference run (same forced tokens), over
+    the first `upto` positions: how many probabilities of the run are not finite, from which
+    position and how far the probability of the forced token moved, in how many positions the
+    most likely token changed. None when either run recorded nothing.
+    """
+    p_r, p_x = ref["probs"].get(name, []), run["probs"].get(name, [])
+    t_r, t_x = ref["top"].get(name, []), run["top"].get(name, [])
+    n = min(len(p_r), len(p_x), len(t_r), len(t_x))
+    if upto is not None:
+        n = min(n, upto)
+    if n <= 0:
+        return None
+    bad = [i for i in range(n) if not (math.isfinite(p_x[i]) and math.isfinite(p_r[i]))]
+    good = [i for i in range(n) if math.isfinite(p_x[i]) and math.isfinite(p_r[i])]
+    delta = {i: abs(p_r[i] - p_x[i]) for i in good}
+    moved = [i for i in range(n) if i in bad or delta[i] != 0.0]
+    return {
+        "n": n,
+        "nonfinite": len(bad),
+        "first_delta": moved[0] if moved else None,
+        "max": max(delta.values(), default = 0.0),
+        "mean": statistics.fmean(delta.values()) if delta else 0.0,
+        "flips": sum(1 for i in range(n) if t_r[i][0][0] != t_x[i][0][0]),
+    }
+
+
+def verdict(test, floor) -> str:
+    """
+    What a comparison says, given the same run repeated as today (the floor). Identical is
+    identical. Otherwise the comparison can only be as good as the floor: within it when the
+    largest shift is at most twice the floor's and the changed top tokens at most twice the
+    floor's plus two; a floor that is itself identical leaves no room.
+    """
+    if test is None:
+        return "non registrato"
+    if test["nonfinite"]:
+        return f"**valori non finiti** in {test['nonfinite']} posizioni"
+    if test["first_delta"] is None:
+        return "**identico**"
+    if floor is None:
+        return "diverso (manca il giro ripetuto)"
+    if floor["nonfinite"]:
+        return "diverso (il giro ripetuto ha valori non finiti)"
+    if floor["first_delta"] is None:
+        return "**diverso** (il giro ripetuto è identico)"
+    if test["max"] <= 2 * floor["max"] and test["flips"] <= 2 * floor["flips"] + 2:
+        return "entro il rumore di fondo"
+    return "**fuori dal rumore di fondo**"
 
 
 def gib(x):
     return "-" if x is None else f"{x / 1024 ** 3:.2f}"
 
 
-def check_row(label: str, c, extra: str = "") -> list:
+def check_row(label: str, c, said: str) -> list:
     if c is None:
-        return [label, "-", "-", "-", "-", "non registrato" + extra]
-    same = c["first_delta"] is None
+        return [label, "-", "-", "-", "-", "-", "-", said]
     return [
-        label, c["n"],
-        "nessuna" if same else c["first_delta"],
-        "0" if same else f"{c['max']:.2e}",
-        c["flips"],
-        ("**identico**" if same else "**diverso**") + extra,
+        label, c["n"], c["nonfinite"],
+        "nessuna" if c["first_delta"] is None else c["first_delta"],
+        "0" if c["max"] == 0 else f"{c['max']:.2e}",
+        "0" if c["mean"] == 0 else f"{c['mean']:.2e}",
+        c["flips"], said,
     ]
+
+
+def floor_said(c) -> str:
+    if c is None:
+        return "non registrato"
+    if c["nonfinite"]:
+        return f"**valori non finiti** in {c['nonfinite']} posizioni"
+    return "identico" if c["first_delta"] is None else "non identico: è il metro delle righe sotto"
 
 
 # --------------------------------------------------------------------------------------------
@@ -324,20 +388,26 @@ def measure(env, args, gpu = None) -> str:
 
     phase("as today (thread off)", baselines)
 
-    # 3. References of the same-computation check, still with the thread off
+    # 3. References of the same-computation check, still with the thread off: every run that
+    #    will be repeated with the thread, twice as today
     refs = {}
 
     def references():
         tok_a = base["decode"]["tokens"][DECODER]
-        tok_b = base["mix"]["tokens"][READER]
-        if not tok_a or not tok_b:
+        tok_alone = base["prefill"]["tokens"][READER]
+        tok_mix = base["mix"]["tokens"][READER]
+        if not tok_a or not tok_alone or not tok_mix:
             raise RuntimeError("no tokens to force (a baseline run is missing)")
-        refs["tok_a"], refs["tok_b"] = tok_a, tok_b
-        refs["a1"] = run.run(False, dict(ids = a_ids, forced = tok_a, max_new = 0), None)
-        refs["a2"] = run.run(False, dict(ids = a_ids, forced = tok_a, max_new = 0), None)
-        forced_b = dict(ids = b_ids, forced = tok_b, max_new = 0)
-        refs["b1"] = run.run(False, long_a, forced_b, args.bench_lead)
-        refs["b2"] = run.run(False, long_a, forced_b, args.bench_lead)
+        refs["tok_a"], refs["tok_alone"], refs["tok_mix"] = tok_a, tok_alone, tok_mix
+        forced_a = dict(ids = a_ids, forced = tok_a, max_new = 0)
+        refs["a1"] = run.run(False, forced_a, None)
+        refs["a2"] = run.run(False, forced_a, None)
+        alone = dict(ids = b_ids, forced = tok_alone, max_new = 0)
+        refs["alone1"] = run.run(False, None, alone)
+        refs["alone2"] = run.run(False, None, alone)
+        mixed = dict(ids = b_ids, forced = tok_mix, max_new = 0)
+        refs["mix1"] = run.run(False, long_a, mixed, args.bench_lead)
+        refs["mix2"] = run.run(False, long_a, mixed, args.bench_lead)
 
     if "check" in args.bench_phases:
         phase("references of the check (thread off)", references)
@@ -355,10 +425,11 @@ def measure(env, args, gpu = None) -> str:
     checks = {}
 
     def check():
+        checks["alone"] = run.run(True, None, dict(ids = b_ids, forced = refs["tok_alone"], max_new = 0))
         checks["a"] = run.run(True, dict(ids = a_ids, forced = refs["tok_a"], max_new = 0), short_b, args.bench_lead)
-        checks["b"] = run.run(True, long_a, dict(ids = b_ids, forced = refs["tok_b"], max_new = 0), args.bench_lead)
+        checks["mix"] = run.run(True, long_a, dict(ids = b_ids, forced = refs["tok_mix"], max_new = 0), args.bench_lead)
 
-    if "check" in args.bench_phases and refs.get("b2") is not None:
+    if "check" in args.bench_phases and refs.get("mix2") is not None:
         phase("same computation (thread on)", check)
 
     # ---------------------------------------------------------------------------------------
@@ -420,37 +491,62 @@ def measure(env, args, gpu = None) -> str:
 
     if "check" in args.bench_phases:
         rows = []
-        if refs.get("a2") is not None:
-            rows.append(check_row("`a` da solo, ripetuto (rumore di fondo)", compare_forced(refs["a1"], refs["a2"], DECODER)))
+        # The decoder: the positions it generated while `b` was ingesting, against itself alone
+        w = ingestion(checks["a"]) if checks.get("a") is not None else None
+        # (`b` joins the decode batch in the iteration that gives its first token)
+        inside = tokens_before(checks["a"], DECODER, w["t1"]) if w else 0
+        started = tokens_at(checks["a"], DECODER, w["t0"]) if w else 0
+        floor_a = compare(refs["a1"], refs["a2"], DECODER, inside or None) if refs.get("a2") is not None else None
+        rows.append(check_row("`a` da solo, due volte come oggi", floor_a, floor_said(floor_a)))
         if checks.get("a") is not None:
-            w = ingestion(checks["a"])
-            # `b` joins the decode batch in the iteration that gives its first token
-            inside = tokens_before(checks["a"], DECODER, w["t1"]) if w else 0
-            started = tokens_at(checks["a"], DECODER, w["t0"]) if w else 0
             if inside > started:
-                c = compare_forced(cut(refs["a1"], DECODER, inside), cut(checks["a"], DECODER, inside), DECODER)
+                c = compare(refs["a1"], checks["a"], DECODER, inside)
                 rows.append(check_row(
-                    "`a` accanto all'ingestione di `b`, contro `a` da solo", c,
-                    f" (posizioni {started}-{inside} generate durante l'ingestione)",
+                    f"`a` accanto all'ingestione di `b` sul thread, contro `a` da solo (posizioni {started}-{inside} "
+                    "generate durante l'ingestione)", c, verdict(c, floor_a),
                 ))
             else:
                 notes.append("**Attenzione**: nel giro di controllo `a` non ha generato durante l'ingestione di `b`: "
                              "il confronto su `a` manca (alza `--bench-tokens` o `--bench-prompt-tokens`).")
-        if refs.get("b2") is not None:
-            rows.append(check_row("`b` ingerito come oggi, ripetuto (rumore di fondo)", compare_forced(refs["b1"], refs["b2"], READER)))
-        if checks.get("b") is not None:
-            rows.append(check_row("`b` ingerito sul thread accanto ad `a`, contro `b` ingerito come oggi",
-                                  compare_forced(refs["b1"], checks["b"], READER)))
+        # The reader, alone: the thread without any decode beside it
+        floor_alone = compare(refs["alone1"], refs["alone2"], READER) if refs.get("alone2") is not None else None
+        rows.append(check_row("`b` da solo, ingerito due volte come oggi", floor_alone, floor_said(floor_alone)))
+        if checks.get("alone") is not None:
+            c = compare(refs["alone1"], checks["alone"], READER)
+            rows.append(check_row("`b` da solo, ingerito sul thread, contro come oggi", c, verdict(c, floor_alone)))
+        # The reader, with the decoder beside it
+        floor_mix = compare(refs["mix1"], refs["mix2"], READER) if refs.get("mix2") is not None else None
+        rows.append(check_row("`b` accanto ad `a`, ingerito due volte come oggi", floor_mix, floor_said(floor_mix)))
+        if checks.get("mix") is not None:
+            c = compare(refs["mix1"], checks["mix"], READER)
+            rows.append(check_row("`b` accanto ad `a`, ingerito sul thread, contro come oggi", c, verdict(c, floor_mix)))
         sections.append(
             "## Stesso calcolo\n\n"
-            "Token imposti, probabilità del token imposto posizione per posizione. Per `a` il riferimento è `a` da "
-            "solo e si confrontano le posizioni generate prima che `b` entri nel batch (da lì il batch è di due job e "
-            "i numeri cambiano comunque). Per `b` i token sono quelli che ha dato nel giro «insieme, come oggi», "
-            "e in tutti i giri `b` genera accanto ad `a`. Un confronto vale solo se la riga di rumore di fondo "
-            "corrispondente è identica.\n\n" + table(
-                ["confronto", "posizioni", "prima posizione diversa", "scarto massimo di probabilità",
-                 "posizioni col token più probabile cambiato", "esito"], rows,
+            "Token imposti, probabilità del token imposto posizione per posizione. Ogni confronto col thread ha sopra lo "
+            "stesso giro fatto due volte come oggi: se quello non è identico, i numeri cambiano da soli da un giro "
+            "all'altro e il confronto col thread vale quanto quel metro. «Entro il rumore di fondo»: scarto massimo non "
+            "oltre il doppio di quello del giro ripetuto e token più probabili cambiati non oltre il doppio più due. "
+            "Per `a` si confrontano le posizioni generate prima che `b` entri nel batch (da lì il batch è di due job e "
+            "i numeri cambiano comunque). Per `b` i token imposti sono quelli che ha dato nel giro corrispondente come "
+            "oggi; nei giri «accanto ad `a`» `b` genera in batch con `a` in tutti e tre.\n\n" + table(
+                ["confronto", "posizioni", "valori non finiti", "prima posizione diversa", "scarto massimo di probabilità",
+                 "scarto medio", "posizioni col token più probabile cambiato", "esito"], rows,
             )
+        )
+
+    picks = []
+    for label, rec in (("`a` da solo", base.get("decode")), ("`b` da solo, come oggi", base.get("prefill")),
+                       ("insieme, come oggi", base.get("mix")), ("`b` da solo, sul thread", side.get("prefill")),
+                       ("insieme, col thread", side.get("mix"))):
+        if rec is not None:
+            acc, rej = sum(rec["accepted"].values()), sum(rec["rejected"].values())
+            picks.append([label, fmt(rec["hit"], 3), fmt(acc / (acc + rej), 2) if acc + rej else "-",
+                          " + ".join(str(len(rec["tokens"][n])) for n in sorted(rec["tokens"]))])
+    if picks:
+        sections.append(
+            "## I giri\n\nUn'ingestione che calcola bene sceglie gli stessi esperti qualunque sia il thread: la quota "
+            "servita dalla VRAM di un giro col thread deve stare vicino a quella dello stesso giro come oggi.\n\n"
+            + table(["giro", "selezioni servite dalla VRAM", "bozze accettate", "token generati (per job)"], picks)
         )
 
     mem = []
@@ -488,7 +584,8 @@ def measure(env, args, gpu = None) -> str:
         f"- Bozza: {env.draft_desc}",
         f"- `a`: prompt di {int(a_ids.shape[-1])} token; `b`: documento più domanda, {int(b_ids.shape[-1])} token, "
         f"pezzi di {gen.max_chunk_size}; `b` viene accodato dopo {args.bench_lead} token di `a`",
-        "- Prima di ogni giro la cache dei prompt viene azzerata: ogni giro ingerisce il documento da capo",
+        "- Prima di ogni giro i checkpoint di stato vengono scartati: ogni giro ingerisce i suoi prompt dal primo token "
+        "(la tabella delle pagine non viene toccata)",
         "- Il banco non ha le finestre di decode del server (`--decode-slice-ms`): «come oggi» qui è la libreria da sola, "
         "che dà ad `a` un passo per pezzo; in produzione le finestre gliene danno di più, a spese di `b`",
         f"- Slot del worker degli esperti: {slots or '-'}"
@@ -496,6 +593,10 @@ def measure(env, args, gpu = None) -> str:
         f"- Un pezzo gira accanto al decode se ha almeno {gen.side_min_tokens} token e il batch di decode non supera "
         f"{gen.side_max_rows} righe per token; altrimenti il generatore lo aspetta",
         f"- Intervallo di cambio del GIL: {1000 * sys.getswitchinterval():.1f} ms",
+        "- Attese del worker del thread di prefill: " + (
+            "sull'host, con copie e flag su uno stream a parte" if env.host_waits
+            else "**sullo stream del passaggio** (`--bench-no-handoff`): i kernel del decode ci restano dietro, il giro "
+                 "serve solo a dire se lo stream a parte c'entra con un numero sbagliato"),
         "- Campionamento greedy, nessuna condizione di stop; dopo l'adattamento iniziale nessuno sweep del piazzamento",
         "- I tok/s di `a` «mentre `b` ingerisce» contano i token arrivati tra l'accodamento di `b` e il suo primo token",
         "- Uso e potenza delle schede: media dei campioni di `nvidia-smi` nella finestra, saltando il primo mezzo secondo"
@@ -511,7 +612,7 @@ def main():
     ap.add_argument("--bench-tokens", type = int, default = 600, help = "token di `a` nel giro da solo e nel controllo (default 600)")
     ap.add_argument("--bench-decoder-tokens", type = int, default = 6000,
                     help = "tetto ai token di `a` nei giri insieme: deve durare più dell'ingestione di `b` (default 6000)")
-    ap.add_argument("--bench-reader-tokens", type = int, default = 64, help = "token generati da `b` dopo il prompt (default 64)")
+    ap.add_argument("--bench-reader-tokens", type = int, default = 128, help = "token generati da `b` dopo il prompt (default 128)")
     ap.add_argument("--bench-lead", type = int, default = 48, help = "token di `a` prima che `b` venga accodato (default 48)")
     ap.add_argument("--bench-warmup", type = int, default = 48, help = "token del giro di riscaldamento (default 48)")
     ap.add_argument("--bench-adapt", type = int, default = 3, help = "giri al massimo per adattare il piazzamento degli esperti (default 3, 0 = no)")
@@ -519,6 +620,9 @@ def main():
     ap.add_argument("--bench-phases", default = "speed,check", help = "speed (velocità), check (stesso calcolo); default entrambe")
     ap.add_argument("--bench-slots", type = int, default = 0,
                     help = "slot del worker degli esperti (EXL3_MOE_CPU_SLOTS, 3-8); default 0: quelli della libreria (4)")
+    ap.add_argument("--bench-no-handoff", action = "store_true",
+                    help = "le attese del worker del thread di prefill restano sullo stream del passaggio "
+                           "(EXL3_LANE_HOST_WAITS=0): lento, serve a isolare un numero sbagliato")
     ap.add_argument("--bench-switch-ms", type = float, default = 0.0,
                     help = "intervallo di cambio del GIL in millisecondi (default 0: quello di Python, 5 ms)")
     ap.add_argument("--bench-out", default = None, help = "file .md del rapporto")
@@ -539,6 +643,8 @@ def main():
     if args.bench_slots:
         # Read once, when the library is imported
         os.environ["EXL3_MOE_CPU_SLOTS"] = str(args.bench_slots)
+    if args.bench_no_handoff:
+        os.environ["EXL3_LANE_HOST_WAITS"] = "0"
     if args.bench_switch_ms > 0:
         sys.setswitchinterval(args.bench_switch_ms / 1000.0)
 
@@ -636,6 +742,7 @@ def main():
         sweep = sweep,
         slots = slots,
         device_ids = cuda_devices(model, draft_model),
+        host_waits = not args.bench_no_handoff,
         version = exl3_version,
         revision = revision,
         lib_path = os.path.dirname(exllamav3.__file__),

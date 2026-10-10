@@ -41,9 +41,12 @@ def make_env(steps = 5):
     g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
     g.side_min_tokens = CHUNK
     g.max_chunk_size = CHUNK
+    # The checkpoint cache as the bench uses it: pruned with every checkpoint called stranded
     resets = []
-    g.pagetable.reset_page_table = lambda: resets.append(len(resets))
-    g.recurrent_cache = types.SimpleNamespace(prune_stranded = lambda: 0)
+    rc = types.SimpleNamespace(pagetable = g.pagetable)
+    rc.prune_stranded = lambda: resets.append(rc.pagetable.is_resumable("any page"))
+    g.pagetable.is_resumable = lambda key: True
+    g.recurrent_cache = rc
 
     class BenchJob(ToyJob):
         """Job as the bench makes it, over the toy job: forced tokens, probabilities, results
@@ -95,6 +98,7 @@ def make_env(steps = 5):
         sweep = None,
         slots = lambda: "4: 2 per il decode e 2 per il prefill",
         device_ids = [0, 1],
+        host_waits = True,
         version = "0.0.0-test",
         revision = "0000000",
         lib_path = "/lib",
@@ -108,7 +112,7 @@ def make_env(steps = 5):
 
 
 ARGS = types.SimpleNamespace(
-    bench_tokens = 120, bench_decoder_tokens = 2000, bench_reader_tokens = 12, bench_lead = 6, bench_warmup = 8,
+    bench_tokens = 120, bench_decoder_tokens = 4000, bench_reader_tokens = 12, bench_lead = 6, bench_warmup = 8,
     bench_adapt = 0, bench_adapt_tokens = 20, bench_phases = ["speed", "check"],
 )
 
@@ -151,16 +155,49 @@ def test_reading_a_run():
     assert PB.decode_rate(rec, "a", w["t0"], w["t1"]) == (2.5, 5)
     assert PB.whole_rate(rec, "a") == (11 - 2) / 4.0
     assert PB.ingestion(rec, "c") is None
-    short = PB.cut(rec, "a", 3)
-    assert short["tokens"]["a"] == [0, 1, 2] and len(short["probs"]["a"]) == 3 and short["tokens"]["b"] == [7, 8, 9]
-    assert len(rec["tokens"]["a"]) == 11
+
+
+def forced(probs, tops):
+    return {"probs": {"b": probs}, "top": {"b": [([t, 0], [0.9, 0.1]) for t in tops]}}
+
+
+def test_comparing_two_forced_runs():
+    ref = forced([0.5, 0.25, 0.125, 0.5], [1, 2, 3, 4])
+    assert PB.compare(ref, forced([0.5, 0.25, 0.125, 0.5], [1, 2, 3, 4]), "b") == {
+        "n": 4, "nonfinite": 0, "first_delta": None, "max": 0.0, "mean": 0.0, "flips": 0,
+    }
+    c = PB.compare(ref, forced([0.5, 0.25, 0.375, 0.25], [1, 2, 9, 4]), "b")
+    assert (c["first_delta"], c["max"], c["mean"], c["flips"], c["nonfinite"]) == (2, 0.25, 0.125, 1, 0)
+    # Only the first positions (the ones generated before the other job joined the batch)
+    assert PB.compare(ref, forced([0.5, 0.25, 0.375, 0.25], [1, 2, 9, 4]), "b", upto = 2)["first_delta"] is None
+    # A value that is not a number is counted, not folded into a maximum that hides it
+    c = PB.compare(ref, forced([0.5, float("nan"), 0.125, float("inf")], [1, 7, 3, 4]), "b")
+    assert (c["nonfinite"], c["first_delta"], c["max"], c["flips"]) == (2, 1, 0.0, 1)
+    assert PB.compare(ref, forced([], []), "b") is None and PB.compare(ref, ref, "c") is None
+
+
+def test_what_a_comparison_says():
+    same = dict(n = 100, nonfinite = 0, first_delta = None, max = 0.0, mean = 0.0, flips = 0)
+    noisy = dict(n = 100, nonfinite = 0, first_delta = 0, max = 0.04, mean = 0.002, flips = 2)
+    assert PB.verdict(None, same) == "non registrato"
+    assert PB.verdict(same, noisy) == "**identico**"
+    assert PB.verdict(dict(noisy, nonfinite = 64), noisy) == "**valori non finiti** in 64 posizioni"
+    # A floor that is identical leaves no room
+    assert PB.verdict(noisy, same) == "**diverso** (il giro ripetuto è identico)"
+    # A floor that moves is the measure: twice its largest shift, twice its changed tokens plus two
+    assert PB.verdict(dict(noisy, max = 0.08, flips = 6), noisy) == "entro il rumore di fondo"
+    assert PB.verdict(dict(noisy, max = 0.081), noisy) == "**fuori dal rumore di fondo**"
+    assert PB.verdict(dict(noisy, flips = 7), noisy) == "**fuori dal rumore di fondo**"
+    assert PB.verdict(noisy, None).startswith("diverso (manca")
+    assert PB.floor_said(same) == "identico" and PB.floor_said(noisy).startswith("non identico")
 
 
 def test_a_run_of_the_runner(env):
     run = PB.Runner(env)
     a, b = env.prompts["a"], env.prompts["b"]
     rec = run.run(True, dict(ids = a, max_new = 2000), dict(ids = b, max_new = 12), lead = 6)
-    assert env.resets == [0]
+    # Before the run every checkpoint was pruned as stranded, and the page table was put back
+    assert env.resets == [False] and env.gen.recurrent_cache.pagetable is env.gen.pagetable
     assert len(rec["tokens"]["b"]) == 12 and rec["cancelled"] == ["a"]
     assert not env.gen.num_remaining_jobs()
     # b was enqueued once a had its lead, and its prompt went in eight chunks beside a's decode
@@ -206,10 +243,20 @@ def test_the_report(env):
     assert thread[4] == "8" and int(thread[5]) >= 8 * 5
 
     check = rows_of(report, "## Stesso calcolo")
-    assert len(check) == 5
-    assert all(r[-1].startswith("**identico**") for r in check[1:]), check
-    assert "generate durante l'ingestione" in check[2][-1]
+    assert len(check) == 7
+    # The toy model is repeatable: every floor is identical, and so is every run with the thread
+    assert [r[-1] for r in check[1::2]] == ["identico"] * 3, check
+    assert [r[-1] for r in check[2::2]] == ["**identico**"] * 3, check
+    assert "generate durante l'ingestione" in check[2][0]
     assert int(check[2][1]) >= 8 * 5            # positions of a compared: those inside the window
+    assert check[1][1] == check[2][1]           # ... and the floor is taken over the same ones
+    assert all(r[2] == "0" for r in check[1:])
+
+    runs = rows_of(report, "## I giri")
+    assert [r[0] for r in runs[1:]] == [
+        "`a` da solo", "`b` da solo, come oggi", "insieme, come oggi", "`b` da solo, sul thread", "insieme, col thread",
+    ]
+    assert runs[2][3] == "12" and runs[1][3] == "120"
 
     mem = rows_of(report, "## Memoria delle schede")
     assert mem[0] == ["giro", "picco cuda:0", "picco cuda:1", "libera cuda:0", "libera cuda:1"]
@@ -217,8 +264,9 @@ def test_the_report(env):
 
     assert "Slot del worker degli esperti: 4: 2 per il decode e 2 per il prefill" in report
     assert "almeno 16 token" in report
-    # Every run started from an empty prompt cache
-    assert len(env.resets) >= 12
+    assert "Attese del worker del thread di prefill: sull'host" in report
+    # Every run ingested its prompts again
+    assert len(env.resets) >= 14 and not any(env.resets)
 
 
 def test_a_wrong_number_beside_the_decode_is_reported(env, monkeypatch):
@@ -235,9 +283,31 @@ def test_a_wrong_number_beside_the_decode_is_reported(env, monkeypatch):
     monkeypatch.setattr(toy, "layer_step", layer_step)
     report = PB.measure(env, ARGS)
     check = rows_of(report, "## Stesso calcolo")
-    assert check[1][-1].startswith("**identico**") and check[3][-1].startswith("**identico**")    # the noise floors
-    assert check[2][-1].startswith("**identico**")              # a is not touched
-    assert check[4][-1].startswith("**diverso**"), check[4]     # b ingested on the thread
+    assert [r[-1] for r in check[1::2]] == ["identico"] * 3     # the floors
+    assert check[2][-1] == "**identico**"                       # a is not touched
+    # b ingested on the thread, alone and beside a
+    assert check[4][-1] == check[6][-1] == "**diverso** (il giro ripetuto è identico)", check
+
+
+def test_values_that_are_not_numbers_are_called_that(env, monkeypatch):
+    # What the first run on the real model looked like: after a prompt ingested on the thread
+    # the probabilities were NaN
+    real = env.Job
+
+    class Broken(real):
+        def receive_sample(self, logits, next_token, next_k_tokens, next_k_probs, next_prob, results):
+            out = super().receive_sample(logits, next_token, next_k_tokens, next_k_probs, next_prob, results)
+            if self.return_probs and any(t.startswith("exl3-prefill") for t in self.chunk_threads) \
+                    and len(self.chunk_threads) > 1:
+                results[-1]["token_probs"] = torch.full((1, 1), float("nan"))
+            return out
+
+    env.Job = Broken
+    report = PB.measure(env, ARGS)
+    check = rows_of(report, "## Stesso calcolo")
+    assert check[4][-1] == "**valori non finiti** in 12 posizioni" and check[4][2] == "12"
+    assert check[6][-1] == "**valori non finiti** in 12 posizioni"
+    assert check[2][-1] == "**identico**"       # the decoder's own prompt is one chunk: untouched here
 
 
 def test_a_failed_phase_is_said_and_the_rest_goes_on(env):
