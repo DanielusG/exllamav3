@@ -52,11 +52,14 @@ Measured on the machine (2026-10-10, bench at 91621dd, placement adapted to the 
   to those of each group alone, in every position of every job (9 job comparisons, 400
   positions each). The check is not blind: the same figures tell a job in a batch from the
   job alone (regular decode: the most likely token changes in 2-7 positions out of 400).
-- A staggered call is host-bound: about 15 ms to issue a pass whatever the size of its group,
-  2 ms for the draft step, 2-2.7 ms per job to sample; the cards finish each half as the host
-  finishes issuing it. Hence the threshold: two groups of one job cost two calls for what one
-  batch of two gives in one step of the same length. What moves the figures next is the
-  host's cost per pass.
+- A staggered call is draft step (2 ms), issue (about 15 ms of host time for a pass, whatever
+  the size of its group) and sampling (2-2.7 ms per job); the cards work during the issue and
+  idle in the other two. With groups of one job the host is the limit of the issue too: the
+  cards finish each half as the host finishes issuing it (a half pass of one job is about 12
+  ms of stream time). Hence the threshold: two groups of one job cost two calls for what one
+  batch of two gives in one step of the same length. With groups of two the cards' half pass
+  (about 17 ms) and the host's issue are level, and what the cards still idle, 6-7.5 ms of a
+  23 ms call with 4 jobs, is the draft and sampling phases.
 - The CPU expert worker is out of the way only with a placement that fits the traffic: the
   cards wait for it 2-3 ms per call each at 91% of selections served from VRAM. On the
   placement tuned for production traffic the bench's prompts got 74%, and every multi-job
