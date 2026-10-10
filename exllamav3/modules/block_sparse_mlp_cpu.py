@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
+from ..util.lane import current_lane, lanes_busy
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -624,6 +625,10 @@ class BlockSparseMLP_CPU:
         # when badly overdue (raw model.forward drivers with no generator, e.g. perf.py)
         ip.moe_cpu_swap_pending = True
         if self._swap_tick_count < 4 * interval:
+            return
+        # Not while two threads issue passes (util/lane.py): the sweep quiesces the cards and
+        # rewrites expert slots in place, and the other thread would go on issuing
+        if current_lane() or lanes_busy():
             return
         run_pending_swap_sweeps(ip)
 

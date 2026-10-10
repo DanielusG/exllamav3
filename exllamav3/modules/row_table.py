@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..loader.safetensors import DiskTensorHandle
 from ..ext import exllamav3_ext as ext
+from ..util.lane import current_lane
 
 """
 Row-addressable table behind an embedding module (token embeddings, hashed n-gram embeddings),
@@ -66,8 +67,13 @@ class RowTable:
         self.num_rows = 0
         self.row_words = None       # elements per stored row
         self.row_dtype = None
-        self._pins = []             # pinned staging sets (see _PinSet)
-        self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
+        # Per lane (util/lane.py: threads that issue passes at the same time): the pinned
+        # staging sets (see _PinSet) and the queued prefetches, oldest first: {"ids", "pin",
+        # "future"}. A set is safe to rewrite once the last lookup's uploads from it are done,
+        # which the lookup's own thread knows (its event, or the sync point of its decode
+        # loop) and another thread does not
+        self._lane_pins = {}
+        self._lane_pending = {}
         self._executor = None
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
@@ -138,10 +144,26 @@ class RowTable:
                 del t
             self._set_stores([slab])
 
+    @property
+    def _pins(self) -> list:
+        return self._lane_pins.setdefault(current_lane(), [])
+
+    @_pins.setter
+    def _pins(self, pins: list):
+        self._lane_pins[current_lane()] = pins
+
+    @property
+    def _pending(self) -> list:
+        return self._lane_pending.setdefault(current_lane(), [])
+
+    @_pending.setter
+    def _pending(self, pending: list):
+        self._lane_pending[current_lane()] = pending
+
     def close(self):
         self.drain_prefetch()       # queued workers still read the table; first
         self.stores = None
-        self._pins = []
+        self._lane_pins = {}
 
     def export(self, stc) -> dict:
         """
@@ -202,15 +224,18 @@ class RowTable:
                              os.POSIX_FADV_WILLNEED)
 
     def drain_prefetch(self):
-        for e in list(self._pending):
-            self._retire(e)
+        for pending in list(self._lane_pending.values()):
+            for e in list(pending):
+                self._retire(e)
         if self._executor is not None:
             self._executor.shutdown(wait = True)
             self._executor = None
 
     def _forget(self, entry: dict):
-        # by identity: list.remove would compare the entries' id tensors
-        self._pending = [e for e in self._pending if e is not entry]
+        # by identity: list.remove would compare the entries' id tensors (whichever lane
+        # queued it: drain_prefetch retires them all)
+        for lane, pending in list(self._lane_pending.items()):
+            self._lane_pending[lane] = [e for e in pending if e is not entry]
 
     def _retire(self, entry: dict):
         # Drop a queued prefetch that no lookup will take. Its worker may still be writing the

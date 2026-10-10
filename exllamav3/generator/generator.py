@@ -4,6 +4,7 @@ import os
 import torch
 from ..model.model import Model
 from ..model.forward_cursor import ForwardCursor, DirectForward, cuda_stage_bounds
+from ..util.lane import Lane, cuda_devices
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
@@ -40,6 +41,21 @@ class _Flight:
         self.jobs = jobs
 
 
+class _SidePass:
+    """A chunk of a job's prompt being ingested on the prefill thread (Generator._prefill_round):
+    the job, its prefill coroutine stopped at the chunk's forward passes, the future of those
+    passes, whether decode steps may be taken beside them and how many have been so far."""
+
+    __slots__ = ("job", "step", "future", "beside", "steps")
+
+    def __init__(self, job, step, future, beside):
+        self.job = job
+        self.step = step
+        self.future = future
+        self.beside = beside
+        self.steps = 0
+
+
 class Generator:
 
     def __init__(
@@ -65,6 +81,7 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         stagger_decode: bool = False,
+        prefill_thread: bool = False,
         **kwargs
     ):
         """
@@ -138,6 +155,15 @@ class Generator:
             then returns the tokens of one group. Can be switched at any time (attribute of the same
             name); needs the MTP drafter or no drafter. EXL3_STAGGER_DECODE=1 in the environment
             turns it on for callers that do not pass the argument. See iterate_staggered().
+
+        :param prefill_thread:
+            Run the forward passes of prompt ingestion on a second thread, so that the jobs that are
+            generating keep getting decode steps while another job's prompt is ingested, instead of
+            one step per prefill chunk. The two threads issue on the same CUDA streams: the decode
+            steps fit in the time the prefill spends waiting for the CPU expert worker and for its
+            own host. Can be switched at any time (attribute of the same name); not available with a
+            tensor-parallel load. EXL3_PREFILL_THREAD=1 in the environment turns it on for callers
+            that do not pass the argument. See _prefill_round().
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -257,6 +283,29 @@ class Generator:
         self._lanes = {}
         self._stagger_backlog = []
         self._stagger_split = None
+
+        # Prompt ingestion on a second thread (_prefill_round). _side is the chunk under way;
+        # the thread and its lane (util/lane.py) are made at the first use. What may overlap:
+        # a chunk of at least side_min_tokens tokens and a decode step of at most side_max_rows
+        # rows x tokens. Those two never take the same path through a module (the decode graphs
+        # and the fused decode kernels serve up to 8 rows x tokens, the direct GEMM up to 144
+        # rows, and a chunk of a page or more is past every such threshold), so no buffer
+        # baked into a module at load time is used by both
+        self.prefill_thread = prefill_thread or os.environ.get("EXL3_PREFILL_THREAD", "0") not in ("", "0")
+        self.side_min_tokens = PAGE_SIZE
+        self.side_max_rows = 8
+        self.side_stats = {
+            "chunks": 0, "beside": 0, "decode_steps": 0, "errors": 0,
+            "t_chunks": 0.0, "t_waited": 0.0,
+        }
+        self._side = None
+        self._side_ok = None
+        self._side_lane = None
+        self._side_pool = None
+        self._side_turn = 0
+        # Chunks ingested beside a decode since the last report: [chunks, decode steps beside
+        # them, seconds of chunks]; reported in one line once no job is ingesting any more
+        self._side_stretch = None
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
@@ -448,6 +497,8 @@ class Generator:
         if flight is not None:
             flight.step.close()
         self._stagger_backlog = []
+        # A chunk under way on the prefill thread is left to finish first
+        self._side_drop()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
         self.active_jobs.clear()
@@ -507,6 +558,11 @@ class Generator:
             backlog = []
             self._stagger_drain(backlog)
             self._stagger_backlog += [r for r in backlog if r.get("job") is not job]
+
+        # Likewise for a chunk of its prompt under way on the prefill thread: it is left to
+        # finish, and not recorded
+        if self._side is not None and self._side.job is job:
+            self._side_drop()
 
         num_jobs = self.num_remaining_jobs()
 
@@ -606,15 +662,7 @@ class Generator:
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
-        flying = self._flight.jobs if self._flight is not None else ()
-        for job in list(self.active_jobs):
-            # A job whose pass is issued in part has pages ahead of its sequence position
-            if flying and any(j is job for j in flying):
-                continue
-            try:
-                job.prefill(results)
-            except Exception as e:
-                self.reap_failed_job(job, e, results)
+        self._prefill_round(results)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -683,10 +731,15 @@ class Generator:
 
     def recurrent_checkpoint(self):
         flying = self._flight.jobs if self._flight is not None else ()
+        side_job = self._side.job if self._side is not None else None
         for job in self.active_jobs:
             # The states of a job in flight are half a pass ahead on the first card only; it was
             # offered its checkpoint at this very position before it was issued
             if flying and any(j is job for j in flying):
+                continue
+            # The state of a job whose prompt chunk is under way is being advanced by the prefill
+            # thread; it was offered its checkpoint after the previous chunk
+            if job is side_job:
                 continue
             job.maybe_stash_recurrent(self.recurrent_cache)
 
@@ -1044,6 +1097,253 @@ class Generator:
             buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
             self.staging_buffers[key] = buf
         return buf[:rows]
+
+
+    # ---------------------------------------------------------------------------------------
+    #   Prompt ingestion, inline or on a second thread
+    # ---------------------------------------------------------------------------------------
+
+    def _prefill_round(self, results: list):
+        """
+        One round of prompt ingestion.
+
+        As upstream, every job still ingesting its prompt gets one chunk and iterate() goes on
+        to the decode step when they are done: a job that is generating gets one token per
+        round of chunks. With prefill_thread the forward passes of a chunk run on a second
+        thread instead (the yielded function of Job._prefill_co), with its own workspaces and
+        CPU expert worker slots (util/lane.py), and this thread does not wait for them while a
+        job is generating: it goes on to the decode step, and a later round records the chunk
+        once it is done. So:
+
+          - one chunk is under way at a time (self._side); with several jobs ingesting, they
+            take turns at it;
+          - a chunk and a decode step overlap only when they cannot meet inside a module
+            (side_min_tokens, side_max_rows: see __init__). A shorter chunk (the tail of a
+            prompt), or any chunk while the decode batch is larger than that, is waited for
+            like an inline one;
+          - everything that is not a forward pass stays on this thread: the plan of the chunk,
+            its record (sequence and page positions, page hashes), the checkpoint, the results.
+            The page table and the recurrent cache are never touched from the other thread;
+          - a job whose chunk is under way is left alone until the chunk is recorded: no
+            checkpoint (recurrent_checkpoint), no decode step (it is not done with its prompt
+            until the record says so), and cancel() lets the chunk finish before it releases
+            the job's pages and state;
+          - the two threads issue on the same streams (util/lane.py says why), so kernels
+            never overlap on a card and a job changes hands in stream order;
+          - with no job generating there is nothing to do meanwhile and the round waits for
+            its chunks, one per job as upstream. They still run on the prefill thread, so the
+            workspaces of a prefill pass exist once.
+
+        A failed chunk fails its job only, as an inline one (reap_failed_job).
+        """
+        flying = self._flight.jobs if self._flight is not None else ()
+        side = self.prefill_thread and self._side_plan()
+
+        if not side and self._side is None:
+            for job in list(self.active_jobs):
+                # A job whose pass is issued in part has pages ahead of its sequence position
+                if flying and any(j is job for j in flying):
+                    continue
+                try:
+                    job.prefill(results)
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+            return
+
+        # Whether a chunk may be left to run beside this round's decode step: somebody is
+        # generating, and the step is decode-sized for every module (side_max_rows)
+        rows = 0
+        for job in self.active_jobs:
+            if job.is_prefill_done():
+                rows += len(job.sequences) * (1 + self.num_draft_tokens)
+        beside = side and 0 < rows <= self.side_max_rows
+
+        # The chunk under way: left to run beside this round's decode step, or recorded. A job
+        # whose chunk is recorded here starts its next one in the next round, after the
+        # checkpoint this round offers it
+        served = None
+        cur = self._side
+        if cur is not None:
+            if beside and not cur.future.done():
+                cur.steps += 1
+            else:
+                served = cur.job
+                self._side_collect(results, wait_all = not beside)
+
+        waiting = []
+        for job in list(self.active_jobs):
+            if flying and any(j is job for j in flying):
+                continue
+            if job is served or (self._side is not None and job is self._side.job):
+                continue
+            if side and not job.is_prefill_done():
+                waiting.append(job)
+                continue
+            # A job past its prompt (the call stamps its first prefill time), or any job when
+            # the switch has just been turned off
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
+
+        # Whoever had a chunk longest ago goes first
+        waiting.sort(key = lambda j: getattr(j, "_side_turn", 0))
+        for job in waiting:
+            if self._side is not None:
+                break
+            if not self._side_start(job, results):
+                continue
+            if beside and self._side.beside:
+                self._side.steps += 1       # this round's decode step
+            else:
+                self._side_collect(results, wait_all = True)
+
+        if self._side_stretch is not None and self._side is None \
+                and all(job.is_prefill_done() for job in self.active_jobs):
+            self._side_stretch_end()
+
+
+    def _side_plan(self) -> bool:
+        """Whether prompt chunks can go to a second thread; sets it up at the first call."""
+        ok = self._side_ok
+        if ok is None:
+            why = None
+            slots = None
+            devices = []
+            if self.model.loaded_tp:
+                why = "tensor-parallel model"
+            else:
+                devices = cuda_devices(self.model, self.draft_model)
+                if not devices:
+                    why = "model not on a CUDA device"
+            if why is None:
+                hosts = {}
+                for m in (self.model, self.draft_model):
+                    for h in getattr(getattr(m, "config", None), "moe_cpu_hosts", {}).values():
+                        hosts[id(h)] = h
+                for h in hosts.values():
+                    slots = h.split_lanes()
+                    if slots is None:
+                        why = "the CPU expert worker has a single slot (EXL3_MOE_CPU_SLOTS)"
+                        break
+            if why is None:
+                self._side_lane = Lane(1, devices)
+                self._side_pool = ThreadPoolExecutor(
+                    max_workers = 1,
+                    thread_name_prefix = "exl3-prefill",
+                    initializer = self._side_lane.enter,
+                )
+                extra = "" if slots is None else \
+                    f", CPU expert worker slots {slots[0]} for the decode and {slots[1]} for the prefill"
+                print(f" -- Prefill thread: on{extra}", flush = True)
+            else:
+                print(f" !! Prefill thread not available: {why}", flush = True)
+            self._side_ok = ok = why is None
+        return ok
+
+
+    def _side_start(self, job, results: list) -> bool:
+        """Plan the job's next chunk and hand its forward passes to the prefill thread. False
+        when the round had nothing to compute for the job (pages found in the cache) or the
+        plan failed (the job is released, as for an inline chunk)."""
+        step = job._prefill_co(results)
+        try:
+            run = next(step)
+        except StopIteration:
+            return False
+        except Exception as e:
+            self.reap_failed_job(job, e, results)
+            return False
+        self._side_turn += 1
+        job._side_turn = self._side_turn
+        self._side = self._side_submit(job, step, run)
+        return True
+
+
+    def _side_submit(self, job, step, run) -> _SidePass:
+        beside = getattr(run, "tokens", 0) >= self.side_min_tokens
+        return _SidePass(job, step, self._side_pool.submit(self._side_work, run), beside)
+
+
+    def _side_work(self, run) -> float:
+        """On the prefill thread: a chunk's forward passes, waited for (a chunk that is done
+        has run: its job may be released). Returns the seconds it took."""
+        t0 = time.perf_counter()
+        lane = self._side_lane
+        with torch.inference_mode(), lane.passing():
+            try:
+                run()
+            except BaseException:
+                # What the failed pass had issued still runs: the job is released only after it
+                try:
+                    lane.synchronize()
+                except Exception:
+                    pass
+                raise
+            lane.synchronize()
+        return time.perf_counter() - t0
+
+
+    def _side_collect(self, results: list, wait_all: bool = False):
+        """
+        Wait for the chunk under way and record it. A job of several sequences has a chunk per
+        sequence in one round: the next one is handed over at once and stays under way, unless
+        wait_all (nothing is decoding meanwhile, or the thread is being left), which sees the
+        job's round through.
+        """
+        while self._side is not None:
+            cur, self._side = self._side, None
+            stats = self.side_stats
+            t0 = time.perf_counter()
+            try:
+                dt = cur.future.result()
+                stats["t_waited"] += time.perf_counter() - t0
+                stats["chunks"] += 1
+                stats["t_chunks"] += dt
+                if cur.steps:
+                    stats["beside"] += 1
+                    stats["decode_steps"] += cur.steps
+                    stretch = self._side_stretch
+                    if stretch is None:
+                        stretch = self._side_stretch = [0, 0, 0.0]
+                    stretch[0] += 1
+                    stretch[1] += cur.steps
+                    stretch[2] += dt
+                run = cur.step.send(results)
+            except StopIteration:
+                return
+            except Exception as e:
+                stats["errors"] += 1
+                cur.step.close()
+                self.reap_failed_job(cur.job, e, results)
+                return
+            self._side = self._side_submit(cur.job, cur.step, run)
+            if self._side.beside and not wait_all:
+                self._side.steps += 1       # this round's decode step
+                return
+
+
+    def _side_drop(self):
+        """Let the chunk under way finish and forget it (its job is being released: no kernel
+        may be left writing into pages and states about to be handed to someone else). No-op
+        with no chunk under way."""
+        cur, self._side = self._side, None
+        if cur is None:
+            return
+        try:
+            cur.future.result()
+        except Exception:
+            pass
+        cur.step.close()
+
+
+    def _side_stretch_end(self):
+        """Report the chunks ingested beside a decode since the last report (a server has no
+        other trace of it; side_stats is for whoever holds the generator)."""
+        stretch, self._side_stretch = self._side_stretch, None
+        if stretch is not None:
+            print(f" -- Prefill thread: {stretch[0]} chunks in {stretch[2]:.1f} s, "
+                  f"{stretch[1]} decode steps beside them", flush = True)
 
 
     # ---------------------------------------------------------------------------------------
