@@ -70,8 +70,9 @@ Tests: `tests/test_stagger_decode.py` (no GPU, no extension: toy model on two pr
 stub jobs; tokens of a staggered run must equal those of a regular one).
 
 Bench on the real model: `experiments/stagger_bench.py` (server stopped; loads the model the
-way the server does; report in Markdown). Three parts: speed (one batch against staggered),
-same computation, where the time goes. What the first run on the machine taught:
+way the server does; report in Markdown). Four parts, `--bench-phases` picks among them: speed
+(one batch against staggered), same computation, where the time goes on the cards, where the
+host's time goes. What the first runs on the machine taught:
 
 - Two identical greedy runs of this model do not give the same tokens, so token equality
   proves nothing. The check forces on every job the tokens it produced alone and compares the
@@ -85,6 +86,12 @@ same computation, where the time goes. What the first run on the machine taught:
 - Host timers and `nvidia-smi` cannot tell a card that waits for the worker from an idle one:
   the profiled runs bracket each card's part of the pass and the worker handoffs with CUDA
   events (stream time, no host synchronization).
+- The host thread paces a staggered call, and timers around three functions do not say what
+  its time is made of. With py-spy installed the bench has it sample this process's Python
+  stacks during one more set of runs (one capture; a frame named after the run on the stack
+  tells the runs apart) and the report splits a call into phases (draft, inputs, issue, wait
+  for the cards, sampling) and the issue into the library's components, with the most sampled
+  source lines. The stacks go to a second Markdown file next to the report.
 
 `tests/test_stagger_bench.py` runs the report side of the bench on fakes.
 

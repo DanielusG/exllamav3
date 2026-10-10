@@ -4,7 +4,7 @@ Bench of the staggered decode (Generator.stagger_decode) on the production model
 
 The model is loaded exactly as the OpenAI server loads it (same flags, through the server's own
 ModelContainer), then a raw Generator is driven from this process. For 2, 3 and 4 jobs
-generating at the same time it gives three things:
+generating at the same time it gives four things:
 
   - speed: the regular decode (one batch) against the staggered one, greedy sampling;
   - same computation: every job is generated again with its own tokens forced on it, in every
@@ -13,7 +13,10 @@ generating at the same time it gives three things:
     near-tie flips and the texts part ways), so comparing tokens proves nothing; forced tokens
     keep every run on the same sequence and the group alone, run twice, gives the noise floor;
   - where the time goes: a short run with CUDA events around each card's part of the pass and
-    around the handoffs to the CPU expert worker (stream time, no host synchronization).
+    around the handoffs to the CPU expert worker (stream time, no host synchronization);
+  - where the host's time goes: py-spy (when installed) samples this process's Python stacks
+    during one more set of runs, and the report splits a call into its phases and the issue of
+    a pass into the library's components. The sampled stacks go to a second Markdown file.
 
 Before measuring, the expert placement is adapted to the bench's own prompts with the
 library's sweeps (the placement loaded from the server's file follows production traffic). The
@@ -40,12 +43,21 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
 import argparse
+import collections
+import ctypes
+import inspect
+import linecache
+import re
+import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import types
 from types import SimpleNamespace
 
 PROMPTS = [
@@ -282,6 +294,288 @@ class StreamProf:
                 "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
             }
         return out
+
+
+HOST_TAG = "bench_host__"
+
+
+def _trampoline(fn):
+    return fn()
+
+
+def tagged(tag: str, fn):
+    """Call fn() inside a frame named `tag`: the stacks a sampling profiler takes then say which
+    run they belong to, with no clock to align."""
+    code = _trampoline.__code__
+    names = {"co_name": tag}
+    if hasattr(code, "co_qualname"):
+        names["co_qualname"] = tag
+    return types.FunctionType(code.replace(**names), _trampoline.__globals__)(fn)
+
+
+class HostProf:
+    """
+    Python stacks of this process sampled by py-spy while tagged() runs execute. py-spy is a
+    process of its own that reads the interpreter's memory: nothing is hooked in here and, with
+    --nonblocking, the bench is never paused. --idle keeps the samples in which the thread waits
+    (a blocking readback from a card is the point), and the runs are told apart by their tagged
+    frame, so one capture covers a whole phase.
+    """
+
+    def __init__(self, exe: str, rate: int = 250, startup: float = 3.0):
+        self.exe = exe
+        self.rate = rate
+        self.startup = startup
+        self.messages = ""      # what py-spy wrote on stderr
+        self._proc = None
+        self._out = None
+        self._err = None
+
+    def begin(self):
+        # Yama (kernel.yama.ptrace_scope 1) lets only an ancestor attach, and py-spy is our
+        # child: name every process of this user as allowed to. No effect where it is off.
+        try:
+            ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1), 0, 0, 0)     # PR_SET_PTRACER, ANY
+        except Exception:
+            pass
+        fd, self._out = tempfile.mkstemp(prefix = "stagger-bench-host-", suffix = ".txt")
+        os.close(fd)
+        os.remove(self._out)        # py-spy creates it; its absence afterwards means no capture
+        self._err = tempfile.TemporaryFile(mode = "w+")
+        self._proc = subprocess.Popen(
+            [
+                self.exe, "record", "--pid", str(os.getpid()), "--rate", str(self.rate),
+                "--format", "raw", "--output", self._out, "--idle", "--nonblocking", "--full-filenames",
+            ],
+            stdout = subprocess.DEVNULL, stderr = self._err,
+        )
+        # py-spy says nothing when it is attached: give it time, and fail now if it is gone
+        t_end = time.perf_counter() + self.startup
+        while time.perf_counter() < t_end:
+            if self._proc.poll() is not None:
+                raise RuntimeError(f"py-spy exited at once: {self._close()}")
+            time.sleep(0.1)
+
+    def _close(self) -> str:
+        if self._err is not None:
+            self._err.seek(0)
+            self.messages = self._err.read().strip()
+            self._err.close()
+            self._err = None
+        return self.messages[-400:] or "(no message)"
+
+    def end(self) -> str:
+        """Stop the capture and return py-spy's raw output."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            raise RuntimeError("py-spy was not started")
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout = 60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        said = self._close()
+        try:
+            with open(self._out) as f:
+                raw = f.read()
+        except OSError:
+            raw = ""
+        finally:
+            try:
+                os.remove(self._out)
+            except OSError:
+                pass
+        if not raw.strip():
+            raise RuntimeError(f"py-spy gave no samples (exit code {proc.returncode}): {said}")
+        return raw
+
+
+_FRAME = re.compile(r"^(.*) \((.*):(\d+)\)$")
+
+
+def parse_stacks(raw: str) -> list:
+    """py-spy's raw format, one line per distinct stack ("frame;frame;... samples", outermost
+    frame first, a frame being "function (file:line)") as [(samples, [(function, file, line)])]."""
+    out = []
+    for line in raw.splitlines():
+        stack, _, n = line.rpartition(" ")
+        if not stack or not n.isdigit():
+            continue
+        frames = []
+        for part in stack.split(";"):
+            m = _FRAME.match(part)
+            frames.append((m.group(1), m.group(2), int(m.group(3))) if m else (part, "", 0))
+        out.append((int(n), frames))
+    return out
+
+
+def host_runs(stacks: list) -> dict:
+    """tag -> [(samples, frames below the tagged frame)] for the stacks that go through one."""
+    runs = {}
+    for n, frames in stacks:
+        for i, f in enumerate(frames):
+            if f[0].startswith(HOST_TAG):
+                runs.setdefault(f[0], []).append((n, frames[i + 1:]))
+                break
+    return runs
+
+
+def decode_step_yield(generator_cls):
+    """Line of the decode step's yield (Generator._iterate_gen_co): above it the step stages its
+    inputs, below it it samples. None when it cannot be found."""
+    try:
+        src, start = inspect.getsourcelines(generator_cls._iterate_gen_co)
+    except Exception:
+        return None
+    for i, line in enumerate(src):
+        if re.search(r"=\s*yield\b", line):
+            return start + i
+    return None
+
+
+# The library's files by what they are in a decode pass; the first one met below the loop over
+# the modules decides (util/tensor.py, the workspace cache, is counted across all of them)
+_FAMILY = {
+    "hyperconnections.py": "hyperconnections",
+    "block_sparse_mlp.py": "MoE",
+    "block_sparse_mlp_routing.py": "MoE",
+    "block_sparse_mlp_cpu.py": "MoE",
+    "moe_cpu_host.py": "MoE",
+    "moe_batch_recon.py": "MoE",
+    "attn.py": "attenzione QSA",
+    "bc_attn.py": "attenzione QSA",
+    "qsa_indexer.py": "attenzione QSA",
+    "attn_per_seq.py": "attenzione QSA",
+    "gated_delta_net.py": "attenzione lineare (GDN)",
+    "ple.py": "ingresso PLE / n-gram",
+    "ngram_embedding.py": "ingresso PLE / n-gram",
+    "row_table.py": "ingresso PLE / n-gram",
+    "embedding.py": "embedding",
+    "linear.py": "testa di uscita e lineari",
+    "exl3.py": "testa di uscita e lineari",
+}
+
+PHASE_DRAFT = "bozza: passo della testa MTP"
+PHASE_INPUTS = "ingressi del passo"
+PHASE_ISSUE = "emissione del passo"
+PHASE_ADVANCE = "avanzamento degli stati ricorrenti"
+PHASE_WAIT = "attesa delle schede (lettura bloccante del token)"
+PHASE_SAMPLER = "campionamento: lancio del sampler"
+PHASE_SAMPLE = "campionamento: receive_sample"
+PHASE_MTP_UPDATE = "aggiornamento della cache della testa MTP"
+PHASE_REWIND = "rewind degli stati ricorrenti"
+PHASE_SAMPLE_REST = "campionamento: resto"
+PHASE_OUTSIDE = "fuori da iterate() (il banco stesso)"
+PHASE_ORDER = [
+    PHASE_DRAFT, PHASE_INPUTS, PHASE_ISSUE, PHASE_ADVANCE, PHASE_WAIT, PHASE_SAMPLER, PHASE_SAMPLE,
+    PHASE_MTP_UPDATE, PHASE_REWIND, PHASE_SAMPLE_REST,
+]
+
+
+def issue_component(frames: list) -> str:
+    """What a stack below the loop over the modules is issuing."""
+    base = [(name, os.path.basename(file)) for name, file, _ in frames]
+    names = {n for n, _ in base}
+    files = {f for _, f in base}
+    for _, file in base:
+        family = _FAMILY.get(file)
+        if family is None:
+            continue
+        if family == "hyperconnections":
+            if "apply_" in names:
+                return "hyperconnections: apply_"
+            if names & {"mix", "_mix"}:
+                return "hyperconnections: mix"
+            return "hyperconnections: resto"
+        if family == "MoE":
+            if "routing_std" in names or "block_sparse_mlp_routing.py" in files:
+                return "MoE: instradamento"
+            if names & {"cpu_split_submit", "submit_issue_fused"}:
+                return "MoE: consegna al worker"
+            if names & {"cpu_split_combine", "submit_collect_fused"}:
+                return "MoE: raccolta dal worker"
+            return "MoE: esperti residenti e resto"
+        return family
+    return "blocco (codice proprio)" if "transformer.py" in files else "ciclo sui moduli"
+
+
+def host_phase(frames: list, yield_at: int | None = None):
+    """(phase, component of the issue or None) of one sampled stack of a run, by the names of
+    the generator's functions on it."""
+    at = next((i for i, f in enumerate(frames) if f[0] == "iterate" and os.path.basename(f[1]) == "generator.py"), None)
+    if at is None:
+        return PHASE_OUTSIDE, None
+    sub = frames[at + 1:]
+    names = [f[0] for f in sub]
+    files = [os.path.basename(f[1]) for f in sub]
+    if "iterate_draftmodel_mtp_gen" in names:
+        return PHASE_DRAFT, None
+    if "_iterate_gen_co" in names:
+        i = names.index("_iterate_gen_co")
+        below = names[i + 1:]
+        if yield_at is not None and sub[i][2] <= yield_at:
+            return PHASE_INPUTS, None
+        if "receive_sample" in below:
+            leaf = sub[-1]
+            if leaf[0] == "receive_sample" and ".cpu()" in linecache.getline(leaf[1], leaf[2]):
+                return PHASE_WAIT, None
+            return PHASE_SAMPLE, None
+        if "receive_logits" in below:
+            return PHASE_SAMPLER, None
+        if "prefill" in below:
+            return PHASE_MTP_UPDATE, None
+        if "rewind" in below or "reject_remainder" in below:
+            return PHASE_REWIND, None
+        if yield_at is None and not below:
+            return "passo: codice proprio (ingressi o campionamento)", None
+        return PHASE_SAMPLE_REST, None
+    if "advance_recurrent_states" in names:
+        return PHASE_ADVANCE, None
+    if {"run_to", "forward_ls"} & set(names) or ("forward" in names and "model.py" in files):
+        return PHASE_ISSUE, issue_component(sub)
+    own = [f[0] for f in sub if os.path.basename(f[1]) == "generator.py"]
+    return "altro in iterate(): " + (own[-1] if own else "iterate"), None
+
+
+def host_digest(rows: list, yield_at: int | None = None) -> dict:
+    """Samples of one run by phase, by component of the issue and by source line (the deepest
+    frame outside torch: a line that calls into native code stands for that call)."""
+    phases, comps, lines = collections.Counter(), collections.Counter(), collections.Counter()
+    total = scratch = 0
+    for n, frames in rows:
+        phase, comp = host_phase(frames, yield_at)
+        total += n
+        phases[phase] += n
+        if comp is not None:
+            comps[comp] += n
+            if any(f[1].replace("\\", "/").endswith("util/tensor.py") for f in frames):
+                scratch += n
+        own = [f for f in frames if "/torch/" not in f[1].replace("\\", "/")]
+        leaf = own[-1] if own else (frames[-1] if frames else ("?", "", 0))
+        lines[leaf] += n
+    return {"total": total, "phases": phases, "components": comps, "scratch": scratch, "lines": lines}
+
+
+def short_path(path: str) -> str:
+    return "/".join(path.replace("\\", "/").split("/")[-2:])
+
+
+def stacks_text(runs: list) -> str:
+    """The sampled stacks as a Markdown file: for whoever wants to cut them differently."""
+    out = [
+        "# Decode sfalsato: stack campionati sull'host",
+        "",
+        "Una riga per stack distinto sotto il giro: numero di campioni, poi i frame dal più esterno "
+        "(`funzione (file:riga)`, separati da `;`). Formato di py-spy `--format raw`, con i percorsi accorciati.",
+    ]
+    for label, rows in runs:
+        out += ["", f"## {label}", "", "```"]
+        for n, frames in sorted(rows, key = lambda r: -r[0]):
+            out.append(f"{n} " + ";".join(f"{name} ({short_path(file)}:{line})" for name, file, line in frames))
+        out.append("```")
+    return "\n".join(out) + "\n"
 
 
 def bench_revision() -> str:
@@ -624,13 +918,91 @@ PROF_HEADER = [
 ]
 
 
-def measure(env, args, gpu = None) -> str:
-    """Everything between a loaded model and the text of the report."""
+def host_section(cols: list, notes: list, tokens: int, rate) -> str:
+    """The report's section on the host's time. cols: (label, run, digest, samples expected)."""
+    text = [
+        "## Dove va il tempo dell'host\n",
+        f"Un'altra serie di giri ({tokens} token per job) durante la quale py-spy campiona lo stack Python di questo "
+        f"processo {rate if rate is not None else '-'} volte al secondo, senza fermarlo. Ogni campione è assegnato a una "
+        "fase della chiamata dal nome delle funzioni del generatore che ha sullo stack; la quota di campioni di una fase, "
+        "per i ms per chiamata del giro, dà i ms della fase. I campioni coprono tutto il giro, i ms per chiamata il "
+        "tratto in cui tutti i job generano.\n\n"
+        "- **emissione del passo**: il thread lancia i kernel dei moduli; le schede lavorano intanto\n"
+        "- **attesa delle schede**: il thread è fermo sulla prima lettura del token campionato, cioè aspetta che le "
+        "schede finiscano il passo; le letture successive della stessa chiamata aspettano solo il sampler\n"
+        "- le altre fasi sono lavoro dell'host (e, per bozza e aggiornamento della testa MTP, anche una sua attesa "
+        "della scheda che la ospita) durante il quale il passo successivo non è ancora emesso\n"
+        "- una riga che chiama codice nativo vale per tutta la chiamata: py-spy vede solo i frame Python",
+    ]
+    text += [f"\n{note}" for note in notes]
+    cols = [c for c in cols if c[2]["total"] > 0 and c[1]["window"] is not None]
+    if not cols:
+        return "\n".join(text + ["\nNessun giro campionato."])
+
+    def ms(col, n):
+        _, r, d, _ = col
+        return fmt(r["window"]["ms_step"] * n / d["total"], 2) if n else "-"
+
+    labels = [c[0] for c in cols]
+    rows = [
+        ["ms per chiamata"] + [fmt(c[1]["window"]["ms_step"], 2) for c in cols],
+        ["campioni (attesi)"] + [f"{c[2]['total']} ({c[3]:.0f})" for c in cols],
+    ]
+    seen = collections.Counter()
+    for c in cols:
+        seen.update(c[2]["phases"])
+    order = [p for p in PHASE_ORDER if p in seen]
+    order += [p for p, _ in seen.most_common() if p not in order and p != PHASE_OUTSIDE]
+    order += [PHASE_OUTSIDE] if PHASE_OUTSIDE in seen else []
+    for p in order:
+        rows.append([p] + [ms(c, c[2]["phases"].get(p, 0)) for c in cols])
+    text += ["\n### Fasi di una chiamata, ms\n", table(["fase"] + labels, rows)]
+    short = [c[0] for c in cols if c[2]["total"] < 0.5 * c[3]]
+    if short:
+        text.append(
+            "\n**Attenzione**: meno della metà dei campioni attesi per " + ", ".join(short)
+            + "; py-spy non ha tenuto il passo o si è agganciato tardi, le quote di quei giri sono meno affidabili."
+        )
+
+    seen = collections.Counter()
+    for c in cols:
+        seen.update(c[2]["components"])
+    rows = [[k] + [ms(c, c[2]["components"].get(k, 0)) for c in cols] for k, _ in seen.most_common()]
+    rows.append(["di cui nella cache dei buffer di lavoro (`util/tensor.py`)"] + [ms(c, c[2]["scratch"]) for c in cols])
+    text += [
+        "\n### Emissione del passo per componente, ms\n",
+        "Stessi campioni della riga «emissione del passo», divisi per il primo file della libreria che si incontra sotto "
+        "il ciclo sui moduli. L'ultima riga attraversa le altre: campioni con la cache dei buffer di lavoro sullo stack.\n",
+        table(["componente"] + labels, rows),
+    ]
+
+    staggered = [c for c in cols if c[1]["stagger"]]
+    for c in ([staggered[0], staggered[-1]] if len(staggered) > 1 else staggered):
+        label, r, d, _ = c
+        rows = []
+        for (name, file, line), n in d["lines"].most_common(25):
+            code = linecache.getline(file, line).strip().replace("|", "\\|")
+            rows.append([
+                f"{100.0 * n / d['total']:.1f}%", ms(c, n), f"`{short_path(file)}:{line}`", f"`{name}`",
+                f"`{code[:90]}`" if code else "-",
+            ])
+        text += [f"\n### Righe più campionate: {label}\n", table(["campioni", "ms per chiamata", "riga", "funzione", "codice"], rows)]
+    return "\n".join(text)
+
+
+PHASES = ("speed", "check", "prof", "host")
+
+
+def measure(env, args, gpu = None, extra: dict | None = None) -> str:
+    """Everything between a loaded model and the text of the report. The expert placement and
+    the warm-up always run; args.bench_phases picks among PHASES (all of them by default). With
+    `extra`, the sampled host stacks are left there as the text of a second file ("stacks")."""
     torch, gen, model = env.torch, env.gen, env.model
     names = NAMES[:env.max_jobs]
     n_jobs_list = [n for n in env.n_jobs_list if 2 <= n <= env.max_jobs]
     bench = Bench(env, gpu)
     notes = []          # problems of the measure itself, shown right under the summary
+    phases = set(getattr(args, "bench_phases", None) or PHASES)
 
     def phase(label: str, fn):
         print(f" -- bench: {label}", flush = True)
@@ -706,20 +1078,21 @@ def measure(env, args, gpu = None) -> str:
         for name in names:
             solo[name] = bench.run(name, False, args.bench_tokens)
 
-    phase("one job at a time", one_at_a_time)
-    rows = []
-    for name, r in solo.items():
-        w = r["window"]
-        rows.append([
-            name, len(r["tokens"][name]), fmt(w and w["tok_s"]), fmt(w and w["ms_step"], 2),
-            fmt(w and w["tok_step"], 2), fmt(r["hit"], 3),
-        ])
-    sections.append("## Un job alla volta\n\n" + table(
-        ["job", "token", "tok/s", "ms per passo", "token per passo", "selezioni servite dalla VRAM"], rows,
-    ))
+    if phases & {"speed", "check"}:     # the check forces on each job the tokens it gave alone
+        phase("one job at a time", one_at_a_time)
+        rows = []
+        for name, r in solo.items():
+            w = r["window"]
+            rows.append([
+                name, len(r["tokens"][name]), fmt(w and w["tok_s"]), fmt(w and w["ms_step"], 2),
+                fmt(w and w["tok_step"], 2), fmt(r["hit"], 3),
+            ])
+        sections.append("## Un job alla volta\n\n" + table(
+            ["job", "token", "tok/s", "ms per passo", "token per passo", "selezioni servite dalla VRAM"], rows,
+        ))
 
     summary = []
-    for n in n_jobs_list:
+    for n in (n_jobs_list if "speed" in phases else []):
         def timing(n = n):
             return bench.run(names[:n], False, args.bench_tokens), bench.run(names[:n], True, args.bench_tokens)
 
@@ -784,24 +1157,25 @@ def measure(env, args, gpu = None) -> str:
                 )
             check_parts.append("\n".join(part))
 
-    phase("same computation (forced tokens)", check)
-    sections.append(
-        "## Stesso calcolo?\n\n"
-        "Due giri identici di questo modello non danno gli stessi token greedy: al primo quasi-pareggio la scelta "
-        "cambia e da lì i testi divergono, quindi confrontare i token non dice nulla. Qui ogni job viene generato "
-        "di nuovo **imponendogli** i token che ha prodotto da solo, in tutti i modi: ogni giro elabora la stessa "
-        "sequenza e a ogni posizione si registrano la probabilità del token imposto e i due token più probabili. "
-        "Il riferimento è il gruppo del job fatto girare da solo; la riga «rifatto» confronta due giri identici "
-        "del gruppo da solo ed è la misura di quanto il modello cambia da un giro all'altro senza che cambi "
-        "nulla.\n\n"
-        "- **token imposto più probabile**: in quante posizioni del giro in esame il token imposto è anche il più probabile\n"
-        "- **top-1 cambiati**: posizioni in cui il token più probabile non è lo stesso nei due giri\n"
-        "- **margine massimo dove cambia**: tra quelle posizioni, il distacco più grande tra primo e secondo token nel riferimento\n"
-        "- **prima posizione con p diversa**: la prima posizione in cui la probabilità del token imposto non è "
-        "identica, bit per bit, nei due giri (`-` quando lo è ovunque)\n"
-        "- **scarto di p**: differenza, in valore assoluto, tra i due giri della probabilità del token imposto\n\n"
-        + ("\n\n".join(check_parts) if check_parts else "Nessun confronto completato.")
-    )
+    if "check" in phases:
+        phase("same computation (forced tokens)", check)
+        sections.append(
+            "## Stesso calcolo?\n\n"
+            "Due giri identici di questo modello non danno gli stessi token greedy: al primo quasi-pareggio la scelta "
+            "cambia e da lì i testi divergono, quindi confrontare i token non dice nulla. Qui ogni job viene generato "
+            "di nuovo **imponendogli** i token che ha prodotto da solo, in tutti i modi: ogni giro elabora la stessa "
+            "sequenza e a ogni posizione si registrano la probabilità del token imposto e i due token più probabili. "
+            "Il riferimento è il gruppo del job fatto girare da solo; la riga «rifatto» confronta due giri identici "
+            "del gruppo da solo ed è la misura di quanto il modello cambia da un giro all'altro senza che cambi "
+            "nulla.\n\n"
+            "- **token imposto più probabile**: in quante posizioni del giro in esame il token imposto è anche il più probabile\n"
+            "- **top-1 cambiati**: posizioni in cui il token più probabile non è lo stesso nei due giri\n"
+            "- **margine massimo dove cambia**: tra quelle posizioni, il distacco più grande tra primo e secondo token nel riferimento\n"
+            "- **prima posizione con p diversa**: la prima posizione in cui la probabilità del token imposto non è "
+            "identica, bit per bit, nei due giri (`-` quando lo è ovunque)\n"
+            "- **scarto di p**: differenza, in valore assoluto, tra i due giri della probabilità del token imposto\n\n"
+            + ("\n\n".join(check_parts) if check_parts else "Nessun confronto completato.")
+        )
 
     # 5. Where the time goes: stream-time brackets
     prof_rows = []
@@ -817,21 +1191,59 @@ def measure(env, args, gpu = None) -> str:
             r = bench.run(names[:n], True, args.bench_prof_tokens, profile = True)
             prof_rows.append(prof_row(f"{n} job, sfalsato", r))
 
-    phase("where the time goes", profile)
-    sections.append(
-        "## Dove va il tempo\n\n"
-        f"Giri brevi a parte ({args.bench_prof_tokens} token per job) con eventi CUDA attorno alle parti del passo: "
-        "tempi di flusso delle schede, senza sincronizzare l'host. Cifre per chiamata di `iterate()`, sul tratto in "
-        "cui tutti i job generano.\n\n"
-        "- **passo**: dall'inizio dell'emissione alla fine del lavoro emesso su quella scheda. Nel modo normale quello "
-        "della scheda 1 comprende la prima metà del passo, che gira sulla scheda 0\n"
-        "- **attesa del worker**: somma delle parentesi di raccolta, cioè il tempo in cui la scheda è ferma ad aspettare "
-        "gli esperti calcolati su CPU (più la rilettura del risultato) dopo aver finito i propri\n"
-        "- **consegna al worker**: somma delle parentesi di emissione di un job (attesa che lo slot sia libero, più il "
-        "kernel che lo riempie)\n"
-        "- **raccolte per chiamata**: quanti layer MoE la scheda ha chiuso in una chiamata\n\n"
-        + (table(PROF_HEADER, prof_rows) if prof_rows else "Nessun giro di profilo completato.")
-    )
+    if "prof" in phases:
+        phase("where the time goes", profile)
+        sections.append(
+            "## Dove va il tempo\n\n"
+            f"Giri brevi a parte ({args.bench_prof_tokens} token per job) con eventi CUDA attorno alle parti del passo: "
+            "tempi di flusso delle schede, senza sincronizzare l'host. Cifre per chiamata di `iterate()`, sul tratto in "
+            "cui tutti i job generano.\n\n"
+            "- **passo**: dall'inizio dell'emissione alla fine del lavoro emesso su quella scheda. Nel modo normale quello "
+            "della scheda 1 comprende la prima metà del passo, che gira sulla scheda 0\n"
+            "- **attesa del worker**: somma delle parentesi di raccolta, cioè il tempo in cui la scheda è ferma ad aspettare "
+            "gli esperti calcolati su CPU (più la rilettura del risultato) dopo aver finito i propri\n"
+            "- **consegna al worker**: somma delle parentesi di emissione di un job (attesa che lo slot sia libero, più il "
+            "kernel che lo riempie)\n"
+            "- **raccolte per chiamata**: quanti layer MoE la scheda ha chiuso in una chiamata\n\n"
+            + (table(PROF_HEADER, prof_rows) if prof_rows else "Nessun giro di profilo completato.")
+        )
+
+    # 6. Where the host's time goes: sampled Python stacks
+    host = getattr(env, "host", None)
+    yield_at = getattr(env, "yield_at", None)
+    host_cols = []          # (label, the run, its digest, samples expected)
+    host_note = []
+
+    def host_profile():
+        if host is None:
+            host_note.append(
+                "py-spy non trovato (`pip install py-spy` nell'ambiente del server, oppure `--bench-pyspy` con il "
+                "percorso dell'eseguibile): fase saltata."
+            )
+            return
+        plan = [(f"`{names[0]}` da solo", names[:1], False)]
+        for n in n_jobs_list:
+            plan += [(f"{n} job, un batch", names[:n], False), (f"{n} job, sfalsato", names[:n], True)]
+        done = []
+        host.begin()
+        try:
+            for i, (label, who, stagger) in enumerate(plan):
+                t0 = time.perf_counter()
+                r = tagged(f"{HOST_TAG}{i}", lambda: bench.run(who, stagger, args.bench_host_tokens))
+                done.append((f"{HOST_TAG}{i}", label, r, time.perf_counter() - t0))
+        finally:
+            raw = host.end()
+        runs = host_runs(parse_stacks(raw))
+        for tag, label, r, seconds in done:
+            host_cols.append((label, r, host_digest(runs.get(tag, []), yield_at), seconds * host.rate))
+        if extra is not None:
+            extra["stacks"] = stacks_text([(label, runs.get(tag, [])) for tag, label, _, _ in done])
+        if host.messages:
+            host_note.append("py-spy ha scritto: `" + " / ".join(host.messages.splitlines()[-3:]) + "`")
+
+    if "host" in phases:
+        phase("where the host's time goes", host_profile)
+        sections.append(host_section(host_cols, host_note, args.bench_host_tokens, getattr(host, "rate", None)))
 
     bench.close()
 
@@ -844,7 +1256,8 @@ def measure(env, args, gpu = None) -> str:
         "",
         "## Sintesi",
         "",
-        table(["job insieme", "un batch tok/s", "sfalsato tok/s", "differenza"], summary) if summary else "Nessuna misura completa.",
+        table(["job insieme", "un batch tok/s", "sfalsato tok/s", "differenza"], summary) if summary
+        else "Nessuna misura completa." if "speed" in phases else "Misura di velocità non richiesta (`--bench-phases`).",
         "",
     ]
     for note in notes:
@@ -860,6 +1273,7 @@ def measure(env, args, gpu = None) -> str:
         + ("" if split else " (**decode sfalsato non disponibile**)"),
         f"- Bozza: {env.draft_desc}",
         f"- Decode sfalsato misurato da 2 job in su; il generatore da solo lo usa da {env.min_jobs_default} job",
+        f"- Fasi eseguite, dopo piazzamento e riscaldamento: {', '.join(p for p in PHASES if p in phases)}",
         f"- Token per job {args.bench_tokens}, moduli per turno {args.bench_interleave}, batch massimo {gen.max_batch_size}",
     ]
     if copies is not None:
@@ -888,6 +1302,12 @@ def main():
     ap.add_argument("--bench-adapt-tokens", type = int, default = 160, help = "token per job in un giro di adattamento (default 160)")
     ap.add_argument("--bench-prof-tokens", type = int, default = 160, help = "token per job nei giri di profilo (default 160)")
     ap.add_argument("--bench-interleave", type = int, default = 1, help = "moduli per turno nell'emissione alternata (default 1)")
+    ap.add_argument("--bench-phases", default = ",".join(PHASES),
+                    help = "fasi da eseguire dopo piazzamento e riscaldamento: speed (velocità), check (stesso calcolo), "
+                           "prof (tempi di flusso delle schede), host (stack dell'host con py-spy); default tutte")
+    ap.add_argument("--bench-host-tokens", type = int, default = 400, help = "token per job nei giri campionati da py-spy (default 400)")
+    ap.add_argument("--bench-host-rate", type = int, default = 250, help = "campioni al secondo di py-spy (default 250)")
+    ap.add_argument("--bench-pyspy", default = None, help = "eseguibile di py-spy (default: quello nel PATH o accanto a python)")
     ap.add_argument("--bench-out", default = None, help = "file .md del rapporto")
     ap.add_argument("--bench-no-gpu", action = "store_true", help = "non campionare nvidia-smi")
     ap.add_argument("--bench-server-repo", default = os.getcwd(), help = "repository del server (default: directory corrente)")
@@ -899,6 +1319,10 @@ def main():
         return 0
     if args.bench_out is not None and not args.bench_out.endswith(".md"):
         raise SystemExit("--bench-out: il rapporto è un file .md")
+    args.bench_phases = [p.strip() for p in args.bench_phases.split(",") if p.strip()]
+    unknown = [p for p in args.bench_phases if p not in PHASES]
+    if unknown:
+        raise SystemExit(f"--bench-phases: fasi sconosciute {unknown}; valgono {', '.join(PHASES)}")
 
     # The server's package first, then this checkout's library ahead of an installed one
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -924,7 +1348,7 @@ def main():
 
     revision = bench_revision()
     print(f" -- bench: {os.path.basename(__file__)} at commit {revision}; phases: expert placement, warm-up, "
-          "speed, same computation (forced tokens), where the time goes", flush = True)
+          + ", ".join(args.bench_phases), flush = True)
     cfg = parse_args(server_argv)
     container = ModelContainer(cfg)
     container.load_model_sync()
@@ -976,6 +1400,11 @@ def main():
             text = chat(text)
         return tokenizer.encode(text, encode_special_tokens = True)
 
+    pyspy = args.bench_pyspy or shutil.which("py-spy")
+    if pyspy is None:
+        beside = os.path.join(os.path.dirname(sys.executable), "py-spy")
+        pyspy = beside if os.path.exists(beside) else None
+
     split = gen._stagger_plan()
     env = SimpleNamespace(
         torch = torch,
@@ -988,6 +1417,8 @@ def main():
         n_jobs_list = n_jobs_list,
         sweep = sweep,
         prof = StreamProf(torch, model, gen, stage_devices(torch, model, split)) if torch.cuda.is_available() else None,
+        host = HostProf(pyspy, args.bench_host_rate) if pyspy else None,
+        yield_at = decode_step_yield(Generator),
         split = split,
         min_jobs_default = min_jobs_default,
         n_modules = len(model.fwd_modules),
@@ -1005,8 +1436,9 @@ def main():
     if not args.bench_no_gpu:
         gpu = GpuSampler()
         gpu.start()
+    extra = {}
     try:
-        text = measure(env, args, gpu)
+        text = measure(env, args, gpu, extra)
     finally:
         if gpu is not None:
             gpu.stop()
@@ -1019,6 +1451,11 @@ def main():
         f.write(text)
     print(text)
     print(f" -- bench: report written to {out}", flush = True)
+    if extra.get("stacks"):
+        stacks_out = out[:-len(".md")] + "-stacks.md"
+        with open(stacks_out, "w") as f:
+            f.write(extra["stacks"])
+        print(f" -- bench: sampled host stacks written to {stacks_out}", flush = True)
 
     # Orderly release of the cards and of the CPU expert worker. The expert tier is NOT closed:
     # its close() saves the placement, and the production file must not learn from a bench
