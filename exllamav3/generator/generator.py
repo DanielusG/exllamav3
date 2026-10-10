@@ -1,7 +1,9 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
+from ..model.forward_cursor import ForwardCursor, DirectForward, cuda_stage_bounds
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
@@ -16,12 +18,27 @@ from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+class _Flight:
+    """A group of jobs whose decode step is under way (Generator.iterate_staggered): the step
+    coroutine stopped at its forward pass, the pass itself, the lane of pinned staging buffers
+    the step staged its inputs through, and the jobs."""
+
+    __slots__ = ("step", "fwd", "lane", "jobs")
+
+    def __init__(self, step, fwd, lane: int, jobs: list):
+        self.step = step
+        self.fwd = fwd
+        self.lane = lane
+        self.jobs = jobs
+
 
 class Generator:
 
@@ -47,6 +64,7 @@ class Generator:
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
+        stagger_decode: bool = False,
         **kwargs
     ):
         """
@@ -112,6 +130,14 @@ class Generator:
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
+
+        :param stagger_decode:
+            For a model whose layers are split over two GPUs: with two or more jobs generating, decode
+            them as two groups half a pass apart, so one group runs on the second card while the other
+            runs on the first, instead of one batch that keeps one card idle at a time. Each iterate()
+            then returns the tokens of one group. Can be switched at any time (attribute of the same
+            name); needs the MTP drafter or no drafter. EXL3_STAGGER_DECODE=1 in the environment
+            turns it on for callers that do not pass the argument. See iterate_staggered().
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -206,6 +232,22 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
+
+        # Staggered decode (iterate_staggered). _step_group narrows the draft and decode steps to
+        # one group of jobs; _flight is the group whose pass is issued up to the second card;
+        # _lanes holds the second set of pinned staging buffers (the first set is the
+        # generator's own); _stagger_backlog keeps results produced outside iterate()
+        self.stagger_decode = stagger_decode or os.environ.get("EXL3_STAGGER_DECODE", "0") not in ("", "0")
+        self.stagger_interleave = 1
+        self.stagger_stats = {
+            "steps": 0, "launched": 0, "sampled": 0, "solo": 0, "drains": 0,
+            "t_launch": 0.0, "t_issue": 0.0, "t_sample": 0.0,
+        }
+        self._step_group = None
+        self._flight = None
+        self._lanes = {}
+        self._stagger_backlog = []
+        self._stagger_split = None
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
@@ -392,6 +434,11 @@ class Generator:
         """
 
         num_jobs = self.num_remaining_jobs()
+        # A pass issued in part is abandoned with its jobs (their pages and states go below)
+        flight, self._flight = self._flight, None
+        if flight is not None:
+            flight.step.close()
+        self._stagger_backlog = []
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
         self.active_jobs.clear()
@@ -442,6 +489,15 @@ class Generator:
         cancellation drains the generator completely, the page table is defragmented immediately because no active
         block tables still depend on the current physical page ordering.
         """
+
+        # The job's pass may be issued in part (staggered decode): its group is finished and
+        # sampled first, so no kernel is left to write into pages and states about to be
+        # released. The other jobs' tokens are handed out by the next iterate()
+        flight = self._flight
+        if flight is not None and any(j is job for j in flight.jobs):
+            backlog = []
+            self._stagger_drain(backlog)
+            self._stagger_backlog += [r for r in backlog if r.get("job") is not job]
 
         num_jobs = self.num_remaining_jobs()
 
@@ -536,10 +592,16 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+        if self._stagger_backlog:
+            results, self._stagger_backlog = self._stagger_backlog, []
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
+        flying = self._flight.jobs if self._flight is not None else ()
         for job in list(self.active_jobs):
+            # A job whose pass is issued in part has pages ahead of its sequence position
+            if flying and any(j is job for j in flying):
+                continue
             try:
                 job.prefill(results)
             except Exception as e:
@@ -549,8 +611,12 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
+        # Two groups of jobs half a pass apart (layers split over two GPUs)
+        if self._stagger_wanted():
+            self.iterate_staggered(results)
+
         # Generation with draft model
-        if self.draft_model:
+        elif self.draft_model:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -603,7 +669,12 @@ class Generator:
 
 
     def recurrent_checkpoint(self):
+        flying = self._flight.jobs if self._flight is not None else ()
         for job in self.active_jobs:
+            # The states of a job in flight are half a pass ahead on the first card only; it was
+            # offered its checkpoint at this very position before it was issued
+            if flying and any(j is job for j in flying):
+                continue
             job.maybe_stash_recurrent(self.recurrent_cache)
 
 
@@ -723,11 +794,12 @@ class Generator:
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
+        jobs = self._step_jobs()
 
         # Get shape of active batch
         batch_size = 0
         max_seq_len = 0
-        for job in self.active_jobs:
+        for job in jobs:
             if not job.is_prefill_done(): continue
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
             batch_size += 1
@@ -743,7 +815,7 @@ class Generator:
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
-        for job in self.active_jobs:
+        for job in jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
@@ -754,7 +826,7 @@ class Generator:
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
-        for job in self.active_jobs:
+        for job in jobs:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
@@ -961,14 +1033,285 @@ class Generator:
         return buf[:rows]
 
 
+    # ---------------------------------------------------------------------------------------
+    #   Staggered decode
+    # ---------------------------------------------------------------------------------------
+
+    def _step_jobs(self) -> list:
+        """Jobs the draft and decode steps work on: every active job, or one group of them
+        while the decode is staggered."""
+        group = self._step_group
+        return self.active_jobs if group is None else group
+
+
+    def _begin_forward(self, input_ids: torch.Tensor, params: dict):
+        """The decode step's forward pass, not issued yet: whole (Model.forward) for a regular
+        step, in pieces for a group of a staggered one."""
+        if self._step_group is None:
+            return DirectForward(self.model, input_ids, params)
+        return ForwardCursor(self.model, input_ids, params)
+
+
+    def _stagger_plan(self) -> int | None:
+        """Index in model.fwd_modules of the first module on the second card, or None when the
+        decode cannot be staggered: tensor-parallel load, not exactly two cards in a row, or a
+        drafter whose step is not group-aware (anything but MTP)."""
+        split = self._stagger_split
+        if split is None:
+            split = 0
+            why = None
+            if self.model.loaded_tp:
+                why = "tensor-parallel model"
+            elif self.ngram_match_min or (self.draft_model is not None and not self.mtp_draft):
+                why = "drafter other than MTP"
+            else:
+                bounds = cuda_stage_bounds(self.model)
+                if len(bounds) == 1:
+                    split = bounds[0]
+                else:
+                    why = f"layers on {len(bounds) + 1} card(s), two needed"
+            self._stagger_split = split
+            if self.stagger_decode:
+                if split:
+                    print(f" -- Staggered decode: modules 0-{split - 1} on the first card, "
+                          f"{split}-{len(self.model.fwd_modules) - 1} on the second")
+                else:
+                    print(f" !! Staggered decode not available: {why}")
+        return split or None
+
+
+    def _stagger_wanted(self) -> bool:
+        """Whether this iteration's decode goes through iterate_staggered(): always while a pass
+        is issued in part; otherwise with the switch on, two or more jobs generating and no job
+        ingesting its prompt (an iteration that may run a prefill chunk stays one batch)."""
+        if self._flight is not None:
+            return True
+        if not self.stagger_decode or self._stagger_plan() is None:
+            return False
+        ready = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done() or len(job.sequences) != 1:
+                return False
+            ready += 1
+        return ready >= 2
+
+
+    @staticmethod
+    def _stagger_pick(ready: list, n_flying: int) -> list:
+        """Jobs to issue now out of those at rest, given how many are in flight: all of them,
+        minus what evens out the two groups (a job held back joins the other group at the next
+        iteration). With nothing in flight this splits the jobs in two."""
+        hold = max(0, (len(ready) - n_flying) // 2)
+        return ready[:len(ready) - hold]
+
+
+    def _new_lane(self) -> dict:
+        lane = {"staging_buffers": {}, "sample_pinned": None, "_draft_conf_round": None}
+        for name in ("draft_input_ids_pinned", "draft_ids_pinned"):
+            buf = getattr(self, name, None)
+            if buf is not None:
+                lane[name] = torch.empty(buf.shape, dtype = buf.dtype, pin_memory = True)
+        return lane
+
+
+    @contextmanager
+    def _stagger_scope(self, lane: int, jobs: list):
+        """
+        Run a piece of the draft or decode step for one group: the step functions see only its
+        jobs, and stage through the pinned buffers of its lane. A group keeps its lane from the
+        moment its inputs are staged until it is sampled, and the other group in the meantime
+        uses the other lane: uploads from pinned memory are asynchronous, so a buffer rewritten
+        for one group while the other group's pass has yet to reach the second card would hand
+        that pass the wrong block table, cache lengths and token ids. Lane 0 is the generator's
+        own set of buffers.
+        """
+        assert self._step_group is None, "nested staggered scope"
+        own = None
+        if lane:
+            own = self._lanes.get(lane)
+            if own is None:
+                own = self._lanes[lane] = self._new_lane()
+            saved = {k: getattr(self, k) for k in own}
+            for k, v in own.items():
+                setattr(self, k, v)
+        self._step_group = jobs
+        try:
+            yield
+        finally:
+            self._step_group = None
+            if own is not None:
+                for k in own:
+                    own[k] = getattr(self, k)
+                for k, v in saved.items():
+                    setattr(self, k, v)
+
+
+    def _stagger_issue(self, late, early, split: int):
+        """
+        Issue the second-card half of one pass and the first-card half of another, a module of
+        each in turn. The kernels land on the two cards' own streams, so the cards work at the
+        same time. Taking turns is what keeps the CPU expert worker out of the way: it serves
+        its ring strictly in the order the jobs were published, so two halves issued one after
+        the other would make the first card wait at its first MoE layer until the second card
+        is done with all of its own. The second-card module goes first in each turn.
+        """
+        n = max(1, int(self.stagger_interleave))
+        if late is not None:
+            late.wake()
+        while True:
+            more = False
+            if late is not None and late.pos < late.end:
+                late.run_to(late.pos + n)
+                more = True
+            if early is not None and early.pos < split:
+                early.run_to(min(early.pos + n, split))
+                more = True
+            if not more:
+                break
+
+
+    def _stagger_sample(self, flight, results: list):
+        """Advance the states of a fully issued pass and resume its decode step to sample."""
+        logits = flight.fwd.finish()
+        with self._stagger_scope(flight.lane, flight.jobs):
+            try:
+                flight.step.send((logits, results))
+            except StopIteration:
+                pass
+        self.stagger_stats["sampled"] += 1
+
+
+    def _stagger_drain(self, results: list):
+        """Finish the pass in flight on its own and sample it (a job of its group is being
+        cancelled). No-op with nothing in flight."""
+        flight, self._flight = self._flight, None
+        if flight is None:
+            return
+        with torch.inference_mode():
+            flight.fwd.wake()
+            self._stagger_sample(flight, results)
+        self.stagger_stats["drains"] += 1
+
+
+    def iterate_staggered(self, results: list):
+        """
+        Decode step for a model whose layers are split over two GPUs, with the jobs in two
+        groups half a pass apart.
+
+        A regular step issues one pass for all the jobs: the first card runs its layers while
+        the second one waits, then the other way round, and each card is idle for more than
+        half of the step. Here one group is always "in flight": its pass has been issued up to
+        the last module on the first card and it waits there. Each call
+
+          1. drafts for the jobs at rest and stages their inputs (the new group);
+          2. issues the second-card half of the group in flight together with the first-card
+             half of the new group (_stagger_issue);
+          3. samples the group that was in flight, which is now complete; its tokens are this
+             call's results. The new group stays in flight for the next call.
+
+        So every call returns the tokens of one group and the groups take turns. The groups
+        are not fixed: whoever is at rest and ready is issued, minus what keeps the two groups
+        even. With one job left, or when a job starts ingesting a prompt, nothing new is issued,
+        the group in flight is completed alone and iterate() goes back to regular steps.
+
+        What makes it safe to keep a pass waiting: its jobs' pages and recurrent states are
+        referenced (nothing else can take them), its pinned staging buffers belong to its lane
+        (_stagger_scope), its stream stack is owned (ForwardCursor.hold), and while two passes
+        are issued in turn they are on different cards (the modules' workspaces are per card).
+        The states' position advances only when the pass is complete, so a job in flight looks
+        to the rest of iterate() as it did when it was issued; the state tensors of the
+        first-card layers are already a pass ahead, which is why such a job is passed over at
+        checkpoint time and its group is completed before any of its jobs is cancelled.
+
+        An exception in here is as fatal for the generator as one in a regular decode step.
+        """
+        stats = self.stagger_stats
+        t0 = time.perf_counter()
+        flight, self._flight = self._flight, None
+        split = self._stagger_plan()
+
+        # The new group: jobs at rest, unless the decode is going back to regular steps
+        launch = []
+        if self.stagger_decode and split is not None:
+            ready = []
+            for job in self.active_jobs:
+                if not job.is_prefill_done() or len(job.sequences) != 1:
+                    ready = []
+                    break
+                if flight is None or not any(j is job for j in flight.jobs):
+                    ready.append(job)
+            launch = self._stagger_pick(ready, len(flight.jobs) if flight is not None else 0)
+
+        new = None
+        if launch:
+            lane = 1 - flight.lane if flight is not None else 0
+            with self._stagger_scope(lane, launch):
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results) if self.mtp_draft else None
+                step = self._iterate_gen_co(draft_tokens)
+                try:
+                    fwd = next(step)
+                except StopIteration:
+                    step = None
+            if step is not None:
+                new = _Flight(step, fwd, lane, launch)
+                stats["launched"] += 1
+        t1 = time.perf_counter()
+
+        self._stagger_issue(
+            flight.fwd if flight is not None else None,
+            new.fwd if new is not None else None,
+            split,
+        )
+        if new is not None:
+            new.fwd.hold()
+            self._flight = new
+        t2 = time.perf_counter()
+
+        if flight is not None:
+            self._stagger_sample(flight, results)
+            if new is None:
+                stats["solo"] += 1
+        t3 = time.perf_counter()
+
+        stats["steps"] += 1
+        stats["t_launch"] += t1 - t0
+        stats["t_issue"] += t2 - t1
+        stats["t_sample"] += t3 - t2
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+        """
+        One decode step for the jobs of this step: build the batch, run the forward pass, sample.
+        """
+        step = self._iterate_gen_co(draft_tokens)
+        try:
+            fwd = next(step)
+        except StopIteration:
+            return
+        batch_logits = fwd.finish()
+        try:
+            step.send((batch_logits, results))
+        except StopIteration:
+            pass
+
+
+    def _iterate_gen_co(self, draft_tokens: torch.Tensor | None = None):
+        """
+        The decode step as a coroutine that stops once, at the forward pass: it yields the pass
+        (something with finish(), not issued yet or issued in part) and is resumed with
+        (logits, results) to sample from them. Returns without yielding when no job of the step is
+        generating. Before the yield the jobs' inputs are staged (their page positions move, their
+        sampling filters start); the results list is the one of the iterate() call that resumes
+        the step, which need not be the call that started it (iterate_staggered).
+        """
+        jobs = self._step_jobs()
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
         # determines how many cache pages the temporary block table needs for this iteration.
         batch_size = 0
         max_seq_len = 0
-        for job in self.active_jobs:
+        for job in jobs:
             if not job.is_prefill_done(): continue
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens)
             batch_size += len(job.sequences)
@@ -991,7 +1334,7 @@ class Generator:
         batch = 0
         use_offsets = "mrope" in self.model.caps
         positions = self._staging("positions", batch_size) if use_offsets else None
-        for job in self.active_jobs:
+        for job in jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
@@ -1008,7 +1351,7 @@ class Generator:
         active_embeddings = []
         logit_mapping = []
         batch_jobs = []
-        for job in self.active_jobs:
+        for job in jobs:
             logit_mapping.append(len(input_ids_list))
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
@@ -1059,10 +1402,7 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        batch_logits, results = yield self._begin_forward(batch_ids, params)
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -1135,7 +1475,7 @@ class Generator:
                     (max(batch_size, 32), 1), dtype = torch.long, pin_memory = True
                 )
             launched = []
-            for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+            for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a == b: continue
                 token_logits = batch_logits[a:b, :, :]
                 sampled = job.receive_logits(token_logits)
@@ -1177,7 +1517,7 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
-            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+            for idx, (job, a, b) in enumerate(zip(jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
@@ -1294,7 +1634,7 @@ class Generator:
             self._draft_conf_round = None
             cal = self.draft_calibrator
             row = 0
-            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+            for job, a_idx, b_idx in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx: continue
                 accepted_length = accepted_lengths[row]
                 conf = st["conf"][row]
@@ -1330,7 +1670,7 @@ class Generator:
         if self.mtp_draft:
             target_hidden = p_export_states[-1]
             accepted_idx = 0
-            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+            for job, a_idx, b_idx in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx:
                     continue
                 accepted_length = accepted_lengths[accepted_idx]
