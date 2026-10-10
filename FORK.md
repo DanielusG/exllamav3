@@ -105,8 +105,10 @@ Upstream's `iterate()` runs a prefill chunk for every job still ingesting its pr
 decode step: a job that is generating gets one token per chunk while another job's prompt goes in
 (2.9 s per 2048-token chunk on this machine). With the switch on, the forward passes of a chunk
 run on a second thread and the generator's thread goes on decoding. Off by default; with it off
-the generator behaves as upstream. **Not validated: the one run on the machine computed wrong
-numbers (see below); the fix that followed has not been run.**
+the generator behaves as upstream. Run on the machine on one case (one job generating, one
+ingesting an 8289-token document; see the two runs below): same numbers as upstream within
+upstream's own run-to-run noise, the generating job at half its solo speed during the ingestion,
+the ingestion half as long again. Not in use in the server.
 
 The two threads issue on the same CUDA streams, so kernels never overlap on a card. That is not
 a choice: the compiled EXL3 kernels (GEMM, MGEMM, the fused MoE kernel) coordinate their thread
@@ -195,8 +197,41 @@ First run on the machine (2026-10-10, bench at ad6dfa4, 8289-token document, chu
   run twice as upstream and judges the run with the thread against that floor; it counts values
   that are not finite, compares a prompt ingested on the thread with nobody decoding as well
   (which tells the thread from the overlap), and no longer resets the page table between runs
-  (it drops the state checkpoints instead; whether the reset was behind the floor is not known).
+  (it drops the state checkpoints instead; the reset was not behind the floor, see below).
 - Memory: about 70 MiB less free on each card with the thread (0.39 and 0.37 GiB left).
 - `EXL3_LANE_HOST_WAITS=0` (`--bench-no-handoff`) keeps the second thread's worker waits on the
   pass's stream: nothing is gained, but the handoff stream is out of the picture, for telling
   whose fault a wrong number is.
+
+Second run (2026-10-10, bench at af7c041, same case, with the fix):
+
+- Same computation, as far as this bench can tell. No value that is not finite; the three
+  comparisons with the thread are within the floor of the same run done twice as upstream
+  (largest shift 0.036-0.078 against 0.047-0.057, mean shift 0.0040-0.0056 against
+  0.0041-0.0050, most likely token changed in 1-3 positions against 1-4); expert selections
+  served from VRAM 0.945 with the thread against 0.949 as upstream, 0.951 against 0.951 with
+  nobody decoding. What it cannot tell: an error smaller than the floor, and a race that did
+  not happen in this one run.
+- Speed. The generating job got 354 tokens during the 11.3 s of the other job's ingestion
+  (31.2 tok/s; 61.0 alone, 1.1 as upstream), 193 decode steps beside 4 chunks. The ingestion
+  took 11.3 s against 7.9 s beside the same job as upstream and 7.3 s alone (731 prompt tok/s
+  against 1139). With nobody decoding the thread costs nothing (1144 against 1139). The same
+  work done one after the other takes 7.3 + 354 / 61.0 = 13.1 s, so the overlap saves 14%.
+- The cards are not what limits: 48% + 42% during the window (42% + 31% as upstream), 151 W
+  against 133 W. Which of the GIL and the worker's ring does has not been measured
+  (`--bench-switch-ms` moves the first).
+- Memory: peak 30 MiB higher on each card; 0.39 and 0.37 GiB free at the end against 0.40 and
+  0.44.
+- The floor is still there without the page-table reset, and upstream's sources name a cause
+  (read, not confirmed on the machine). On a split model a prefill chunk of 32 rows or more
+  sends the hot CPU-resident experts through `MoeCpuHost.submit_prefill`'s streamed path. Its
+  fused tier calls `exl3_moe` without the slot scratch, which the kernel describes as "arrival
+  order, which is not bit-reproducible run to run" (`quant/exl3_moe_kernel.cuh`), and its
+  batched tier adds with a single atomic `index_add_` unless `EXL3_MOE_RECON_DET=1`
+  (`modules/moe_batch_recon.py`: the default there is off, although the comment says it follows
+  `EXL3_MOE_FUSED_DET`, which is on). Both as in v1.5.4. Decode does not take that path, and
+  the staggered bench, whose repeated runs were identical with the same 55-token prompt, never
+  dropped its prompts between runs. A run with
+  `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1` would tell: if the repeated runs then read
+  identical, the comparison with the thread becomes exact (its speed figures would not be
+  production's: the fused tier is off).
