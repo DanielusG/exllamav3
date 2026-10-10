@@ -4,9 +4,20 @@ Bench of the staggered decode (Generator.stagger_decode) on the production model
 
 The model is loaded exactly as the OpenAI server loads it (same flags, through the server's own
 ModelContainer), then a raw Generator is driven from this process. For 2, 3 and 4 jobs
-generating at the same time it measures the regular decode (one batch) and the staggered one,
-and checks with greedy sampling that every job of the staggered run yields the same tokens as
-its group does alone.
+generating at the same time it gives three things:
+
+  - speed: the regular decode (one batch) against the staggered one, greedy sampling;
+  - same computation: every job is generated again with its own tokens forced on it, in every
+    mode, and the probabilities are compared position by position against the job's group
+    alone. Two identical runs of this model do not give the same greedy tokens (the first
+    near-tie flips and the texts part ways), so comparing tokens proves nothing; forced tokens
+    keep every run on the same sequence and the group alone, run twice, gives the noise floor;
+  - where the time goes: a short run with CUDA events around each card's part of the pass and
+    around the handoffs to the CPU expert worker (stream time, no host synchronization).
+
+Before measuring, the expert placement is adapted to the bench's own prompts with the
+library's sweeps (the placement loaded from the server's file follows production traffic). The
+server's placement file is never written.
 
 Run it with the server STOPPED (it needs the server's VRAM), from the server repository:
 
@@ -34,6 +45,8 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+from types import SimpleNamespace
 
 PROMPTS = [
     "Write a detailed technical essay, at least 1500 words long, on how a B-tree index works "
@@ -47,6 +60,24 @@ PROMPTS = [
     "Explain at length, in at least 1500 words, the history of the steam engine from Newcomen "
     "to the locomotive, with dates, people, and the engineering problems each step solved.",
 ]
+
+NAMES = "abcd"
+_MISSING = object()
+
+
+def _own_attr(obj, name: str):
+    """The attribute as set on the instance itself (_MISSING when it comes from the class)."""
+    return getattr(obj, "__dict__", {}).get(name, _MISSING)
+
+
+def _restore_attr(obj, name: str, prev):
+    if prev is _MISSING:
+        try:
+            delattr(obj, name)
+        except AttributeError:
+            pass
+    else:
+        setattr(obj, name, prev)
 
 
 class GpuSampler:
@@ -111,13 +142,14 @@ class Timer:
         self.calls = 0
         self._obj = obj
         self._name = name
-        self._orig = getattr(obj, name)
+        self._prev = _own_attr(obj, name)
+        orig = getattr(obj, name)
         timer = self
 
         def timed(*args, **kwargs):
             t0 = time.perf_counter()
             try:
-                return timer._orig(*args, **kwargs)
+                return orig(*args, **kwargs)
             finally:
                 timer.total += time.perf_counter() - t0
                 timer.calls += 1
@@ -130,95 +162,344 @@ class Timer:
         return total, calls
 
     def remove(self):
+        _restore_attr(self._obj, self._name, self._prev)
+
+
+class StreamProf:
+    """
+    Stream-time brackets (CUDA events, no host synchronization) for a profiled run: around each
+    card's part of a decode pass and, inside it, around the two handoffs of a MoE layer to the
+    CPU expert worker. The collect bracket (wait for the worker's flag, then the readback) is
+    the stall a card could not hide behind its own expert work; the issue bracket is the wait
+    for the slot's previous job plus the staging kernel.
+
+    A pass bracket starts when the host starts issuing and ends when the card is done with what
+    was issued: in a regular step the second card's bracket therefore includes the first half
+    of the pass, which runs on the other card.
+
+    Installed for the profiled runs only (begin/end): the wrappers cost a few events per layer.
+    """
+
+    def __init__(self, torch, model, gen, stage_devs):
+        self.torch = torch
+        self.model = model
+        self.gen = gen
+        self.stage_devs = stage_devs        # (first card, second card) of a pass; None when unknown
+        self.step = 0                       # index of the iterate() call in progress
+        self.fallbacks = 0                  # handoffs that left the fused path (not bracketed)
+        self.pending = []                   # (kind, device index, step, start event, end event)
+        self.resolved = []                  # (kind, device index, step, ms)
+        self._undo = []
+
+    def _swap(self, obj, name: str, make):
+        prev = _own_attr(obj, name)
+        setattr(obj, name, make(getattr(obj, name)))
+        self._undo.append((obj, name, prev))
+
+    def _mark(self, dev):
+        with self.torch.cuda.device(dev):
+            ev = self.torch.cuda.Event(enable_timing = True)
+            ev.record()
+        return ev
+
+    def _bracket(self, kind: str, devs: list, fn):
+        starts = [(d, self._mark(d)) for d in devs]
+        r = fn()
+        for d, ev0 in starts:
+            self.pending.append((kind, d.index, self.step, ev0, self._mark(d)))
+        return r
+
+    def begin(self):
+        prof = self
+        self.pending, self.resolved, self.fallbacks, self.step = [], [], 0, 0
+        d0, d1 = self.stage_devs
+        both = [d for d in (d0, d1) if d is not None]
+
+        def issue(orig):
+            def wrapped(layer_idx, y, *args, **kwargs):
+                r = prof._bracket("issue", [y.device], lambda: orig(layer_idx, y, *args, **kwargs))
+                if r is None:
+                    prof.fallbacks += 1
+                return r
+            return wrapped
+
+        def collect(orig):
+            def wrapped(handle, *args, **kwargs):
+                # handle: (seq, slot, rows, h, ho, device, counts)
+                return prof._bracket("collect", [handle[5]], lambda: orig(handle, *args, **kwargs))
+            return wrapped
+
+        def forward(orig):
+            def wrapped(*args, **kwargs):
+                return prof._bracket("pass", both, lambda: orig(*args, **kwargs))
+            return wrapped
+
+        def stagger_issue(orig):
+            def wrapped(late, early, split):
+                devs = []
+                if late is not None and d1 is not None:
+                    devs.append(d1)
+                if early is not None and d0 is not None:
+                    devs.append(d0)
+                return prof._bracket("pass", devs, lambda: orig(late, early, split))
+            return wrapped
+
+        for host in getattr(self.model.config, "moe_cpu_hosts", {}).values():
+            if hasattr(host, "submit_issue_fused"):
+                self._swap(host, "submit_issue_fused", issue)
+            if hasattr(host, "submit_collect_fused"):
+                self._swap(host, "submit_collect_fused", collect)
+        self._swap(self.model, "forward", forward)
+        if hasattr(self.gen, "_stagger_issue"):
+            self._swap(self.gen, "_stagger_issue", stagger_issue)
+
+    def end(self):
+        for obj, name, prev in reversed(self._undo):
+            _restore_attr(obj, name, prev)
+        self._undo = []
+        for d in range(self.torch.cuda.device_count()):
+            self.torch.cuda.synchronize(d)
+        for kind, dev, step, ev0, ev1 in self.pending:
+            self.resolved.append((kind, dev, step, ev0.elapsed_time(ev1)))
+        self.pending = []
+
+    @staticmethod
+    def digest(resolved: list, first: int, last: int) -> dict:
+        """Per (kind, card): ms and brackets per iterate() call, median and p90 of one bracket,
+        over the calls first+1 .. last."""
+        calls = max(1, last - first)
+        by = {}
+        for kind, dev, step, ms in resolved:
+            if first < step <= last:
+                by.setdefault((kind, dev), []).append(ms)
+        out = {}
+        for key, vals in by.items():
+            vals.sort()
+            out[key] = {
+                "ms_call": sum(vals) / calls,
+                "n_call": len(vals) / calls,
+                "med": vals[len(vals) // 2],
+                "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
+            }
+        return out
+
+
+def split_modules(model) -> list:
+    """The MoE layers with a dynamic expert placement (empty without one)."""
+    ip = getattr(getattr(model, "config", None), "infer_params", None)
+    return list(getattr(ip, "moe_cpu_swap_modules", None) or [])
+
+
+def placement_counts(torch, model):
+    """(expert selections served from VRAM, all selections) counted by the split layers since
+    the last sweep; None for a model without a dynamic placement. A sweep decays the counts, so
+    two readings are comparable only with no sweep in between."""
+    mods = split_modules(model)
+    if not mods:
+        return None
+    gpu = total = 0.0
+    with torch.inference_mode():
+        for m in mods:
+            hist = m._split_hist.detach().to("cpu", torch.float64)
+            smap = m._split_map.detach().to("cpu")
+            total += float(hist.sum())
+            gpu += float(hist[smap < m.cpu_split_first].sum())
+    return gpu, total
+
+
+def placement_maps(torch, model) -> list:
+    with torch.inference_mode():
+        return [m._split_map.detach().to("cpu").clone() for m in split_modules(model)]
+
+
+def hit_rate(c0, c1):
+    if c0 is None or c1 is None:
+        return None
+    total = c1[1] - c0[1]
+    return (c1[0] - c0[0]) / total if total > 0 else None
+
+
+def stage_devices(torch, model, split):
+    """The CUDA device of the modules before and after the stage boundary (None when unknown)."""
+    def first(mods):
+        for module, _, _ in mods:
+            dev = getattr(module, "device", None)
+            if dev is not None and torch.device(dev).type == "cuda":
+                return torch.device(dev)
+        return None
+    if not split:
+        return first(model.fwd_modules), None
+    return first(model.fwd_modules[:split]), first(model.fwd_modules[split:])
+
+
+class Bench:
+    """A loaded model, its generator and the instruments; run() is one generation."""
+
+    def __init__(self, env, gpu):
+        self.env = env
+        self.gpu = gpu
+        self.timers = {}
+        for key, obj, name in (("draft", env.gen, "iterate_draftmodel_mtp_gen"), ("forward", env.model, "forward")):
+            if hasattr(obj, name):
+                self.timers[key] = Timer(obj, name)
+
+    def close(self):
+        for t in self.timers.values():
+            t.remove()
+
+    def run(self, job_names, stagger: bool, tokens: int, forced: dict | None = None, profile: bool = False):
+        """
+        Generate for the named prompts at the same time: `tokens` tokens each with greedy
+        sampling, or, with `forced` (name -> token ids), exactly those tokens, with the
+        probability of each and the two most likely tokens of its position recorded. Returns
+        the tokens of each job and the figures of the stretch in which ALL the jobs were
+        generating (from the iteration after the last job's first token to the one before the
+        first job's last).
+        """
+        env = self.env
+        torch, gen = env.torch, env.gen
+        prof = env.prof if profile else None
+        gen.stagger_decode = stagger
+        stats0 = dict(gen.stagger_stats)
+        for t in self.timers.values():
+            t.take()
+        counts0 = placement_counts(torch, env.model)
+
+        jobs = {}
+        for name in job_names:
+            kwargs = {}
+            n_new = tokens
+            if forced is not None:
+                n_new = len(forced[name])
+                kwargs = {"return_probs": True, "return_top_tokens": 2}
+            jobs[name] = env.Job(
+                input_ids = env.prompts[name],
+                max_new_tokens = n_new,
+                sampler = env.sampler_cls(),
+                identifier = name,
+                **kwargs,
+            )
+        by_job = {id(job): name for name, job in jobs.items()}
+        gen.enqueue(list(jobs.values()))
+        if forced is not None:
+            for name, job in jobs.items():
+                job.constrain_output_now(torch.tensor([forced[name]], dtype = torch.long))
+
+        out = {name: [] for name in jobs}
+        probs = {name: [] for name in jobs}
+        top = {name: [] for name in jobs}       # per position: ([token 1, token 2], [p1, p2])
+        done = set()
+        timeline = []       # (t after the iteration, tokens so far per job, jobs done)
+        marks = []          # timer and stagger totals after each iteration
+        if prof is not None:
+            prof.begin()
         try:
-            delattr(self._obj, self._name)
-        except AttributeError:
-            pass
+            while gen.num_remaining_jobs():
+                if prof is not None:
+                    prof.step = len(timeline)
+                results = gen.iterate()
+                now = time.perf_counter()
+                for r in results:
+                    name = by_job.get(id(r.get("job")))
+                    if r.get("stage") == "error":
+                        raise RuntimeError(f"job {name} failed: {r.get('error')!r}")
+                    if r.get("stage") != "streaming" or name is None:
+                        continue
+                    ids = r.get("token_ids")
+                    if ids is not None:
+                        out[name] += ids.reshape(-1).tolist()
+                    p = r.get("token_probs")
+                    if p is not None:
+                        probs[name] += p.reshape(-1).tolist()
+                    kt, kp = r.get("top_k_tokens"), r.get("top_k_probs")
+                    if kt is not None and kp is not None:
+                        top[name] += list(zip(
+                            kt.reshape(-1, kt.shape[-1]).tolist(),
+                            kp.reshape(-1, kp.shape[-1]).tolist(),
+                        ))
+                    if r.get("eos"):
+                        done.add(name)
+                timeline.append((now, {n: j.new_tokens + getattr(j, "rq_new_tokens", 0) for n, j in jobs.items()}, len(done)))
+                marks.append((
+                    {k: (t.total, t.calls) for k, t in self.timers.items()},
+                    dict(gen.stagger_stats),
+                ))
+        finally:
+            if prof is not None:
+                prof.end()
 
-
-def run_once(gen, Job, sampler_cls, prompts: dict, tokens: int, stagger: bool, gpu: GpuSampler | None, timers: dict):
-    """
-    Generate `tokens` tokens for every prompt at the same time. Returns a dict with the tokens
-    of each job and the figures of the stretch in which ALL the jobs were generating (from the
-    iteration after the last job's first token to the one before the first job's last).
-    """
-    gen.stagger_decode = stagger
-    stats0 = dict(gen.stagger_stats)
-    for t in timers.values():
-        t.take()
-
-    jobs = {}
-    for name, ids in prompts.items():
-        job = Job(input_ids = ids, max_new_tokens = tokens, sampler = sampler_cls(), identifier = name)
-        jobs[name] = job
-    by_job = {id(job): name for name, job in jobs.items()}
-    gen.enqueue(list(jobs.values()))
-
-    out = {name: [] for name in jobs}
-    done = set()
-    timeline = []       # (t after the iteration, tokens so far per job)
-    marks = []          # timer and stagger totals after each iteration
-    while gen.num_remaining_jobs():
-        results = gen.iterate()
-        now = time.perf_counter()
-        for r in results:
-            name = by_job.get(id(r.get("job")))
-            if r.get("stage") == "error":
-                raise RuntimeError(f"job {name} failed: {r.get('error')!r}")
-            if r.get("stage") != "streaming":
-                continue
-            ids = r.get("token_ids")
-            if ids is not None:
-                out[name] += ids.view(-1).tolist()
-            if r.get("eos"):
-                done.add(name)
-        timeline.append((now, {n: j.new_tokens + getattr(j, "rq_new_tokens", 0) for n, j in jobs.items()}, len(done)))
-        marks.append((
-            {k: (t.total, t.calls) for k, t in timers.items()},
-            dict(gen.stagger_stats),
-        ))
-
-    # The stretch with every job generating
-    first = next((i for i, (_, toks, _) in enumerate(timeline) if all(v >= 1 for v in toks.values())), None)
-    last = next((i for i, (_, _, n_done) in enumerate(timeline) if n_done > 0), len(timeline)) - 1
-    res = {
-        "tokens": out,
-        "jobs": len(jobs),
-        "stagger": stagger,
-        "accepted": sum(j.accepted_draft_tokens for j in jobs.values()),
-        "rejected": sum(j.rejected_draft_tokens for j in jobs.values()),
-        "window": None,
-    }
-    if first is not None and last > first + 4:
-        t_a, toks_a, _ = timeline[first]
-        t_b, toks_b, _ = timeline[last]
-        n_tok = sum(toks_b.values()) - sum(toks_a.values())
-        steps = last - first
-        dur = t_b - t_a
-        tm_a, st_a = marks[first]
-        tm_b, st_b = marks[last]
-        res["window"] = {
-            "seconds": dur,
-            "tokens": n_tok,
-            "steps": steps,
-            "tok_s": n_tok / dur,
-            "ms_step": 1000.0 * dur / steps,
-            "tok_step": n_tok / steps,
-            "per_job": {n: (toks_b[n] - toks_a[n]) / dur for n in toks_a},
-            "timers_ms_step": {k: 1000.0 * (tm_b[k][0] - tm_a[k][0]) / steps for k in tm_a},
-            "stagger": {k: st_b[k] - st_a[k] for k in st_b},
-            "gpu": gpu.mean(t_a, t_b) if gpu is not None else None,
+        # The stretch with every job generating
+        first = next((i for i, (_, toks, _) in enumerate(timeline) if all(v >= 1 for v in toks.values())), None)
+        last = next((i for i, (_, _, n_done) in enumerate(timeline) if n_done > 0), len(timeline)) - 1
+        res = {
+            "names": list(job_names),
+            "stagger": stagger,
+            "tokens": out,
+            "probs": probs,
+            "top": top,
+            "accepted": sum(j.accepted_draft_tokens for j in jobs.values()),
+            "rejected": sum(j.rejected_draft_tokens for j in jobs.values()),
+            "hit": hit_rate(counts0, placement_counts(torch, env.model)),
+            "window": None,
+            "prof": None,
+            "prof_fallbacks": prof.fallbacks if prof is not None else 0,
         }
-    res["stagger_total"] = {k: gen.stagger_stats[k] - stats0[k] for k in stats0}
-    return res
+        if first is not None and last > first + 4:
+            t_a, toks_a, _ = timeline[first]
+            t_b, toks_b, _ = timeline[last]
+            n_tok = sum(toks_b.values()) - sum(toks_a.values())
+            steps = last - first
+            dur = max(t_b - t_a, 1e-9)
+            tm_a, st_a = marks[first]
+            tm_b, st_b = marks[last]
+            res["window"] = {
+                "seconds": dur,
+                "tokens": n_tok,
+                "steps": steps,
+                "tok_s": n_tok / dur,
+                "ms_step": 1000.0 * dur / steps,
+                "tok_step": n_tok / steps,
+                "per_job": {n: (toks_b[n] - toks_a[n]) / dur for n in toks_a},
+                "timers_ms_step": {k: 1000.0 * (tm_b[k][0] - tm_a[k][0]) / steps for k in tm_a},
+                "stagger": {k: st_b[k] - st_a[k] for k in st_b},
+                "gpu": self.gpu.mean(t_a, t_b) if self.gpu is not None else None,
+            }
+            if prof is not None:
+                res["prof"] = StreamProf.digest(prof.resolved, first, last)
+        res["stagger_total"] = {k: gen.stagger_stats[k] - stats0[k] for k in stats0}
+        return res
 
 
-def first_difference(a: list, b: list):
-    """None when one list is a prefix of the other (or equal), else the first index that differs."""
-    for i, (x, y) in enumerate(zip(a, b)):
-        if x != y:
-            return i
-    return None
+def compare_forced(ref: dict, run: dict, name: str):
+    """
+    One job of a forced run against the same job of a reference run (same forced tokens):
+    how far the probability of the forced token moved, in how many positions the most likely
+    token changed and how wide the reference's lead was where it did, and in how many positions
+    of the run the forced token is the most likely one. None when either run recorded nothing.
+    """
+    p_r, p_x = ref["probs"].get(name, []), run["probs"].get(name, [])
+    t_r, t_x = ref["top"].get(name, []), run["top"].get(name, [])
+    forced = run["tokens"].get(name, [])
+    n = min(len(p_r), len(p_x), len(t_r), len(t_x), len(forced))
+    if n == 0:
+        return None
+    delta = [abs(a - b) for a, b in zip(p_r[:n], p_x[:n])]
+    flips = [i for i in range(n) if t_r[i][0][0] != t_x[i][0][0]]
+    return {
+        "n": n,
+        "max": max(delta),
+        "mean": statistics.fmean(delta),
+        "flips": len(flips),
+        "first_flip": flips[0] if flips else None,
+        "margin": max((t_r[i][1][0] - t_r[i][1][1] for i in flips), default = None),
+        "on_top": sum(1 for i in range(n) if t_x[i][0][0] == forced[i]),
+    }
+
+
+def groups_of(n: int) -> list:
+    """The two groups a staggered run of the first n jobs settles into (Generator._stagger_pick)."""
+    first = n - n // 2
+    return [NAMES[:first], NAMES[first:n]]
 
 
 def fmt(x, nd = 1):
@@ -232,11 +513,353 @@ def table(header: list, rows: list) -> str:
     return "\n".join(lines)
 
 
+def timing_row(label: str, r: dict) -> list:
+    w = r["window"]
+    if w is None:
+        return [label, "finestra troppo corta"] + ["-"] * 10
+    acc = r["accepted"] + r["rejected"]
+    g = w["gpu"]
+    st = w["stagger"]
+    steps = max(1, w["steps"])
+    if r["stagger"]:
+        host = (f"bozza+ingressi {1000 * st['t_launch'] / steps:.2f}, emissione {1000 * st['t_issue'] / steps:.2f}, "
+                f"campionamento {1000 * st['t_sample'] / steps:.2f}")
+    else:
+        tm = w["timers_ms_step"]
+        draft, forward = tm.get("draft", 0.0), tm.get("forward", 0.0)
+        host = f"bozza {draft:.2f}, emissione {forward:.2f}, resto {w['ms_step'] - draft - forward:.2f}"
+    return [
+        label,
+        fmt(w["tok_s"]),
+        " / ".join(fmt(v) for v in w["per_job"].values()),
+        fmt(w["ms_step"], 2),
+        fmt(w["tok_step"], 2),
+        fmt(r["accepted"] / acc if acc else None, 3),
+        fmt(r["hit"], 3),
+        " + ".join(f"{u:.0f}%" for u, _, _ in g) if g else "-",
+        " + ".join(f"{p:.0f} W" for _, p, _ in g) if g else "-",
+        g[0][2] if g else 0,
+        fmt(w["seconds"], 1),
+        host,
+    ]
+
+
+TIMING_HEADER = [
+    "modo", "tok/s totali", "tok/s per job", "ms per chiamata", "token per chiamata", "accettazione bozza",
+    "selezioni servite dalla VRAM", "uso schede", "potenza", "campioni GPU", "finestra s",
+    "tempo host per chiamata (ms)",
+]
+
+
+def check_row(name: str, label: str, c) -> list:
+    if c is None:
+        return [name, label, "nessun dato", "-", "-", "-", "-", "-"]
+    return [
+        name,
+        label,
+        c["n"],
+        c["on_top"],
+        c["flips"] if not c["flips"] else f"{c['flips']} (primo all'indice {c['first_flip']})",
+        fmt(c["margin"], 4),
+        "0 (identici)" if c["max"] == 0 else f"{c['max']:.4f}",
+        f"{c['mean']:.5f}",
+    ]
+
+
+CHECK_HEADER = [
+    "job", "confronto", "posizioni", "token imposto più probabile", "top-1 cambiati",
+    "margine massimo dove cambia", "scarto massimo di p", "scarto medio di p",
+]
+
+
+def prof_row(label: str, r: dict) -> list:
+    w, p = r["window"], r["prof"]
+    if w is None or p is None:
+        return [label, "finestra troppo corta"] + ["-"] * 7
+    cards = sorted({dev for _, dev in p})
+
+    def cell(kind: str, field: str, nd: int) -> str:
+        return " / ".join(fmt(p.get((kind, d), {}).get(field), nd) for d in cards) if cards else "-"
+
+    return [
+        label,
+        fmt(w["ms_step"], 2),
+        cell("pass", "ms_call", 2),
+        cell("collect", "ms_call", 2),
+        cell("issue", "ms_call", 2),
+        cell("collect", "n_call", 1),
+        cell("collect", "med", 3),
+        cell("collect", "p90", 3),
+        r["prof_fallbacks"],
+    ]
+
+
+PROF_HEADER = [
+    "giro", "ms per chiamata", "passo (scheda 0 / 1)", "attesa del worker (scheda 0 / 1)",
+    "consegna al worker (scheda 0 / 1)", "raccolte per chiamata (scheda 0 / 1)",
+    "una raccolta, mediana ms (scheda 0 / 1)", "una raccolta, p90 ms (scheda 0 / 1)", "consegne fuori dal percorso fuso",
+]
+
+
+def measure(env, args, gpu = None) -> str:
+    """Everything between a loaded model and the text of the report."""
+    torch, gen, model = env.torch, env.gen, env.model
+    names = NAMES[:env.max_jobs]
+    n_jobs_list = [n for n in env.n_jobs_list if 2 <= n <= env.max_jobs]
+    bench = Bench(env, gpu)
+    notes = []          # problems of the measure itself, shown right under the summary
+
+    def phase(label: str, fn):
+        print(f" -- bench: {label}", flush = True)
+        try:
+            return fn()
+        except Exception as e:
+            traceback.print_exc()
+            notes.append(
+                f"**Attenzione**: la fase «{label}» è fallita con `{type(e).__name__}: {e}`; "
+                "le cifre che ne dipendono mancano e quelle delle fasi successive vanno lette con riserva."
+            )
+            try:
+                if gen.num_remaining_jobs():
+                    gen.clear_queue()
+            except Exception:
+                traceback.print_exc()
+            return None
+
+    sections = []
+
+    # 1. Expert placement on the bench's own prompts
+    adapt_rows = []
+    adapt_note = None
+
+    def adapt():
+        nonlocal adapt_note
+        if args.bench_adapt <= 0:
+            adapt_note = "Adattamento disattivato (`--bench-adapt 0`): il piazzamento è quello caricato dal file del server."
+            return
+        if env.sweep is None or placement_counts(torch, model) is None:
+            adapt_note = "Il modello non ha un piazzamento dinamico degli esperti: niente da adattare."
+            return
+        for i in range(args.bench_adapt):
+            r = bench.run(names, False, args.bench_adapt_tokens)
+            before = placement_maps(torch, model)
+            env.sweep()
+            after = placement_maps(torch, model)
+            moved = sum(int((a != b).sum()) for a, b in zip(before, after)) // 2
+            adapt_rows.append([i + 1, fmt(r["hit"], 3), moved])
+            if moved == 0:
+                break
+
+    phase("expert placement", adapt)
+    text = [
+        "Quota delle selezioni di esperti che cadono su esperti residenti in VRAM (il resto lo calcola il "
+        "worker su CPU). Il piazzamento caricato dal file del server segue il traffico di produzione; qui "
+        f"viene adattato ai prompt della misura: ogni giro genera {args.bench_adapt_tokens} token per job "
+        "con tutti i job insieme, poi uno sweep della libreria scambia gli esperti. Dopo l'ultimo giro il "
+        "piazzamento resta fermo per tutta la misura. Il file di piazzamento del server non viene scritto "
+        "(gli sweep non passano dal tier del server, che è l'unico a salvarlo).",
+    ]
+    if adapt_rows:
+        text.append(table(["giro", "selezioni servite dalla VRAM nel giro", "esperti scambiati dallo sweep che segue"], adapt_rows))
+    if adapt_note:
+        text.append(adapt_note)
+    sections.append("## Piazzamento degli esperti\n\n" + "\n\n".join(text))
+
+    # 2. Warm-up of every shape the measure uses
+    def warmup():
+        bench.run(names[:1], False, args.bench_warmup)
+        for n in n_jobs_list:
+            for g in groups_of(n):
+                bench.run(g, False, args.bench_warmup)
+            bench.run(names[:n], False, args.bench_warmup)
+            bench.run(names[:n], True, args.bench_warmup)
+
+    phase("warm-up", warmup)
+
+    # 3. Speed
+    solo = {}
+
+    def one_at_a_time():
+        for name in names:
+            solo[name] = bench.run(name, False, args.bench_tokens)
+
+    phase("one job at a time", one_at_a_time)
+    rows = []
+    for name, r in solo.items():
+        w = r["window"]
+        rows.append([
+            name, len(r["tokens"][name]), fmt(w and w["tok_s"]), fmt(w and w["ms_step"], 2),
+            fmt(w and w["tok_step"], 2), fmt(r["hit"], 3),
+        ])
+    sections.append("## Un job alla volta\n\n" + table(
+        ["job", "token", "tok/s", "ms per passo", "token per passo", "selezioni servite dalla VRAM"], rows,
+    ))
+
+    summary = []
+    for n in n_jobs_list:
+        def timing(n = n):
+            return bench.run(names[:n], False, args.bench_tokens), bench.run(names[:n], True, args.bench_tokens)
+
+        pair = phase(f"{n} jobs", timing)
+        if pair is None:
+            continue
+        batched, staggered = pair
+        section = [f"## {n} job insieme\n", table(TIMING_HEADER, [timing_row("un batch", batched), timing_row("sfalsato", staggered)])]
+        wb, ws = batched["window"], staggered["window"]
+        if wb and ws:
+            gain = ws["tok_s"] / wb["tok_s"] - 1.0
+            summary.append([n, fmt(wb["tok_s"]), fmt(ws["tok_s"]), f"{100 * gain:+.1f}%"])
+            section.append(f"\nSfalsato rispetto a un batch: **{100 * gain:+.1f}%** di tok/s totali.")
+        st = staggered["stagger_total"]
+        section.append(
+            f"\nContatori del decode sfalsato sull'intero giro: {st['steps']} chiamate, {st['launched']} gruppi emessi, "
+            f"{st['sampled']} campionati, {st['solo']} completati da soli, {st['drains']} svuotamenti. "
+            f"Gruppi attesi: {' e '.join('`' + g + '`' for g in groups_of(n))}."
+        )
+        sections.append("\n".join(section))
+
+    # 4. Same computation: forced tokens, probabilities against the group alone
+    check_parts = []
+
+    def check():
+        ref_tokens = {name: solo[name]["tokens"][name] for name in solo}
+        missing = [name for name in names if not ref_tokens.get(name)]
+        if missing:
+            raise RuntimeError(f"no reference tokens for {missing}")
+        alone = {}      # group -> its two forced runs
+        for n in n_jobs_list:
+            for g in groups_of(n):
+                if g not in alone:
+                    alone[g] = (
+                        bench.run(g, False, 0, forced = ref_tokens),
+                        bench.run(g, False, 0, forced = ref_tokens),
+                    )
+            batched = bench.run(names[:n], False, 0, forced = ref_tokens)
+            staggered = bench.run(names[:n], True, 0, forced = ref_tokens)
+            rows = []
+            unforced = []
+            for g in groups_of(n):
+                ref, again = alone[g]
+                for name in g:
+                    rows.append(check_row(name, f"`{g}` da solo, rifatto", compare_forced(ref, again, name)))
+                    rows.append(check_row(name, f"sfalsato contro `{g}` da solo", compare_forced(ref, staggered, name)))
+                    rows.append(check_row(name, f"un batch contro `{g}` da solo", compare_forced(ref, batched, name)))
+                    for label, r in (("da solo", ref), ("sfalsato", staggered), ("un batch", batched)):
+                        if r["tokens"][name] != ref_tokens[name]:
+                            unforced.append(f"`{name}` ({label})")
+            st = staggered["stagger_total"]
+            part = [
+                f"### {n} job\n",
+                table(CHECK_HEADER, rows),
+                f"\nGiro sfalsato a token imposti: {st['steps']} chiamate, {st['launched']} gruppi emessi, "
+                f"{st['sampled']} campionati, {st['solo']} completati da soli, {st['drains']} svuotamenti.",
+            ]
+            if unforced:
+                part.append(
+                    "\n**Attenzione**: i token usciti non sono quelli imposti per " + ", ".join(unforced)
+                    + "; le righe di quei job non confrontano la stessa sequenza."
+                )
+            check_parts.append("\n".join(part))
+
+    phase("same computation (forced tokens)", check)
+    sections.append(
+        "## Stesso calcolo?\n\n"
+        "Due giri identici di questo modello non danno gli stessi token greedy: al primo quasi-pareggio la scelta "
+        "cambia e da lì i testi divergono, quindi confrontare i token non dice nulla. Qui ogni job viene generato "
+        "di nuovo **imponendogli** i token che ha prodotto da solo, in tutti i modi: ogni giro elabora la stessa "
+        "sequenza e a ogni posizione si registrano la probabilità del token imposto e i due token più probabili. "
+        "Il riferimento è il gruppo del job fatto girare da solo; la riga «rifatto» confronta due giri identici "
+        "del gruppo da solo ed è la misura di quanto il modello cambia da un giro all'altro senza che cambi "
+        "nulla.\n\n"
+        "- **token imposto più probabile**: in quante posizioni del giro in esame il token imposto è anche il più probabile\n"
+        "- **top-1 cambiati**: posizioni in cui il token più probabile non è lo stesso nei due giri\n"
+        "- **margine massimo dove cambia**: tra quelle posizioni, il distacco più grande tra primo e secondo token nel riferimento\n"
+        "- **scarto di p**: differenza, in valore assoluto, tra i due giri della probabilità del token imposto\n\n"
+        + ("\n\n".join(check_parts) if check_parts else "Nessun confronto completato.")
+    )
+
+    # 5. Where the time goes: stream-time brackets
+    prof_rows = []
+
+    def profile():
+        if env.prof is None:
+            raise RuntimeError("no CUDA device: stream-time brackets not available")
+        r = bench.run(names[:1], False, args.bench_prof_tokens, profile = True)
+        prof_rows.append(prof_row(f"`{names[0]}` da solo", r))
+        for n in n_jobs_list:
+            r = bench.run(names[:n], False, args.bench_prof_tokens, profile = True)
+            prof_rows.append(prof_row(f"{n} job, un batch", r))
+            r = bench.run(names[:n], True, args.bench_prof_tokens, profile = True)
+            prof_rows.append(prof_row(f"{n} job, sfalsato", r))
+
+    phase("where the time goes", profile)
+    sections.append(
+        "## Dove va il tempo\n\n"
+        f"Giri brevi a parte ({args.bench_prof_tokens} token per job) con eventi CUDA attorno alle parti del passo: "
+        "tempi di flusso delle schede, senza sincronizzare l'host. Cifre per chiamata di `iterate()`, sul tratto in "
+        "cui tutti i job generano.\n\n"
+        "- **passo**: dall'inizio dell'emissione alla fine del lavoro emesso su quella scheda. Nel modo normale quello "
+        "della scheda 1 comprende la prima metà del passo, che gira sulla scheda 0\n"
+        "- **attesa del worker**: somma delle parentesi di raccolta, cioè il tempo in cui la scheda è ferma ad aspettare "
+        "gli esperti calcolati su CPU (più la rilettura del risultato) dopo aver finito i propri\n"
+        "- **consegna al worker**: somma delle parentesi di emissione di un job (attesa che lo slot sia libero, più il "
+        "kernel che lo riempie)\n"
+        "- **raccolte per chiamata**: quanti layer MoE la scheda ha chiuso in una chiamata\n\n"
+        + (table(PROF_HEADER, prof_rows) if prof_rows else "Nessun giro di profilo completato.")
+    )
+
+    bench.close()
+
+    split = env.split
+    copies = env.copy_stats() if env.copy_stats is not None else None
+    head = [
+        "# Decode sfalsato: misura",
+        "",
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+        "## Sintesi",
+        "",
+        table(["job insieme", "un batch tok/s", "sfalsato tok/s", "differenza"], summary) if summary else "Nessuna misura completa.",
+        "",
+    ]
+    for note in notes:
+        head += [note, ""]
+    head += [
+        "## Condizioni",
+        "",
+        f"- ExLlamaV3 {env.version} da `{env.lib_path}`, torch {env.torch_version}",
+        f"- Modello `{env.model_path}`",
+        f"- Schede: {', '.join(env.devices) if env.devices else '-'}",
+        f"- Confine tra le schede: modulo {split} di {env.n_modules}"
+        + ("" if split else " (**decode sfalsato non disponibile**)"),
+        f"- Bozza: {env.draft_desc}",
+        f"- Token per job {args.bench_tokens}, moduli per turno {args.bench_interleave}, batch massimo {gen.max_batch_size}",
+    ]
+    if copies is not None:
+        head.append(
+            f"- Copie tra schede: {copies[0]} dirette, {copies[1]} passate dalla RAM"
+            + (" (**una copia passata dalla RAM blocca l'host a metà passo**)" if copies[1] else "")
+        )
+    head += [
+        "- Campionamento greedy, nessuna condizione di stop; dopo l'adattamento iniziale nessuno sweep del piazzamento",
+        "- Le cifre di ogni riga valgono per il tratto in cui tutti i job generano; «chiamata» è una `iterate()`: "
+        "nel modo normale un passo per tutti i job, nel modo sfalsato un passo per un gruppo",
+        "- Uso e potenza delle schede: media dei campioni di `nvidia-smi` nel tratto, saltando il primo mezzo secondo"
+        + (f" (campionatore fermato da un errore: {gpu.error})" if gpu is not None and gpu.error else ""),
+        "",
+    ]
+    return "\n".join(head) + "\n" + "\n\n".join(sections) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(add_help = False)
     ap.add_argument("--bench-jobs", default = "2,3,4", help = "numeri di job da provare (default 2,3,4)")
     ap.add_argument("--bench-tokens", type = int, default = 400, help = "token generati da ogni job (default 400)")
-    ap.add_argument("--bench-warmup", type = int, default = 48, help = "token del giro di riscaldamento (default 48)")
+    ap.add_argument("--bench-warmup", type = int, default = 48, help = "token dei giri di riscaldamento (default 48)")
+    ap.add_argument("--bench-adapt", type = int, default = 8,
+                    help = "giri al massimo per adattare il piazzamento degli esperti ai prompt della misura (default 8, 0 = no)")
+    ap.add_argument("--bench-adapt-tokens", type = int, default = 160, help = "token per job in un giro di adattamento (default 160)")
+    ap.add_argument("--bench-prof-tokens", type = int, default = 160, help = "token per job nei giri di profilo (default 160)")
     ap.add_argument("--bench-interleave", type = int, default = 1, help = "moduli per turno nell'emissione alternata (default 1)")
     ap.add_argument("--bench-out", default = None, help = "file .md del rapporto")
     ap.add_argument("--bench-no-gpu", action = "store_true", help = "non campionare nvidia-smi")
@@ -262,6 +885,7 @@ def main():
     from exllamav3.generator.sampler import GreedySampler
     from exllamav3.modules import block_sparse_mlp_cpu
     from exllamav3.util import device_copy
+    from exllamav3.version import __version__ as exl3_version
     from openai.config import parse_args
     from openai.model_container import ModelContainer
 
@@ -271,7 +895,6 @@ def main():
             "installa il fork nell'ambiente (pip install -e) e riprova."
         )
 
-    n_jobs_list = sorted({int(x) for x in args.bench_jobs.split(",") if x.strip()})
     cfg = parse_args(server_argv)
     container = ModelContainer(cfg)
     container.load_model_sync()
@@ -296,12 +919,22 @@ def main():
         **gen_kwargs,
     )
     gen.stagger_interleave = args.bench_interleave
+    n_jobs_list = sorted({int(x) for x in args.bench_jobs.split(",") if x.strip()})
     max_jobs = min(max(n_jobs_list), gen.max_batch_size, len(PROMPTS))
-    n_jobs_list = [n for n in n_jobs_list if 2 <= n <= max_jobs]
 
-    # A placement sweep between two runs moves experts between VRAM and the CPU worker, which
-    # changes the numerics of the layers it touches: greedy runs would no longer be comparable
+    # The library's own sweep, past the wrapper the server's expert tier puts around it: the tier
+    # saves the placement file after every sweep it sees, and the production file must not learn
+    # from a bench. From here on nothing sweeps unless the bench asks: a sweep between two runs
+    # moves experts between VRAM and the CPU worker, which changes the numerics of the layers it
+    # touches and the load on the worker
+    lib_sweep = block_sparse_mlp_cpu.run_pending_swap_sweeps
+    lib_sweep = getattr(lib_sweep, "_exl3srv_orig", lib_sweep)
     block_sparse_mlp_cpu.run_pending_swap_sweeps = lambda infer_params: None
+
+    def sweep():
+        ip = model.config.infer_params
+        ip.moe_cpu_swap_pending = True
+        lib_sweep(ip)
 
     def encode(text: str):
         chat = getattr(model, "default_chat_prompt", None)
@@ -309,170 +942,38 @@ def main():
             text = chat(text)
         return tokenizer.encode(text, encode_special_tokens = True)
 
-    names = "abcd"
-    prompts = {names[i]: encode(PROMPTS[i]) for i in range(max_jobs)}
+    split = gen._stagger_plan()
+    env = SimpleNamespace(
+        torch = torch,
+        gen = gen,
+        model = model,
+        Job = Job,
+        sampler_cls = GreedySampler,
+        prompts = {NAMES[i]: encode(PROMPTS[i]) for i in range(max_jobs)},
+        max_jobs = max_jobs,
+        n_jobs_list = n_jobs_list,
+        sweep = sweep,
+        prof = StreamProf(torch, model, gen, stage_devices(torch, model, split)) if torch.cuda.is_available() else None,
+        split = split,
+        n_modules = len(model.fwd_modules),
+        version = exl3_version,
+        lib_path = os.path.dirname(exllamav3.__file__),
+        torch_version = torch.__version__,
+        model_path = cfg.model_path,
+        devices = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+        draft_desc = f"MTP, {gen.num_draft_tokens} token" if draft_model is not None else "nessuna",
+        copy_stats = lambda: (device_copy.stats["direct"], device_copy.stats["bounced"]),
+    )
 
-    timers = {
-        "draft": Timer(gen, "iterate_draftmodel_mtp_gen"),
-        "forward": Timer(model, "forward"),
-    }
     gpu = None
     if not args.bench_no_gpu:
         gpu = GpuSampler()
         gpu.start()
-
-    def run(job_names, stagger, tokens = args.bench_tokens):
-        return run_once(gen, Job, GreedySampler, {n: prompts[n] for n in job_names}, tokens, stagger, gpu, timers)
-
-    def groups_of(n: int):
-        """The two groups a staggered run of the first n jobs settles into (Generator._stagger_pick)."""
-        first = n - n // 2
-        return [names[:first], names[first:n]]
-
-    print(" -- bench: warm-up", flush = True)
-    run(names[:1], False, args.bench_warmup)
-    for n in n_jobs_list:
-        for g in groups_of(n):
-            run(g, False, args.bench_warmup)
-        run(names[:n], False, args.bench_warmup)
-        run(names[:n], True, args.bench_warmup)
-
-    report = []
-    summary = []
-    solo = {}
-    print(" -- bench: one job at a time", flush = True)
-    for name in names[:max_jobs]:
-        solo[name] = run(name, False)
-    solo_again = run(names[0], False)
-    repeat_diff = first_difference(solo[names[0]]["tokens"][names[0]], solo_again["tokens"][names[0]])
-
-    rows = []
-    for name, r in solo.items():
-        w = r["window"]
-        rows.append([name, len(r["tokens"][name]), fmt(w and w["tok_s"]), fmt(w and w["ms_step"], 2), fmt(w and w["tok_step"], 2)])
-    report.append("## Un job alla volta\n\n" + table(["job", "token", "tok/s", "ms per passo", "token per passo"], rows))
-    report.append(
-        f"Ripetizione del job `{names[0]}` da solo: "
-        + ("stessi token." if repeat_diff is None else f"**token diversi dall'indice {repeat_diff}**: "
-           "due esecuzioni identiche non danno gli stessi token, quindi il confronto qui sotto non può "
-           "pretendere l'uguaglianza esatta.")
-    )
-
-    refs = {}       # group string -> run
-    for n in n_jobs_list:
-        print(f" -- bench: {n} jobs", flush = True)
-        grp = groups_of(n)
-        for g in grp:
-            if g not in refs:
-                refs[g] = solo[g] if len(g) == 1 else run(g, False)
-        batched = run(names[:n], False)
-        staggered = run(names[:n], True)
-
-        rows = []
-        for label, r in (("un batch", batched), ("sfalsato", staggered)):
-            w = r["window"]
-            if w is None:
-                rows.append([label, "finestra troppo corta"] + ["-"] * 9)
-                continue
-            acc = r["accepted"] + r["rejected"]
-            g_ = w["gpu"]
-            st = w["stagger"]
-            steps = max(1, w["steps"])
-            if r["stagger"]:
-                host = (f"bozza+ingressi {1000 * st['t_launch'] / steps:.2f}, emissione {1000 * st['t_issue'] / steps:.2f}, "
-                        f"campionamento {1000 * st['t_sample'] / steps:.2f}")
-            else:
-                tm = w["timers_ms_step"]
-                rest = w["ms_step"] - tm["draft"] - tm["forward"]
-                host = f"bozza {tm['draft']:.2f}, emissione {tm['forward']:.2f}, resto {rest:.2f}"
-            rows.append([
-                label,
-                fmt(w["tok_s"]),
-                " / ".join(fmt(v) for v in w["per_job"].values()),
-                fmt(w["ms_step"], 2),
-                fmt(w["tok_step"], 2),
-                fmt(r["accepted"] / acc if acc else None, 3),
-                " + ".join(f"{u:.0f}%" for u, _, _ in g_) if g_ else "-",
-                " + ".join(f"{p:.0f} W" for _, p, _ in g_) if g_ else "-",
-                g_[0][2] if g_ else 0,
-                fmt(w["seconds"], 1),
-                host,
-            ])
-        section = [f"## {n} job insieme\n", table(
-            ["modo", "tok/s totali", "tok/s per job", "ms per chiamata", "token per chiamata",
-             "accettazione bozza", "uso schede", "potenza", "campioni GPU", "finestra s", "tempo host per chiamata (ms)"],
-            rows,
-        )]
-        wb, ws = batched["window"], staggered["window"]
-        if wb and ws:
-            gain = ws["tok_s"] / wb["tok_s"] - 1.0
-            summary.append([n, fmt(wb["tok_s"]), fmt(ws["tok_s"]), f"{100 * gain:+.1f}%"])
-            section.append(f"\nSfalsato rispetto a un batch: **{100 * gain:+.1f}%** di tok/s totali.")
-        st = staggered["stagger_total"]
-        section.append(
-            f"\nContatori del decode sfalsato sull'intero giro: {st['steps']} chiamate, {st['launched']} gruppi emessi, "
-            f"{st['sampled']} campionati, {st['solo']} completati da soli, {st['drains']} svuotamenti. "
-            f"Gruppi attesi: {' e '.join('`' + g + '`' for g in grp)}."
-        )
-
-        # Tokens: every job of the staggered run against its group alone
-        rows = []
-        for g in grp:
-            for name in g:
-                ref = refs[g]["tokens"][name]
-                d_s = first_difference(ref, staggered["tokens"][name])
-                d_b = first_difference(ref, batched["tokens"][name])
-                rows.append([
-                    name, f"`{g}`", len(staggered["tokens"][name]),
-                    "uguali" if d_s is None else f"**diversi dall'indice {d_s}**",
-                    "uguali" if d_b is None else f"diversi dall'indice {d_b}",
-                ])
-        section.append("\n" + table(
-            ["job", "gruppo di riferimento", "token", "sfalsato contro il gruppo da solo", "un batch contro il gruppo da solo"],
-            rows,
-        ))
-        report.append("\n".join(section))
-
-    if gpu is not None:
-        gpu.stop()
-    for t in timers.values():
-        t.remove()
-
-    split = gen._stagger_plan()
-    devices = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-    head = [
-        "# Decode sfalsato: misura",
-        "",
-        time.strftime("%Y-%m-%d %H:%M:%S"),
-        "",
-        "## Sintesi",
-        "",
-        table(["job insieme", "un batch tok/s", "sfalsato tok/s", "differenza"], summary) if summary else "Nessuna misura completa.",
-        "",
-        "La colonna «sfalsato contro il gruppo da solo» delle sezioni sotto dice se il decode sfalsato calcola "
-        "le stesse cose di quello normale: con campionamento greedy ogni job deve dare gli stessi token che dà "
-        "il suo gruppo da solo. La colonna «un batch» è solo informativa: comporre il batch in modo diverso può "
-        "cambiare qualche arrotondamento.",
-        "",
-        "## Condizioni",
-        "",
-        f"- ExLlamaV3 {getattr(exllamav3, '__version__', '?')} da `{os.path.dirname(exllamav3.__file__)}`, torch {torch.__version__}",
-        f"- Modello `{cfg.model_path}`",
-        f"- Schede: {', '.join(devices)}",
-        f"- Confine tra le schede: modulo {split} di {len(model.fwd_modules)}"
-        + ("" if split else " (**decode sfalsato non disponibile**)"),
-        f"- Bozza: {'MTP, ' + str(gen.num_draft_tokens) + ' token' if draft_model is not None else 'nessuna'}",
-        f"- Token per job {args.bench_tokens}, moduli per turno {args.bench_interleave}, batch massimo {gen.max_batch_size}",
-        f"- Copie tra schede: {device_copy.stats['direct']} dirette, {device_copy.stats['bounced']} passate dalla RAM"
-        + (" (**una copia passata dalla RAM blocca l'host a metà passo**)" if device_copy.stats["bounced"] else ""),
-        "- Sweep del piazzamento degli esperti sospesi per tutta la misura; campionamento greedy; nessuna condizione di stop",
-        "- Le cifre di ogni riga valgono per il tratto in cui tutti i job generano; «chiamata» è una `iterate()`: "
-        "nel modo normale un passo per tutti i job, nel modo sfalsato un passo per un gruppo",
-        "- Uso e potenza delle schede: media dei campioni di `nvidia-smi` nel tratto, saltando il primo mezzo secondo"
-        + (f" (campionatore fermato da un errore: {gpu.error})" if gpu is not None and gpu.error else ""),
-        "",
-    ]
-    text = "\n".join(head) + "\n" + "\n\n".join(report) + "\n"
+    try:
+        text = measure(env, args, gpu)
+    finally:
+        if gpu is not None:
+            gpu.stop()
 
     out = args.bench_out
     if out is None:

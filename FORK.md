@@ -42,7 +42,23 @@ Tests: `tests/test_stagger_decode.py` (no GPU, no extension: toy model on two pr
 stub jobs; tokens of a staggered run must equal those of a regular one).
 
 Bench on the real model: `experiments/stagger_bench.py` (server stopped; loads the model the
-way the server does; report in Markdown).
+way the server does; report in Markdown). Three parts: speed (one batch against staggered),
+same computation, where the time goes. What the first run on the machine taught:
+
+- Two identical greedy runs of this model do not give the same tokens, so token equality
+  proves nothing. The check forces on every job the tokens it produced alone and compares the
+  probabilities position by position against the job's group alone; the group alone run twice
+  is the noise floor.
+- The placement loaded from the server's file follows production traffic, not the bench's
+  prompts, and a poor placement loads the CPU expert worker. The bench first adapts it with
+  the library's own sweeps, called past the wrapper of the server's expert tier (the tier
+  saves the placement file after every sweep it sees), and reports the share of selections
+  served from VRAM for every run.
+- Host timers and `nvidia-smi` cannot tell a card that waits for the worker from an idle one:
+  the profiled runs bracket each card's part of the pass and the worker handoffs with CUDA
+  events (stream time, no host synchronization).
+
+`tests/test_stagger_bench.py` runs the report side of the bench on fakes.
 
 Why the two halves are issued a module at a time: the CPU expert worker serves its job ring in
 publication order (`exllamav3_ext/cpu/moe_handoff.cu`), so two halves issued back to back would
