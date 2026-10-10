@@ -777,3 +777,20 @@ def test_the_yield_of_the_decode_step_is_found():
     line = sb.decode_step_yield(WithStep)
     assert line == WithStep._iterate_gen_co.__code__.co_firstlineno + 2
     assert sb.decode_step_yield(Without) is None
+
+
+def test_long_prompts_are_sized_by_tokens_and_differ_from_their_first_words():
+    count = lambda text: len(text.split())                  # one token per word
+    text = sb.long_prompt(count, "What is a B-tree?", "a", 6000)
+    assert 5500 < count(text) < 6600 and text.endswith("Now set the document aside. What is a B-tree?")
+    assert sb.long_prompt(count, "What is a B-tree?", "a", 6000) == text          # same prompt at every run
+    # No shared first page between two jobs: the page table would hand both the same pages
+    other = sb.long_prompt(count, "What is a B-tree?", "b", 6000)
+    assert text.split()[:40] != other.split()[:40]
+    # A tokenizer with three tokens per word gets a third of the paragraphs
+    assert 5500 < 3 * count(sb.long_prompt(lambda t: 3 * len(t.split()), "Q?", "a", 6000)) < 6600
+
+    env = make_env()
+    assert "- Prompt: brevi (la sola domanda)" in section(sb.measure(env, ARGS), "Condizioni")
+    env.prompt_desc = "da 60012 a 60340 token per job"
+    assert "- Prompt: da 60012 a 60340 token per job" in section(sb.measure(env, ARGS), "Condizioni")

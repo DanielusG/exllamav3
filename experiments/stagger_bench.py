@@ -47,6 +47,7 @@ import collections
 import ctypes
 import inspect
 import linecache
+import random
 import re
 import shutil
 import signal
@@ -75,6 +76,36 @@ PROMPTS = [
 
 NAMES = "abcd"
 _MISSING = object()
+
+_WORDS = (
+    "the of and to in is that it was for on are as with his they at be this from have or one had by "
+    "word but not what all were we when your can said there use an each which she do how their if "
+    "will up other about out many then them these so some her would make like him into time has look "
+    "two more write go see number no way could people my than first water been call who oil its now "
+    "find long down day did get come made may part"
+).split()
+
+
+def filler(tag: str, paragraphs: int) -> str:
+    """Deterministic pseudo-prose, different for every tag from its first words on: the page
+    table shares identical pages between jobs, and conversations in production share none."""
+    rng = random.Random(tag)
+    out = []
+    for i in range(paragraphs):
+        words = [rng.choice(_WORDS) for _ in range(90)]
+        sentences = [" ".join(words[j:j + 15]).capitalize() + "." for j in range(0, 90, 15)]
+        out.append(f"[{tag}-{i + 1}] " + " ".join(sentences))
+    return "\n\n".join(out)
+
+
+def long_prompt(count_tokens, question: str, tag: str, n_tokens: int) -> str:
+    """The question behind a document of about n_tokens tokens (count_tokens: text -> tokens).
+    The decode of a long conversation is not the decode of a short one: past a context size the
+    full-attention layers of Flash-Next select what they attend to, one sequence at a time."""
+    probe = 20
+    per_paragraph = max(1, count_tokens(filler(tag, probe)) // probe)
+    document = filler(tag, max(1, n_tokens // per_paragraph))
+    return f"Read this document.\n\n{document}\n\nNow set the document aside. {question}"
 
 
 def _own_attr(obj, name: str):
@@ -1272,6 +1303,7 @@ def measure(env, args, gpu = None, extra: dict | None = None) -> str:
         f"- Confine tra le schede: modulo {split} di {env.n_modules}"
         + ("" if split else " (**decode sfalsato non disponibile**)"),
         f"- Bozza: {env.draft_desc}",
+        f"- Prompt: {getattr(env, 'prompt_desc', None) or 'brevi (la sola domanda)'}",
         f"- Decode sfalsato misurato da 2 job in su; il generatore da solo lo usa da {env.min_jobs_default} job",
         f"- Fasi eseguite, dopo piazzamento e riscaldamento: {', '.join(p for p in PHASES if p in phases)}",
         f"- Token per job {args.bench_tokens}, moduli per turno {args.bench_interleave}, batch massimo {gen.max_batch_size}",
@@ -1302,6 +1334,9 @@ def main():
     ap.add_argument("--bench-adapt-tokens", type = int, default = 160, help = "token per job in un giro di adattamento (default 160)")
     ap.add_argument("--bench-prof-tokens", type = int, default = 160, help = "token per job nei giri di profilo (default 160)")
     ap.add_argument("--bench-interleave", type = int, default = 1, help = "moduli per turno nell'emissione alternata (default 1)")
+    ap.add_argument("--bench-context", type = int, default = 0,
+                    help = "token di documento messi davanti a ogni domanda, per misurare con contesti lunghi come in "
+                           "produzione (default 0: prompt brevi); il primo giro li ingerisce tutti, minuti")
     ap.add_argument("--bench-phases", default = ",".join(PHASES),
                     help = "fasi da eseguire dopo piazzamento e riscaldamento: speed (velocità), check (stesso calcolo), "
                            "prof (tempi di flusso delle schede), host (stack dell'host con py-spy); default tutte")
@@ -1405,6 +1440,28 @@ def main():
         beside = os.path.join(os.path.dirname(sys.executable), "py-spy")
         pyspy = beside if os.path.exists(beside) else None
 
+    def prompt_text(i: int) -> str:
+        if args.bench_context <= 0:
+            return PROMPTS[i]
+        return long_prompt(lambda text: tokenizer.encode(text).shape[-1], PROMPTS[i], NAMES[i], args.bench_context)
+
+    prompts = {NAMES[i]: encode(prompt_text(i)) for i in range(max_jobs)}
+    sizes = [int(p.shape[-1]) for p in prompts.values()]
+    prompt_desc = None
+    if args.bench_context > 0:
+        prompt_desc = f"da {min(sizes)} a {max(sizes)} token per job (documento davanti alla domanda, `--bench-context {args.bench_context}`)"
+        # Every job keeps its prompt and its answer in the cache at the same time; a job that
+        # waits for pages never generates next to the others and the run measures nothing
+        room = getattr(cfg, "cache_size", None)
+        need = sum(sizes) + max_jobs * (max(args.bench_tokens, args.bench_host_tokens) + 512)
+        if room is not None and need > room:
+            raise SystemExit(
+                f"--bench-context {args.bench_context}: {max_jobs} job chiedono {need} token di cache, "
+                f"--cache-size ne ha {room}; riduci il contesto o i job (--bench-jobs)."
+            )
+        print(f" -- bench: prompts of {min(sizes)}-{max(sizes)} tokens; the first run ingests them all "
+              "(minutes), later runs find them in the cache", flush = True)
+
     split = gen._stagger_plan()
     env = SimpleNamespace(
         torch = torch,
@@ -1412,7 +1469,8 @@ def main():
         model = model,
         Job = Job,
         sampler_cls = GreedySampler,
-        prompts = {NAMES[i]: encode(PROMPTS[i]) for i in range(max_jobs)},
+        prompts = prompts,
+        prompt_desc = prompt_desc,
         max_jobs = max_jobs,
         n_jobs_list = n_jobs_list,
         sweep = sweep,
