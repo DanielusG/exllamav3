@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import threading
 from contextlib import contextmanager
 import torch
@@ -41,6 +42,12 @@ What follows from one stream for two threads:
 _tls = threading.local()
 _busy_lock = threading.Lock()
 _busy = 0
+
+# EXL3_LANE_HOST_WAITS=0: a lane's waits for the CPU expert worker stay on the pass's stream, as
+# lane 0's. The other lane's kernels then wait behind them (the feature gains next to nothing),
+# but the handoff stream and its host waits are out of the picture: for telling whose fault a
+# wrong number is
+_HOST_WAITS = os.environ.get("EXL3_LANE_HOST_WAITS", "1") != "0"
 
 
 def current_lane() -> int:
@@ -92,7 +99,7 @@ class Lane:
     def enter(self):
         """Make the calling thread issue on this lane, for good (a thread serves one lane)."""
         _tls.lane = self.index
-        _tls.host_waits = True
+        _tls.host_waits = _HOST_WAITS
 
     @contextmanager
     def passing(self):

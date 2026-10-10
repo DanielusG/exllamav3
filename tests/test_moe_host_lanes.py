@@ -13,12 +13,14 @@ The module under test is loaded on its own, with the rest of the package stubbed
 """
 
 import collections
+import gc
 import importlib.util
 import os
 import sys
 import threading
 import time
 import types
+import weakref
 from contextlib import contextmanager
 
 import numpy as np
@@ -242,6 +244,7 @@ def make_host(monkeypatch, sim, slots):
     h._issue_lock = threading.Lock()
     h._lanes = None
     h._handoff = {}
+    h._handoff_held = {}
     h.gpu_base_ptr = 0
     h.dev_count = {}
     h.specs = [dict(hi = H, ho = H, topk = TOPK)] * 64
@@ -413,6 +416,75 @@ def test_the_chunked_path_keeps_its_waits_off_the_shared_stream(monkeypatch):
     assert {kind for _, kind in sim.default.issued} == {"record", "kernel"}
     handoff = sim.streams[1]
     assert {kind for _, kind in handoff.issued} == {"wait_event", "wait", "write", "record"}
+
+
+def issue_and_drop(h, n_rows):
+    """Issue a layer the way the streamed prefill does, from temporaries nobody else keeps;
+    returns what is needed to collect it and weak references to the sources of its copies."""
+    y, sel, w = rows(n_rows)
+    out = torch.zeros((n_rows, H))
+    jobs, rtmp = h._issue_compute(0, y, sel, w, h.specs[0], out, H)
+    refs = [weakref.ref(y), weakref.ref(w)]
+    del y, sel, w
+    gc.collect()
+    return jobs, out, rtmp, refs
+
+
+def test_the_sources_of_the_copies_outlive_the_call_that_issued_them(monkeypatch):
+    # Found on the real model (NaN after a prompt ingested on the second thread): the copies
+    # of all but the first jobs run on the handoff stream when the worker gets to them, after
+    # the call has returned and its temporaries are gone; the allocator had handed their
+    # memory to the pass's next kernels by then
+    sim = Sim()
+    h = make_host(monkeypatch, sim, 6)
+    h.split_lanes()
+    bg = sim.run()
+    result = {}
+
+    def prefill():
+        try:
+            LANE.Lane(1, [0]).enter()
+            jobs, out, rtmp, refs = issue_and_drop(h, 9 * CAP)
+            result["held"] = [r() is not None for r in refs]
+            h._collect_compute(jobs, out, rtmp, H)
+            gc.collect()
+            result["after"] = [r() is not None for r in refs]
+            result["left"] = len(h._handoff_held)
+        except BaseException as e:
+            result["error"] = e
+
+    t = threading.Thread(target = prefill)
+    t.start()
+    t.join(20)
+    sim.stop = True
+    bg.join(5)
+    assert "error" not in result, result.get("error")
+    assert result["held"] == [True, True]           # until the host has seen the last readback
+    assert result["after"] == [False, False] and result["left"] == 0
+
+
+def test_on_the_pass_s_own_stream_nothing_is_held(monkeypatch):
+    # One thread, one stream: the copies are ahead, in stream order, of whatever reuses the
+    # memory, and the sources go when the call returns, as upstream
+    sim = Sim()
+    h = make_host(monkeypatch, sim, 4)
+    jobs, out, rtmp, refs = issue_and_drop(h, 6 * CAP)
+    assert [r() is not None for r in refs] == [False, False] and h._handoff_held == {}
+    h._collect_compute(jobs, out, rtmp, H)
+    sim.settle()
+    assert sim.errors == [] and not sim.default.ops
+
+
+def test_a_pass_that_never_collects_does_not_pile_up_sources(monkeypatch):
+    sim = Sim()
+    h = make_host(monkeypatch, sim, 6)
+    h.split_lanes()
+    LANE.Lane(1, [0]).enter()
+    kept = []
+    for _ in range(80):
+        y, sel, w = rows(CAP)
+        kept.append(h._issue_compute(0, y, sel, w, h.specs[0], torch.zeros((CAP, H)), H))
+    assert len(h._handoff_held) == 64
 
 
 def test_decode_and_prefill_at_the_same_time(monkeypatch):

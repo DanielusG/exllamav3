@@ -105,7 +105,8 @@ Upstream's `iterate()` runs a prefill chunk for every job still ingesting its pr
 decode step: a job that is generating gets one token per chunk while another job's prompt goes in
 (2.9 s per 2048-token chunk on this machine). With the switch on, the forward passes of a chunk
 run on a second thread and the generator's thread goes on decoding. Off by default; with it off
-the generator behaves as upstream. **Not run on a GPU yet: nothing below is measured.**
+the generator behaves as upstream. **Not validated: the one run on the machine computed wrong
+numbers (see below); the fix that followed has not been run.**
 
 The two threads issue on the same CUDA streams, so kernels never overlap on a card. That is not
 a choice: the compiled EXL3 kernels (GEMM, MGEMM, the fused MoE kernel) coordinate their thread
@@ -172,3 +173,30 @@ Bench on the real model: `experiments/prefill_bench.py` (server stopped, same ar
 server, report in Markdown): one job generating while another ingests a document, as upstream
 and with the thread, against each alone; forced-token probabilities of both jobs against the
 upstream path; memory of the cards.
+
+First run on the machine (2026-10-10, bench at ad6dfa4, 8289-token document, chunks of 2048):
+
+- The scheduling does what it is for: 142 decode steps were taken beside 4 chunks, and the job
+  that was generating got 259 tokens during the 8.1 s of the other job's ingestion (31.8 tok/s;
+  60.4 alone, 1.2 as upstream). The ingestion took 7.3 s as upstream.
+- **The computation was wrong.** After a prompt ingested on the second thread the probabilities
+  of that job were NaN in all 64 positions, and the share of expert selections served from VRAM
+  in that run was 0.675 against 0.952 as upstream: about what routing on noise gives. So the
+  figures above are those of a pass computing garbage, not a measure of the feature.
+- Cause found by reading, not confirmed on the machine: the copies of the chunked path's inputs
+  run on the handoff stream when the worker gets to their job, after `_issue_compute` has
+  returned; its temporaries were freed by then, and the allocator hands a freed block out again
+  in the order of the stream it was made on, so the pass's next kernels wrote into memory those
+  copies had yet to read. The sources are now held until the host has seen the last readback
+  (`_handoff_held`). On one stream the same lifetime is safe, which is why upstream has it.
+- Two identical runs as upstream do not give identical probabilities when each ingests its
+  prompt again (largest shift 0.03-0.05, the most likely token changed in 1-4 positions of
+  64-600), so "identical to upstream" cannot be the test. The bench now repeats every compared
+  run twice as upstream and judges the run with the thread against that floor; it counts values
+  that are not finite, compares a prompt ingested on the thread with nobody decoding as well
+  (which tells the thread from the overlap), and no longer resets the page table between runs
+  (it drops the state checkpoints instead; whether the reset was behind the floor is not known).
+- Memory: about 70 MiB less free on each card with the thread (0.39 and 0.37 GiB left).
+- `EXL3_LANE_HOST_WAITS=0` (`--bench-no-handoff`) keeps the second thread's worker waits on the
+  pass's stream: nothing is gained, but the handoff stream is out of the picture, for telling
+  whose fault a wrong number is.

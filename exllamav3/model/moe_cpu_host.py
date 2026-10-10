@@ -783,6 +783,7 @@ class MoeCpuHost:
         self._issue_lock = threading.Lock()
         self._lanes = None
         self._handoff = {}
+        self._handoff_held = {}
         self.cap_rows = TUNING.cap_rows
         # Per-component thread override: config.infer_params.moe_cpu_threads for the main model,
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
@@ -1354,7 +1355,20 @@ class MoeCpuHost:
         ready.record()
         with torch.cuda.stream(hs):
             hs.wait_event(ready)
-            return self._issue_jobs(layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h), rtmp
+            jobs = self._issue_jobs(layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h)
+        # The copies of the later jobs run when the worker is done with the earlier ones, long
+        # after this returns, and from another stream than the one their sources were made
+        # on. Released here (they are temporaries of this call and of the caller's), the
+        # sources would go back to the allocator, which hands a block out again in the order
+        # of ITS stream: the pass's next kernels would write into memory these copies have
+        # yet to read, and the worker would compute on that. They live until the host has
+        # seen the last readback (_collect_compute)
+        held = self._handoff_held
+        held[id(jobs)] = (jobs, y_pad, sel32, routing_weights)
+        if len(held) > 64:
+            # (a pass that failed between issue and collect never comes back for its entry)
+            del held[next(iter(held))]
+        return jobs, rtmp
 
     def _issue_jobs(self, layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h):
         """The jobs of _issue_compute, on the current stream."""
@@ -1414,11 +1428,15 @@ class MoeCpuHost:
         # (blocking: the wait is as long as the worker takes, and a spinning wait would hold a
         # core the worker's threads and the other lane's host thread can use)
         done = torch.cuda.Event(blocking = True)
-        with torch.cuda.stream(hs):
-            for job in jobs:
-                self._collect_one(job, out, rtmp, h)
-            done.record(hs)
-        done.synchronize()
+        try:
+            with torch.cuda.stream(hs):
+                for job in jobs:
+                    self._collect_one(job, out, rtmp, h)
+                done.record(hs)
+            done.synchronize()
+        finally:
+            # Every copy of these jobs has run: their sources may go (_issue_compute)
+            self._handoff_held.pop(id(jobs), None)
 
     def _max_proj_numel(self):
         mx = 0
