@@ -219,6 +219,7 @@ def make_env(prof = None, **gen_kwargs):
         sweep = model.sweep,
         prof = prof,
         split = 2,
+        min_jobs_default = 3,
         n_modules = 5,
         version = "0.0.0",
         revision = "abc1234 2026-10-10",

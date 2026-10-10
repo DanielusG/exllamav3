@@ -859,6 +859,7 @@ def measure(env, args, gpu = None) -> str:
         f"- Confine tra le schede: modulo {split} di {env.n_modules}"
         + ("" if split else " (**decode sfalsato non disponibile**)"),
         f"- Bozza: {env.draft_desc}",
+        f"- Decode sfalsato misurato da 2 job in su; il generatore da solo lo usa da {env.min_jobs_default} job",
         f"- Token per job {args.bench_tokens}, moduli per turno {args.bench_interleave}, batch massimo {gen.max_batch_size}",
     ]
     if copies is not None:
@@ -948,6 +949,10 @@ def main():
         **gen_kwargs,
     )
     gen.stagger_interleave = args.bench_interleave
+    # The bench measures what staggering does from two jobs up, whatever the generator's own
+    # threshold says is worth it
+    min_jobs_default = getattr(gen, "stagger_min_jobs", 2)
+    gen.stagger_min_jobs = 2
     n_jobs_list = sorted({int(x) for x in args.bench_jobs.split(",") if x.strip()})
     max_jobs = min(max(n_jobs_list), gen.max_batch_size, len(PROMPTS))
 
@@ -984,6 +989,7 @@ def main():
         sweep = sweep,
         prof = StreamProf(torch, model, gen, stage_devices(torch, model, split)) if torch.cuda.is_available() else None,
         split = split,
+        min_jobs_default = min_jobs_default,
         n_modules = len(model.fwd_modules),
         version = exl3_version,
         revision = revision,

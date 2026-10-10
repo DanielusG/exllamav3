@@ -36,7 +36,32 @@ turn. Off by default; with it off the generator behaves as upstream.
     drops it; `iterate` hands out results a cancel produced (`_stagger_backlog`), and does not
     offer prefill or a checkpoint to a job in flight.
 - Not staggered: tensor-parallel loads, drafters other than MTP, models not on exactly two
-  cards in a row, multi-sequence jobs, and any iteration in which a job is ingesting its prompt.
+  cards in a row, multi-sequence jobs, any iteration in which a job is ingesting its prompt,
+  and fewer than `stagger_min_jobs` jobs generating (3; `EXL3_STAGGER_MIN_JOBS`).
+
+Measured on the machine (2026-10-10, bench at 91621dd, placement adapted to the bench's prompts,
+91% of the expert selections served from VRAM, MTP with 1 draft token):
+
+| jobs | one batch | staggered | | cards, one batch | cards, staggered |
+|---|---|---|---|---|---|
+| 2 | 94.9 tok/s | 93.2 tok/s | -1.7% | 38% + 40%, 144 W | 58% + 62%, 180 W |
+| 3 | 117.7 tok/s | 128.6 tok/s | +9.3% | 44% + 42%, 151 W | 62% + 65%, 194 W |
+| 4 | 128.6 tok/s | 154.4 tok/s | +20.1% | 40% + 40%, 149 W | 64% + 65%, 200 W |
+
+- Same computation: with forced tokens the probabilities of a staggered run are bit-identical
+  to those of each group alone, in every position of every job (9 job comparisons, 400
+  positions each). The check is not blind: the same figures tell a job in a batch from the
+  job alone (regular decode: the most likely token changes in 2-7 positions out of 400).
+- A staggered call is host-bound: about 15 ms to issue a pass whatever the size of its group,
+  2 ms for the draft step, 2-2.7 ms per job to sample; the cards finish each half as the host
+  finishes issuing it. Hence the threshold: two groups of one job cost two calls for what one
+  batch of two gives in one step of the same length. What moves the figures next is the
+  host's cost per pass.
+- The CPU expert worker is out of the way only with a placement that fits the traffic: the
+  cards wait for it 2-3 ms per call each at 91% of selections served from VRAM. On the
+  placement tuned for production traffic the bench's prompts got 74%, and every multi-job
+  figure, staggered or not, stopped at about 100 rows per second (4 jobs in one batch: 86
+  tok/s against 129).
 
 Tests: `tests/test_stagger_decode.py` (no GPU, no extension: toy model on two pretend cards,
 stub jobs; tokens of a staggered run must equal those of a regular one).

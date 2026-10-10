@@ -239,6 +239,12 @@ class Generator:
         # generator's own); _stagger_backlog keeps results produced outside iterate()
         self.stagger_decode = stagger_decode or os.environ.get("EXL3_STAGGER_DECODE", "0") not in ("", "0")
         self.stagger_interleave = 1
+        # Jobs generating at the same time from which the decode is staggered. Every call issues
+        # a whole pass, whatever the size of its group, and with the cards no longer the limit a
+        # call costs what the host needs to issue it: two groups of one job take two calls for
+        # the tokens one batch of two gives in a step of about the same length (measured on
+        # Flash-Next, 2x RTX 5060 Ti: -2% with 2 jobs, +9% with 3, +20% with 4)
+        self.stagger_min_jobs = max(2, int(os.environ.get("EXL3_STAGGER_MIN_JOBS", "3")))
         self.stagger_stats = {
             "steps": 0, "launched": 0, "sampled": 0, "solo": 0, "drains": 0,
             "t_launch": 0.0, "t_issue": 0.0, "t_sample": 0.0,
@@ -1082,8 +1088,9 @@ class Generator:
 
     def _stagger_wanted(self) -> bool:
         """Whether this iteration's decode goes through iterate_staggered(): always while a pass
-        is issued in part; otherwise with the switch on, two or more jobs generating and no job
-        ingesting its prompt (an iteration that may run a prefill chunk stays one batch)."""
+        is issued in part; otherwise with the switch on, stagger_min_jobs or more jobs generating
+        and no job ingesting its prompt (an iteration that may run a prefill chunk stays one
+        batch)."""
         if self._flight is not None:
             return True
         if not self.stagger_decode or self._stagger_plan() is None:
@@ -1093,7 +1100,7 @@ class Generator:
             if not job.is_prefill_done() or len(job.sequences) != 1:
                 return False
             ready += 1
-        return ready >= 2
+        return ready >= max(2, self.stagger_min_jobs)
 
 
     @staticmethod
@@ -1211,8 +1218,9 @@ class Generator:
 
         So every call returns the tokens of one group and the groups take turns. The groups
         are not fixed: whoever is at rest and ready is issued, minus what keeps the two groups
-        even. With one job left, or when a job starts ingesting a prompt, nothing new is issued,
-        the group in flight is completed alone and iterate() goes back to regular steps.
+        even. With fewer than stagger_min_jobs jobs left, or when a job starts ingesting a prompt,
+        nothing new is issued, the group in flight is completed alone and iterate() goes back to
+        regular steps.
 
         What makes it safe to keep a pass waiting: its jobs' pages and recurrent states are
         referenced (nothing else can take them), its pinned staging buffers belong to its lane
@@ -1240,7 +1248,9 @@ class Generator:
                     break
                 if flight is None or not any(j is job for j in flight.jobs):
                     ready.append(job)
-            launch = self._stagger_pick(ready, len(flight.jobs) if flight is not None else 0)
+            n_flying = len(flight.jobs) if flight is not None else 0
+            if len(ready) + n_flying >= max(2, self.stagger_min_jobs):
+                launch = self._stagger_pick(ready, n_flying)
 
         new = None
         if launch:

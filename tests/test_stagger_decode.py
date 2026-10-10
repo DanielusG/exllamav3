@@ -506,7 +506,7 @@ class ToyPagetable:
         self.defrags += 1
 
 
-def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batch_size = 4):
+def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batch_size = 4, min_jobs = 2):
     model = ToyModel()
     g = GEN.Generator.__new__(GEN.Generator)
     g.model = model
@@ -540,6 +540,7 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
         g.num_draft_tokens = 0
     g.stagger_decode = stagger
     g.stagger_interleave = 1
+    g.stagger_min_jobs = min_jobs
     g.stagger_stats = {
         "steps": 0, "launched": 0, "sampled": 0, "solo": 0, "drains": 0,
         "t_launch": 0.0, "t_issue": 0.0, "t_sample": 0.0,
@@ -561,10 +562,10 @@ PROMPTS = {
 }
 
 
-def run(names, stagger, draft = True, num_draft_tokens = 1, lengths = None, script = None, **job_kw):
+def run(names, stagger, draft = True, num_draft_tokens = 1, lengths = None, script = None, min_jobs = 2, **job_kw):
     """Drive iterate() until every job is done. script(generator, jobs, n) runs before the n-th
     iteration (to add, cancel or switch). Returns (tokens per job, generator, jobs)."""
-    g = make_generator(draft = draft, stagger = stagger, num_draft_tokens = num_draft_tokens)
+    g = make_generator(draft = draft, stagger = stagger, num_draft_tokens = num_draft_tokens, min_jobs = min_jobs)
     jobs = {}
     lengths = lengths or {}
 
@@ -828,3 +829,45 @@ def test_one_job_is_never_staggered():
     ref, g0, _ = run("a", stagger = False)
     out, g, _ = run("a", stagger = True)
     assert out == ref and g.stagger_stats["steps"] == 0
+
+
+def test_below_the_threshold_the_decode_stays_one_batch():
+    ref, _, _ = run("ab", stagger = False)
+    out, g, _ = run("ab", stagger = True, min_jobs = 3)
+    assert out == ref and g.stagger_stats["steps"] == 0
+
+
+def test_staggering_ends_when_the_jobs_fall_below_the_threshold():
+    # `a` leaves first, so the two jobs left are one in flight and one at rest: the case in
+    # which the scheduler itself must refuse to issue (with `c` leaving first the two left are
+    # in flight together and the decode falls back on its own)
+    lengths = {"a": 20, "b": 70, "c": 55}
+    ref, _, _ = run("abc", stagger = False, lengths = lengths)
+    seen = {}
+
+    def script(g, jobs, n, add):
+        # The first iteration that starts with two jobs left: at most a pass is still in flight
+        if "steps" not in seen and g.num_remaining_jobs() <= 2:
+            seen["steps"] = g.stagger_stats["steps"]
+            seen["flying"] = g._flight is not None
+
+    out, g, _ = run("abc", stagger = True, lengths = lengths, min_jobs = 3, script = script)
+    assert out == ref
+    assert seen["steps"] > 5 and seen["flying"]         # staggered with three
+    # One more call completes the pass in flight alone, then regular steps for the two left
+    assert g.stagger_stats["steps"] == seen["steps"] + 1
+    assert g.stagger_stats["solo"] == 1
+
+
+def test_staggering_starts_again_when_a_job_joins():
+    lengths = {"a": 90, "b": 90, "c": 40}
+    seen = {}
+
+    def script(g, jobs, n, add):
+        if n == 10:
+            seen["before"] = g.stagger_stats["steps"]
+            add("c")
+
+    out, g, _ = run("ab", stagger = True, lengths = lengths, min_jobs = 3, script = script)
+    assert seen["before"] == 0 and g.stagger_stats["steps"] > 5
+    assert out["a"] == run("a", stagger = False, lengths = lengths)[0]["a"]
