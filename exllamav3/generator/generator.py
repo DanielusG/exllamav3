@@ -251,6 +251,9 @@ class Generator:
         }
         self._step_group = None
         self._flight = None
+        # Stretch of staggered calls in progress: [start, end of the last call, calls, most jobs
+        # at once]; reported in one line when the decode goes back to regular steps
+        self._stagger_run = None
         self._lanes = {}
         self._stagger_backlog = []
         self._stagger_split = None
@@ -641,6 +644,10 @@ class Generator:
         # Regular generation
         else:
             self.iterate_gen(results)
+
+        # Back to regular steps (also after a cancel completed the pass in flight between calls)
+        if self._stagger_run is not None and self._flight is None:
+            self._stagger_run_end()
 
         # Visualization
         if self.visualizer:
@@ -1078,11 +1085,13 @@ class Generator:
                     why = f"layers on {len(bounds) + 1} card(s), two needed"
             self._stagger_split = split
             if self.stagger_decode:
+                # flush: under a service stdout is block-buffered, and these would surface hours
+                # later or never
                 if split:
                     print(f" -- Staggered decode: modules 0-{split - 1} on the first card, "
-                          f"{split}-{len(self.model.fwd_modules) - 1} on the second")
+                          f"{split}-{len(self.model.fwd_modules) - 1} on the second", flush = True)
                 else:
-                    print(f" !! Staggered decode not available: {why}")
+                    print(f" !! Staggered decode not available: {why}", flush = True)
         return split or None
 
 
@@ -1287,6 +1296,21 @@ class Generator:
         stats["t_launch"] += t1 - t0
         stats["t_issue"] += t2 - t1
         stats["t_sample"] += t3 - t2
+
+        run = self._stagger_run
+        if run is None:
+            run = self._stagger_run = [t0, t3, 0, 0]
+        run[1] = t3
+        run[2] += 1
+        run[3] = max(run[3], (len(flight.jobs) if flight is not None else 0) + (len(new.jobs) if new is not None else 0))
+
+
+    def _stagger_run_end(self):
+        """Report the stretch of staggered calls that just ended. A server has no other trace
+        of the decode having been staggered (stagger_stats is for whoever holds the generator)."""
+        run, self._stagger_run = self._stagger_run, None
+        if run is not None:
+            print(f" -- Staggered decode: {run[2]} calls in {run[1] - run[0]:.1f} s, up to {run[3]} jobs", flush = True)
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):

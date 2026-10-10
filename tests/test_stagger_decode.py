@@ -547,6 +547,7 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
     }
     g._step_group = None
     g._flight = None
+    g._stagger_run = None
     g._lanes = {}
     g._stagger_backlog = []
     g._stagger_split = None
@@ -871,3 +872,56 @@ def test_staggering_starts_again_when_a_job_joins():
     out, g, _ = run("ab", stagger = True, lengths = lengths, min_jobs = 3, script = script)
     assert seen["before"] == 0 and g.stagger_stats["steps"] > 5
     assert out["a"] == run("a", stagger = False, lengths = lengths)[0]["a"]
+
+
+def stretch_lines(capsys) -> list:
+    return [l for l in capsys.readouterr().out.splitlines() if "calls in" in l]
+
+
+def calls_of(line: str) -> int:
+    return int(line.split(":")[1].split("calls")[0])
+
+
+def test_each_stretch_of_staggered_calls_is_reported_in_one_line(capsys):
+    """A server holds the generator behind its own worker: the lines on stdout are the only
+    trace that the decode was staggered (and they are flushed: stdout of a service is not a
+    terminal)."""
+    _, g, _ = run("abc", True, min_jobs = 3)
+    lines = [l for l in capsys.readouterr().out.splitlines() if "Staggered decode" in l]
+    assert lines[0] == " -- Staggered decode: modules 0-3 on the first card, 4-7 on the second"
+    assert len(lines) == 2 and g._stagger_run is None
+    assert calls_of(lines[1]) == g.stagger_stats["steps"] and lines[1].endswith(" s, up to 3 jobs")
+
+    # Nothing is reported for a decode that never staggers
+    run("ab", True, min_jobs = 3)
+    assert stretch_lines(capsys) == []
+
+    # A job that takes several iterations to ingest its prompt ends the stretch; the next one
+    # starts when it generates, with one job more
+    def script(g, jobs, n, add):
+        if n == 15:
+            add("d")
+
+    _, g, _ = run("abc", True, min_jobs = 3, lengths = {"a": 80, "b": 80, "c": 80, "d": 40}, script = script, prefill_iters = 4)
+    lines = stretch_lines(capsys)
+    assert len(lines) == 2, lines
+    assert lines[0].endswith("up to 3 jobs") and lines[1].endswith("up to 4 jobs")
+    assert sum(calls_of(l) for l in lines) == g.stagger_stats["steps"]
+
+
+def test_a_stretch_ended_by_a_cancel_between_two_calls_is_reported_at_the_next_one(capsys):
+    def script(g, jobs, n, add):
+        if n == 12:
+            # The pass in flight is completed by the cancel itself, outside iterate(); with two
+            # jobs left the next call is a regular step and closes the stretch
+            victim = g._flight.jobs[0]
+            victim.cancelled = True
+            g.cancel(victim)
+            assert g._flight is None and g._stagger_run is not None
+            capsys.readouterr()
+        if n == 13:
+            assert g._stagger_run is None
+
+    _, g, _ = run("abc", True, min_jobs = 3, script = script)
+    lines = stretch_lines(capsys)
+    assert len(lines) == 1 and calls_of(lines[0]) == g.stagger_stats["steps"] == 12
