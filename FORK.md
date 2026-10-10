@@ -11,6 +11,12 @@ module (`exllamav3_ext`) and keeps coming from the installed 1.5.4 wheel.
 
 ## What differs from upstream
 
+### No CI workflows
+
+`.github/workflows/build.yml` (upstream's wheel build) is removed on this branch: nothing here
+is released as a wheel, and a push that carries a workflow file needs a token with the
+`workflow` scope.
+
 ### Staggered decode (`Generator(stagger_decode = True)`, `EXL3_STAGGER_DECODE=1`)
 
 With the layers split over two cards a regular decode step keeps one card idle at a time. With
