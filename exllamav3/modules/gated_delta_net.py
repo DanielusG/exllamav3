@@ -81,6 +81,11 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
 
 class GDNState:
 
+    # No module reads `position` while a pass runs (stash, unstash and rewind do, between passes):
+    # a prompt chunk may be issued on the first card before the previous chunk's pass, still on
+    # the second, has advanced it (Generator.prefill_pipeline)
+    pass_reads_position = False
+
     def __init__(
         self,
         cache: Cache,

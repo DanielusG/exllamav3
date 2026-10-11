@@ -128,8 +128,9 @@ def rows_of(report: str, title: str) -> list:
 def env():
     e = make_env()
     yield e
-    if e.gen._side_pool is not None:
-        e.gen._side_pool.shutdown(wait = True)
+    for pool in (e.gen._side_pool, e.gen._pipe_pool):
+        if pool is not None:
+            pool.shutdown(wait = True)
 
 
 # --------------------------------------------------------------------------------------------
@@ -276,6 +277,42 @@ def test_the_report(env):
     assert "Attese del worker del thread di prefill: sull'host" in report
     # Every run ingested its prompts again
     assert len(env.resets) >= 14 and not any(env.resets)
+
+
+def test_the_report_with_two_chunks_in_flight(env):
+    g = env.gen
+    g.model.host = Slots(6)
+    g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
+    g.recurrent_checkpoint_interval, g.recurrent_checkpoint_interval_pp = 4096, 32768
+    args = types.SimpleNamespace(**dict(vars(ARGS), bench_phases = ["speed", "check", "pipe"]))
+    report = PB.measure(env, args)
+    assert "**Attenzione**" not in report
+
+    summary = rows_of(report, "## Sintesi")
+    assert [r[0] for r in summary[6:]] == ["`b` da solo, in volo sulle due schede", "insieme, in volo sulle due schede"]
+    assert all(c != "-" for c in summary[7][1:])
+
+    window = rows_of(report, "## La finestra di ingestione")
+    thread, flight = window[2], window[3]
+    assert flight[0] == "in volo sulle due schede" and flight[1] == "8"
+    # A half lasts what a whole chunk lasts on the thread (five decode steps), and two chunks
+    # are under way: the prompt is in after about as many steps as on the thread, not twice
+    assert int(flight[2]) < 2 * int(thread[2]) * 0.8
+
+    flying = rows_of(report, "## Due pezzi in volo")
+    assert [r[0] for r in flying[1:]] == ["`b` da solo, sul thread", "`b` da solo, in volo", "insieme, col thread", "insieme, in volo"]
+    assert (flying[1][2], flying[1][3]) == ("0", "0") and (flying[3][2], flying[3][3]) == ("0", "0")
+    # (b's eight chunks and a's prompt)
+    assert int(flying[4][2]) >= 4 and int(flying[4][3]) >= 4 and flying[4][1] == flying[3][1] == "9"
+
+    # The three comparisons again with the chunks in flight, identical like the rest
+    check = rows_of(report, "## Stesso calcolo")
+    assert len(check) == 10
+    assert all("in volo sulle due schede" in r[0] for r in check[7:])
+    assert [r[-1] for r in check[7:]] == ["**identico**"] * 3, check
+
+    assert "Pezzi in volo sulle due schede: on; al massimo 2 insieme; checkpoint di stato ogni 32768 token" in report
+    assert len(rows_of(report, "## Memoria delle schede")) == 7 and len(rows_of(report, "## I giri")) == 8
 
 
 def test_a_wrong_number_beside_the_decode_is_reported(env, monkeypatch):

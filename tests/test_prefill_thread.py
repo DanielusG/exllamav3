@@ -70,11 +70,13 @@ class Slots:
     def begin_pass(self):
         self.passes += 1
 
-    def split_lanes(self, decode_slots = 2):
-        d = min(decode_slots, self.n - 1)
+    def split_lanes(self, decode_slots = 2, lanes = 2):
+        # (the real one's arithmetic: tests/test_moe_host_lanes.py)
+        d = min(decode_slots, self.n - (lanes - 1))
         if d < 1:
             return None
-        self.split = (d, self.n - d)
+        rest = self.n - d
+        self.split = (d,) + tuple(rest // (lanes - 1) + (i < rest % (lanes - 1)) for i in range(lanes - 1))
         return self.split
 
 
@@ -111,17 +113,19 @@ def long_prompt(seed, n):
 
 
 def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4, min_jobs = 2,
-          min_tokens = 16, max_rows = 8):
+          min_tokens = 16, max_rows = 8, pipeline = False):
     """
-    Run jobs to the end. plan: {name: dict(prompt, max_new, at, chunk, steps)}: the job is
-    enqueued before iteration `at`, ingests `chunk` tokens per chunk and each chunk lasts
-    `steps` decode steps when it runs beside a decode. Returns (tokens per job, generator, jobs,
-    the stage and job of every result in order).
+    Run jobs to the end. plan: {name: dict(prompt, max_new, at, chunk, steps, ckpt, halves)}: the
+    job is enqueued before iteration `at`, ingests `chunk` tokens per chunk and each chunk (each
+    half of it, in the pipeline) lasts `steps` decode steps when it runs beside a decode; a
+    checkpoint is due at every multiple of `ckpt`. Returns (tokens per job, generator, jobs, the
+    stage and job of every result in order).
     """
     g = make_generator(draft = draft, stagger = stagger, min_jobs = min_jobs)
     g.model.host = Slots(slots)
     g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
     g.prefill_thread = thread
+    g.prefill_pipeline = pipeline
     g.side_min_tokens = min_tokens
     g.side_max_rows = max_rows
     jobs = {}
@@ -135,6 +139,8 @@ def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4,
                 spec = pending.pop(name)
                 job = ToyJob(g.model, name, spec["prompt"], spec.get("max_new", 40), chunk = spec.get("chunk", 0))
                 job.hurry = threading.Event()
+                job.ckpt_every = spec.get("ckpt", 0)
+                job.halves = spec.get("halves", True)
                 if spec.get("steps"):
                     job.on_chunk = lasting(spec["steps"])
                 jobs[name] = job
@@ -148,9 +154,10 @@ def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4,
             n += 1
             assert n < 20000, "the generator does not finish"
     finally:
-        if g._side_pool is not None:
-            g._side_pool.shutdown(wait = True)
-    assert g._side is None
+        for pool in (g._side_pool, g._pipe_pool):
+            if pool is not None:
+                pool.shutdown(wait = True)
+    assert g._side is None and not g._pipe
     for name, job in jobs.items():
         if not job.cancelled:
             assert seen.get(name, []) == job.out, f"{name}: results differ from what the job sampled"

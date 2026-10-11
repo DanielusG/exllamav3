@@ -58,8 +58,9 @@ def _load_stubbed():
             pass
 
     stub("")
-    for p in ("cache", "generator", "tokenizer", "util"):
+    for p in ("cache", "generator", "model", "tokenizer", "util"):
         stub(p)
+    stub("model.forward_cursor", ForwardCursor = _Any)
     stub("ext", exllamav3_ext = types.SimpleNamespace())
     stub("util.memory", malloc_trim = lambda: None)
     stub("util.tensor", SeqTensor = _Any)

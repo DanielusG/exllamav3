@@ -315,6 +315,25 @@ def test_split_lanes(monkeypatch):
     assert h1.split_lanes() is None and h1._lanes is None
 
 
+def test_split_lanes_for_a_lane_of_prompt_chunks_per_card(monkeypatch):
+    # Generator.prefill_pipeline: lane 0 for the decode, lanes 1 and 2 for the two halves of a chunk
+    sim = Sim()
+    assert make_host(monkeypatch, sim, 6).split_lanes(lanes = 3) == (2, 2, 2)
+    assert make_host(monkeypatch, sim, 8).split_lanes(lanes = 3) == (2, 3, 3)
+    assert make_host(monkeypatch, sim, 5).split_lanes(lanes = 3) == (2, 2, 1)
+    assert make_host(monkeypatch, sim, 4).split_lanes(lanes = 3) == (2, 1, 1)
+    assert make_host(monkeypatch, sim, 3).split_lanes(lanes = 3) == (1, 1, 1)
+    h2 = make_host(monkeypatch, sim, 2)
+    assert h2.split_lanes(lanes = 3) is None and h2._lanes is None
+    # It replaces the split of the prefill thread alone: lane 0 keeps its slots, lane 1 the
+    # bottom of its range. Asking for fewer lanes afterwards changes nothing
+    h = make_host(monkeypatch, sim, 6)
+    assert h.split_lanes() == (2, 4)
+    assert h.split_lanes(lanes = 3) == (2, 2, 2)
+    assert [h._lanes[i][:2] for i in range(3)] == [[0, 2], [2, 2], [4, 2]]
+    assert h.split_lanes() == (2, 2, 2)
+
+
 def test_one_thread_alone_is_what_it_was(monkeypatch):
     # No lanes: the slots in rotation, a window as deep as the slots, everything on the
     # pass's stream

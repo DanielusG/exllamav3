@@ -11,6 +11,12 @@ quelle di `b` dopo un prompt ingerito sul thread (da solo, e accanto a un decode
 stesso prompt ingerito come oggi. Ogni confronto ha accanto lo stesso giro ripetuto come oggi:
 quanto cambiano i numeri da soli è il metro.
 
+Con la fase `pipe` (non è tra quelle di default) gli stessi giri vengono rifatti con due pezzi di
+prompt in volo sulle due schede (Generator.prefill_pipeline): velocità e stesso calcolo, contro
+il thread da solo e contro la libreria come oggi. Ha senso con un documento di più pezzi
+(`--bench-prompt-tokens 32768`) e con uno slot in più per corsia nel worker degli esperti
+(`--bench-slots 6`).
+
 Si lancia a server FERMO, dalla directory del server, con gli stessi argomenti del server (il
 modello viene caricato come lo carica lui):
 
@@ -73,17 +79,19 @@ class Runner:
         finally:
             rc.pagetable = real
 
-    def run(self, thread: bool, decoder: dict | None, reader: dict | None, lead: int = 0):
+    def run(self, thread: bool, decoder: dict | None, reader: dict | None, lead: int = 0, pipeline: bool = False):
         """
         decoder / reader: dict(ids, max_new, forced = None). The decoder starts at once; the
         reader is enqueued once the decoder has generated `lead` tokens (at once without a
         decoder). The run ends when the reader is done, or the decoder when there is no reader;
         a decoder still generating then is cancelled. Returns what happened, per iteration.
+        pipeline: with the thread, two chunks in flight on the two cards.
         """
         env = self.env
         torch, gen = env.torch, env.gen
         self.forget_prompts()
         gen.prefill_thread = thread
+        gen.prefill_pipeline = bool(thread and pipeline)
         side0 = dict(gen.side_stats)
         counts0 = placement_counts(torch, env.model)
         for d in env.device_ids:
@@ -119,6 +127,7 @@ class Runner:
 
         rec = {
             "thread": thread,
+            "pipeline": bool(thread and pipeline),
             "tokens": {n: [] for n in specs},
             "probs": {n: [] for n in specs},
             "top": {n: [] for n in specs},
@@ -450,6 +459,30 @@ def measure(env, args, gpu = None) -> str:
     if "check" in args.bench_phases and refs.get("mix2") is not None:
         phase("same computation (thread on)", check)
 
+    # 5. With two chunks in flight on the two cards. After the thread's own runs: the CPU expert
+    #    worker's slots are split once more here, and the thread's lane keeps half of what it had
+    piped, pchecks = {}, {}
+
+    def pipelined():
+        run.run(True, None, dict(ids = b_ids, max_new = 8), pipeline = True)     # the second thread's first pass
+        if gen.prefill_pipeline_state != "on":
+            raise RuntimeError(f"the pipeline is not available: {gen.prefill_pipeline_reason}")
+        piped["prefill"] = run.run(True, None, short_b, pipeline = True)
+        piped["mix"] = run.run(True, long_a, short_b, args.bench_lead, pipeline = True)
+
+    def pipe_check():
+        pchecks["alone"] = run.run(True, None, dict(ids = b_ids, forced = refs["tok_alone"], max_new = 0), pipeline = True)
+        pchecks["a"] = run.run(True, dict(ids = a_ids, forced = refs["tok_a"], max_new = 0), short_b, args.bench_lead, pipeline = True)
+        pchecks["mix"] = run.run(True, long_a, dict(ids = b_ids, forced = refs["tok_mix"], max_new = 0), args.bench_lead, pipeline = True)
+
+    if "pipe" in args.bench_phases:
+        if not hasattr(gen, "prefill_pipeline_state"):
+            notes.append("**Attenzione**: questa libreria non ha i pezzi in volo sulle due schede (`prefill_pipeline`): la fase `pipe` manca.")
+        else:
+            phase("with two chunks in flight", pipelined)
+            if "check" in args.bench_phases and refs.get("mix2") is not None and piped.get("mix") is not None:
+                phase("same computation (two chunks in flight)", pipe_check)
+
     # ---------------------------------------------------------------------------------------
     #   Report
     # ---------------------------------------------------------------------------------------
@@ -466,6 +499,9 @@ def measure(env, args, gpu = None) -> str:
 
     r_today, n_today = beside(base.get("mix"), w_today)
     r_side, n_side = beside(side.get("mix"), w_side)
+    w_alone_p = ingestion(piped["prefill"]) if piped.get("prefill") else None
+    w_pipe = ingestion(piped["mix"]) if piped.get("mix") else None
+    r_pipe, n_pipe = beside(piped.get("mix"), w_pipe)
 
     def pct(x, ref):
         return "-" if x is None or not ref else f"{100 * x / ref:.0f}%"
@@ -480,13 +516,21 @@ def measure(env, args, gpu = None) -> str:
         ["insieme, col thread", fmt(r_side), pct(r_side, solo_rate), fmt(w_side and w_side["tok_s"], 0),
          fmt(w_side and w_side["seconds"]), pct(w_side and w_side["tok_s"], w_alone and w_alone["tok_s"])],
     ]
+    if piped:
+        summary += [
+            ["`b` da solo, in volo sulle due schede", "-", "-", fmt(w_alone_p and w_alone_p["tok_s"], 0),
+             fmt(w_alone_p and w_alone_p["seconds"]), pct(w_alone_p and w_alone_p["tok_s"], w_alone and w_alone["tok_s"])],
+            ["insieme, in volo sulle due schede", fmt(r_pipe), pct(r_pipe, solo_rate), fmt(w_pipe and w_pipe["tok_s"], 0),
+             fmt(w_pipe and w_pipe["seconds"]), pct(w_pipe and w_pipe["tok_s"], w_alone and w_alone["tok_s"])],
+        ]
     summary_header = [
         "", "`a`: tok/s (nei giri insieme: mentre `b` ingerisce)", "del suo da solo", "`b`: token di prompt al secondo",
         "secondi fino al primo token", "del suo da solo",
     ]
 
     detail = []
-    for label, rec, w, n in (("come oggi", base.get("mix"), w_today, n_today), ("col thread", side.get("mix"), w_side, n_side)):
+    for label, rec, w, n in (("come oggi", base.get("mix"), w_today, n_today), ("col thread", side.get("mix"), w_side, n_side),
+                             ("in volo sulle due schede", piped.get("mix"), w_pipe, n_pipe)):
         if rec is None or w is None:
             continue
         g = gpu_mean(w)
@@ -508,6 +552,31 @@ def measure(env, args, gpu = None) -> str:
                  "passi di decode accanto ai pezzi", "secondi di passaggi sul thread", "selezioni servite dalla VRAM",
                  "uso delle schede", "W"], detail,
             )
+        )
+
+    if piped:
+        rows_p = []
+        for label, rec, w in (("`b` da solo, sul thread", side.get("prefill"), w_alone_t),
+                              ("`b` da solo, in volo", piped.get("prefill"), w_alone_p),
+                              ("insieme, col thread", side.get("mix"), w_side),
+                              ("insieme, in volo", piped.get("mix"), w_pipe)):
+            if rec is None or w is None:
+                continue
+            s_ = rec["side"]
+            g = gpu_mean(w)
+            rows_p.append([
+                label, s_["chunks"], s_.get("piped", 0), s_.get("ahead", 0), fmt(w["seconds"]), fmt(s_["t_chunks"]),
+                fmt(s_["t_waited"]), " + ".join(f"{u:.0f}%" for u, _, _ in g) if g else "-",
+            ])
+        sections.append(
+            "## Due pezzi in volo\n\n«In volo»: ogni pezzo è emesso in due metà, la prima scheda dal thread di prefill e "
+            "la seconda da un thread suo, e il pezzo dopo parte sulla prima scheda mentre questo è sulla seconda. Un pezzo "
+            "non viene pianificato oltre una posizione in cui è dovuto un checkpoint di stato prima che quello che finisce "
+            "lì sia registrato: «pianificati in anticipo» conta quelli partiti prima della registrazione del precedente "
+            "dello stesso job, «con un altro in volo» quelli partiti con un altro pezzo ancora in corso. I secondi di "
+            "passaggi sommano le due metà di ogni pezzo (in volo si sovrappongono: la somma supera il tempo di orologio).\n\n"
+            + table(["giro", "pezzi", "con un altro in volo", "pianificati in anticipo", "secondi fino al primo token",
+                     "secondi di passaggi", "secondi di attesa del thread del generatore", "uso delle schede"], rows_p)
         )
 
     if "check" in args.bench_phases:
@@ -541,6 +610,26 @@ def measure(env, args, gpu = None) -> str:
         if checks.get("mix") is not None:
             c = compare(refs["mix1"], checks["mix"], READER)
             rows.append(check_row("`b` accanto ad `a`, ingerito sul thread, contro come oggi", c, verdict(c, floor_mix)))
+        # The same three with two chunks in flight
+        if pchecks.get("a") is not None:
+            w = ingestion(pchecks["a"])
+            inside = tokens_before(pchecks["a"], DECODER, w["t1"]) if w else 0
+            started = tokens_at(pchecks["a"], DECODER, w["t0"]) if w else 0
+            if inside > started:
+                c = compare(refs["a1"], pchecks["a"], DECODER, inside)
+                rows.append(check_row(
+                    f"`a` accanto all'ingestione di `b` in volo sulle due schede, contro `a` da solo (posizioni "
+                    f"{started}-{inside})", c, verdict(c, floor_a),
+                ))
+            else:
+                notes.append("**Attenzione**: nel giro di controllo coi pezzi in volo `a` non ha generato durante "
+                             "l'ingestione di `b`: quel confronto manca.")
+        if pchecks.get("alone") is not None:
+            c = compare(refs["alone1"], pchecks["alone"], READER)
+            rows.append(check_row("`b` da solo, ingerito in volo sulle due schede, contro come oggi", c, verdict(c, floor_alone)))
+        if pchecks.get("mix") is not None:
+            c = compare(refs["mix1"], pchecks["mix"], READER)
+            rows.append(check_row("`b` accanto ad `a`, ingerito in volo sulle due schede, contro come oggi", c, verdict(c, floor_mix)))
         sections.append(
             "## Stesso calcolo\n\n"
             "Token imposti, probabilità del token imposto posizione per posizione. Ogni confronto col thread ha sopra lo "
@@ -558,7 +647,8 @@ def measure(env, args, gpu = None) -> str:
     picks = []
     for label, rec in (("`a` da solo", base.get("decode")), ("`b` da solo, come oggi", base.get("prefill")),
                        ("insieme, come oggi", base.get("mix")), ("`b` da solo, sul thread", side.get("prefill")),
-                       ("insieme, col thread", side.get("mix"))):
+                       ("insieme, col thread", side.get("mix")), ("`b` da solo, in volo", piped.get("prefill")),
+                       ("insieme, in volo", piped.get("mix"))):
         if rec is not None:
             acc, rej = sum(rec["accepted"].values()), sum(rec["rejected"].values())
             picks.append([label, fmt(rec["hit"], 3), fmt(acc / (acc + rej), 2) if acc + rej else "-",
@@ -572,7 +662,8 @@ def measure(env, args, gpu = None) -> str:
 
     mem = []
     for label, rec in (("`b` da solo, come oggi", base.get("prefill")), ("insieme, come oggi", base.get("mix")),
-                       ("`b` da solo, sul thread", side.get("prefill")), ("insieme, col thread", side.get("mix"))):
+                       ("`b` da solo, sul thread", side.get("prefill")), ("insieme, col thread", side.get("mix")),
+                       ("`b` da solo, in volo", piped.get("prefill")), ("insieme, in volo", piped.get("mix"))):
         if rec is not None:
             mem.append([label] + [gib(rec["peak"][d]) for d in env.device_ids] + [gib(rec["free"][d]) for d in env.device_ids])
     if mem:
@@ -613,6 +704,15 @@ def measure(env, args, gpu = None) -> str:
         + (" (prima che il thread serva la prima volta sono tutti in una rotazione, come in produzione)" if slots else ""),
         f"- Un pezzo gira accanto al decode se ha almeno {gen.side_min_tokens} token e il batch di decode non supera "
         f"{gen.side_max_rows} righe per token; altrimenti il generatore lo aspetta",
+    ]
+    if "pipe" in args.bench_phases and hasattr(gen, "prefill_pipeline_state"):
+        head += [
+            f"- Pezzi in volo sulle due schede: {gen.prefill_pipeline_state}"
+            + (f" ({gen.prefill_pipeline_reason})" if gen.prefill_pipeline_reason else "")
+            + f"; al massimo {gen.pipe_depth} insieme; checkpoint di stato ogni {gen.recurrent_checkpoint_interval_pp} token "
+            f"di prompt e ogni {gen.recurrent_checkpoint_interval} negli ultimi {2 * gen.max_chunk_size}",
+        ]
+    head += [
         f"- Intervallo di cambio del GIL: {1000 * sys.getswitchinterval():.1f} ms",
         "- Attese del worker del thread di prefill: " + (
             "sull'host, con copie e flag su uno stream a parte" if env.host_waits
@@ -638,7 +738,9 @@ def main():
     ap.add_argument("--bench-warmup", type = int, default = 48, help = "token del giro di riscaldamento (default 48)")
     ap.add_argument("--bench-adapt", type = int, default = 3, help = "giri al massimo per adattare il piazzamento degli esperti (default 3, 0 = no)")
     ap.add_argument("--bench-adapt-tokens", type = int, default = 160, help = "token di `a` in un giro di adattamento (default 160)")
-    ap.add_argument("--bench-phases", default = "speed,check", help = "speed (velocità), check (stesso calcolo); default entrambe")
+    ap.add_argument("--bench-phases", default = "speed,check",
+                    help = "speed (velocità), check (stesso calcolo), pipe (anche con due pezzi in volo sulle due schede); "
+                           "default speed,check")
     ap.add_argument("--bench-slots", type = int, default = 0,
                     help = "slot del worker degli esperti (EXL3_MOE_CPU_SLOTS, 3-8); default 0: quelli della libreria (4)")
     ap.add_argument("--bench-no-handoff", action = "store_true",
@@ -658,9 +760,9 @@ def main():
     if args.bench_out is not None and not args.bench_out.endswith(".md"):
         raise SystemExit("--bench-out: il rapporto è un file .md")
     args.bench_phases = [p.strip() for p in args.bench_phases.split(",") if p.strip()]
-    unknown = [p for p in args.bench_phases if p not in ("speed", "check")]
+    unknown = [p for p in args.bench_phases if p not in ("speed", "check", "pipe")]
     if unknown:
-        raise SystemExit(f"--bench-phases: fasi sconosciute {unknown}; valgono speed, check")
+        raise SystemExit(f"--bench-phases: fasi sconosciute {unknown}; valgono speed, check, pipe")
     if args.bench_slots:
         # Read once, when the library is imported
         os.environ["EXL3_MOE_CPU_SLOTS"] = str(args.bench_slots)
@@ -751,7 +853,7 @@ def main():
         lanes = getattr(h, "_lanes", None)
         if lanes is None:
             return f"{h.num_slots}, non ancora divisi"
-        return f"{h.num_slots}: {lanes[0][1]} per il decode e {lanes[1][1]} per il prefill"
+        return f"{h.num_slots}: {lanes[0][1]} per il decode e " + " + ".join(str(lanes[i][1]) for i in sorted(lanes) if i) + " per il prefill"
 
     env = SimpleNamespace(
         torch = torch,

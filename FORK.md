@@ -261,7 +261,7 @@ flags with 8 worker threads, MTP 1):
 - **Neither are the cards**: 37% + 36% in the window.
 - **The CPU expert worker is.** A decode step is a pipeline through it, layer by layer: with
   0.84 of the selections served from VRAM, 41 layers of 48 pick at least one CPU-resident
-  expert among their 16 selections (2 rows x 8), and each of those costs the worker 0.46 ms
+  expert among their 20 selections (2 rows x 10), and each of those costs the worker 0.46 ms
   (GEMVs over the experts' weights: 0.42 of it, compute-bound on AVX2 at about 2 GB/s per
   thread) after 0.27 ms for the card to stage the inputs. That is the whole 30 ms step; the
   host, which issues a step in 18 ms, is ahead of it. A prompt alone keeps the worker busy
@@ -372,9 +372,9 @@ stashes and one more checkpoint per turn for nothing).
 less often, 0 = off) and is read at every step; `gen.tail_stats` counts the stashes, the
 checkpoints they replaced and the seconds spent in them.
 
-**Measured** (2026-10-11, on the production model in the exact form of the check, with a bench
-that is not in the tree yet: a prompt of 8.1k tokens and a forced answer of 1100, two rounds
-each way): generation 56.0 ->
+**Measured** (2026-10-11, on the production model in the exact form of the check, with the
+`turn` phase of `experiments/config_bench.py`: a prompt of 8.1k tokens and a forced answer of
+1100, two rounds each way): generation 56.0 ->
 55.7 tok/s (-0.7%), four stashes of 25 ms, the probabilities of the forced tokens identical;
 the next turn resumes 768 tokens later (264 to read instead of 1032) and has its first token in
 0.88 s instead of 1.62. Not seen yet: real traffic, several jobs at once, the staggered decode
@@ -382,6 +382,132 @@ together with it (the checkpoint is offered between two passes, as the regular o
 
 Tests: `tests/test_tail_checkpoint.py` (the job's real rules and the real cache over a stub
 job).
+
+### Two prompt chunks in flight on the two cards (`Generator(prefill_pipeline = True)`, `EXL3_PREFILL_PIPELINE=1`)
+
+Off by default. For a model whose layers are split over two cards, with the MTP head. Measured
+on the machine on 2026-10-11 (below): same computation exactly, a long prompt in a third less
+time alone, and beside jobs that are generating a quarter faster at their expense. In the
+server: `--prefill-pipeline` (rule 26 of its `AGENTS.md`), which also asks for six worker slots.
+
+**The idea.** A prompt is ingested a chunk at a time, and a chunk's pass works on one card at a
+time: each card is idle for half of it. Every layer keeps its own state (K/V pages, recurrent
+state) and needs that state after the previous chunk and the output of the layer before it for
+this one, so nothing stops the next chunk from starting on the first card while this one is on
+the second:
+
+    first card    A(0)  A(1)  A(2) ...
+    second card         B(0)  B(1) ...
+
+with A(k+1) after A(k) and B(k+1) after B(k).
+
+**What the switch does.** It turns the prefill thread on and adds a second one. A chunk's
+passes are issued in pieces (`Job._prefill_co`: the `halves` of the yielded function, a
+`ForwardCursor` stopped where the pass changes card, held, and finished by the other thread;
+then the MTP head's update): the first half by the prefill thread, the second by the new one.
+Each thread takes the chunks in the order they are handed over, which is the two rules above.
+Up to two chunks are under way (`pipe_depth`), of two jobs or of one.
+
+**The MTP head's update takes its turn on the head's card.** The head loads first and is on
+the first card. Its update of a chunk needs the end of that chunk's pass, so it follows the
+second half; run by the second half's thread it was on the first card while the next chunk's
+first half was there, and although the kernels of the two never overlap (one stream), their
+memory did: 0.4 GiB more at the peak on the first card, and a 179k-token prompt that no
+longer fitted at production's split. With the head on the first card the update is therefore
+handed to the prefill thread when the second half is done, and runs between two first halves
+(`_pipe_head_first`, `_pipe_after`): a card has one prompt pass at a time, the head's
+included. `EXL3_PREFILL_PIPELINE_HEAD=second` is the earlier behaviour, for telling the two
+apart.
+
+- `exllamav3/generator/generator.py`: `_pipe_round` and the `_pipe_*` helpers; its docstring
+  has the rules. Everything the round of one chunk at a time says still holds, card by card:
+  only forward passes leave the generator's thread, a chunk and a decode step overlap only if
+  they cannot meet inside a module, a job with a chunk under way gets no checkpoint and no
+  decode step, `cancel` lets its chunks finish the half they are in (and tells them to go no
+  further).
+- **A chunk of the same job is planned ahead of the record of the one before it**
+  (`_pipe_ahead`, `Job._prefill_co(results, at)`), and that is refused where it could go wrong:
+  several sequences, embeddings, a state whose position a module reads during a pass (the
+  state class says: `GDNState.pass_reads_position = False`), and **any position where a
+  recurrent checkpoint is due**. A checkpoint stashes the whole state at one position, and
+  the first half of the next chunk would have moved the first card's layers past it; so the
+  chunk that ends at a checkpoint is recorded with nothing else of its job under way, and
+  the next one starts in the round after the checkpoint. That is one chunk without overlap
+  per checkpoint: every `recurrent_checkpoint_interval_pp` tokens (32768), every
+  `recurrent_checkpoint_interval` in the last two chunks of the prompt (with 4096 for both
+  that interval and the chunk: the last two chunks are in line), and the prompt's last page.
+  A prompt of one chunk gains nothing.
+- **Two lanes** (`util/lane.py`). The first half issues on lane 1, the prefill thread's own,
+  the second on lane 2. Each lane has its kernels on one card (apart from the MTP head's
+  update), so its workspaces are that card's: the two lanes together hold what the prefill
+  thread's one lane held, and a card still runs one prompt chunk at a time beside the decode.
+- `exllamav3/model/moe_cpu_host.py`: `split_lanes(lanes = 3)` gives the decode its two slots
+  and the two halves an even share of the rest (with the default four: one each; the pipeline
+  says so at start-up, and `EXL3_MOE_CPU_SLOTS=6` gives each two, which is what the probe
+  ran with). Two lanes of prompt chunks at once is new to the host: the rotation of the
+  weight-staging slots and the stager's ring of the streamed path were one lane's, and are
+  now taken under `_stage_lock`, down to the enqueue of the copy the stager waits for.
+
+What it costs when it runs: a second host thread (idle between chunks), one lane more in the
+worker's slots, nothing written anywhere, about 130 MiB less free on the first card after a
+long prompt (a chunk waiting between the two cards holds its activations), and the jobs that
+are generating: both halves want the CPU expert worker, which is what limits the overlap of
+one chunk with the decode already (third session above), so a prompt that goes in faster
+beside them takes that time from them.
+
+**Measured** (2026-10-11, server stopped; reports in `~/exl3-pipeline-20261011/reports` on the
+machine):
+
+- `experiments/prefill_bench.py`, phases `speed,check,pipe`, exact form, six worker slots, a
+  33334-token document in chunks of 4096, split `23:262,25:285` (the bench also keeps the
+  inline lane's workspaces on the cards). **Same computation**: the nine comparisons identical,
+  the three with two chunks in flight among them (the prompt alone, the prompt beside a job
+  generating, that job beside the prompt). The prompt alone: 1170 tokens a second in line,
+  1104 on the thread, **1540 in flight** (21.6 s against 30.2). Beside a job generating at
+  49.3 tok/s alone: on the thread the prompt at 614 and the job at 29.1; in flight the prompt
+  at 777 and the job at 24.5. The same work one after the other takes within 1% of either: in
+  flight moves time from the decode to the prompt. Six chunks of ten were planned ahead.
+- A test instance of the server, production's flags and split (`23:226,25:253`), the switch
+  from the environment, six slots, against the same requests without it (four slots, the
+  evening's trial of the 4096 chunk): prompts of 5.5k tokens the same (770 against 765 tokens
+  a second); 29.5k alone 25.6 s against 33.8; 32k beside one job generating 865 tokens a
+  second against 706, the job at 16.0 tok/s against 20.0 (its longest wait 0.6 s against
+  0.2 in that run, 0.2 in the run before the head's turn: not explained); **179k alone 143 s
+  against 207**. Free memory after all of it: 254 and 166 MiB against 384 and 146.
+- Before the head's turn the same instance ran out of memory on the first card at the 179k
+  prompt (24 MiB free before it). That run had more requests in it, with the same speeds for
+  the ones above: 30k beside three jobs generating 820 tokens a second against 641, the jobs
+  at 12 tok/s each against 15; a 95k prompt beside a job generating and a short task had its
+  first token after 123 s where it was 82% in after 136 s, the short task took the same 130 s
+  in all and its first turns started later (17-18 s against 11-15). With the update left to
+  the second thread and eight split units given back on the first card (`23:234`) the 179k
+  prompt goes in, with 22 MiB to spare: the turn is the way out, not the split.
+
+Not seen: images in a prompt (they are ingested one chunk at a time, in the same pieces),
+several prompts at once on real traffic, a decode batch above eight rows, the checkpoint disk
+tier filling while chunks are in flight.
+
+**The probe** (2026-10-11, `experiments/pipeline_probe.py`: the chunks of one job run by hand
+in that order from two threads, outside the generator's bookkeeping; 32768 tokens in 8 chunks
+of 4096, exact form, production's flags with a split of `23:262,25:285`, two worker slots per
+thread): in line 27.2-27.5 s (1191-1204 tokens a second), in line on the prefill thread
+30.9 s (its lane has two of the worker's four slots: -11.5%), in flight 19.8 s (1650-1657,
+**+38%** against in line). The logits of every chunk's last token identical bit for bit in
+the three orders. A chunk in flight spent 2.15 s on the first card and 1.97 s on the second,
+and waited for neither. The probe's two threads each ran whole chunks, alternately, so each
+had workspaces on both cards (it did not load at production's split); and it took the
+weight-staging slots without the lock.
+
+Tests (no GPU, no extension): `tests/test_prefill_pipeline.py` (the real round over the toy
+model, whose job turns the rules into assertions: one chunk per card at a time, a layer takes
+the chunks in order, records in order, a checkpoint on a whole state and never past one, no
+page released under a half; and Job's own coroutine planning ahead the chunks it plans in
+turn), `tests/test_moe_host_lanes.py` (the split into three lanes).
+
+Bench on the real model: the `pipe` phase of `experiments/prefill_bench.py` (same runs as for
+the thread, with two chunks in flight: speed alone and beside a job generating, and the three
+comparisons of the exact check); to be run with `--bench-slots 6` and a document of several
+chunks.
 
 ### Building the extension on the machine
 
