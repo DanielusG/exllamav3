@@ -288,6 +288,17 @@ flags with 8 worker threads, MTP 1):
   and rejected drafts job by job (the MTP head's cache does not show in the probabilities).
   The generating job's longest wait in the window: 78-120 ms. Below 33 tokens a chunk takes
   the worker's decode-size path and is still waited for: not checked, and short.
+- **Several jobs generating.** The bench has one. With 2, 3 and 4 jobs generating (4, 6 and 8
+  decode rows with MTP 1) while a fifth ingests 8289 tokens on the thread, in the exact form:
+  each generating job's probabilities identical to the same jobs with no prompt beside them
+  (about 400 positions each, all generated during the ingestion), the reader's identical to an
+  ingestion as upstream beside the same jobs, and its accepted and rejected drafts the same.
+  With 5 jobs (10 rows: past `side_max_rows`, the chunks are waited for) the same.
+- **In the server** (a test instance on another port, the wheel, this branch): a job
+  generating kept 73% of its events per second beside a 15k-token prompt (longest wait 172 ms),
+  89% beside six prompts of 88-428 tokens (95 ms), 81% beside two long prompts one after the
+  other; a request abandoned in the middle of its ingestion left no error and the server went
+  on answering. No error of the thread or of the engine in 36 chunks.
 
 ### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
 
