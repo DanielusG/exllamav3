@@ -7,7 +7,9 @@ until the server's hooks are ported (see the server's AGENTS.md).
 
 As long as a change touches Python only, the checkout can be used without building anything:
 put it ahead of the installed package on `PYTHONPATH`. The compiled extension is a top-level
-module (`exllamav3_ext`) and keeps coming from the installed 1.5.4 wheel.
+module (`exllamav3_ext`) and keeps coming from the installed 1.5.4 wheel. Everything on this
+branch is of that kind. How to build the extension on the machine, for a change that is not,
+is at the end of this file.
 
 ## What differs from upstream
 
@@ -240,3 +242,99 @@ Second run (2026-10-10, bench at af7c041, same case, with the fix):
   `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1` would tell: if the repeated runs then read
   identical, the comparison with the thread becomes exact (its speed figures would not be
   production's: the fused tier is off).
+
+Third session (2026-10-11, night, server stopped; bench and a probe built on it, production's
+flags with 8 worker threads, MTP 1):
+
+- **Same computation, exactly.** With `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1` two
+  identical runs as upstream give identical probabilities in every position (so those two paths
+  were the whole of the run-to-run noise, as read above), and the three comparisons with the
+  thread come out identical too: the generating job beside an ingestion against itself alone,
+  the prompt ingested on the thread alone, and beside a decode. That is the check to repeat
+  after any change to this code:
+  `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 python experiments/prefill_bench.py --bench-phases check ...`
+  (it costs no speed on this machine: 7.5 s for the prompt, 60 tok/s alone, as without).
+- **The GIL is not what limits the overlap.** A switch interval of 5, 1, 0.2 and 0.05 ms gives
+  the generating job the same 26-27 tok/s; py-spy with `--gil` has the generator's thread hold
+  it 30% of the run and the prefill thread 7%, and nobody the rest of the time.
+- **Neither are the cards**: 37% + 36% in the window.
+- **The CPU expert worker is.** A decode step is a pipeline through it, layer by layer: with
+  0.84 of the selections served from VRAM, 41 layers of 48 pick at least one CPU-resident
+  expert among their 16 selections (2 rows x 8), and each of those costs the worker 0.46 ms
+  (GEMVs over the experts' weights: 0.42 of it, compute-bound on AVX2 at about 2 GB/s per
+  thread) after 0.27 ms for the card to stage the inputs. That is the whole 30 ms step; the
+  host, which issues a step in 18 ms, is ahead of it. A prompt alone keeps the worker busy
+  about half the time (tail jobs of 64 rows, 3-9 ms each, 55 a second). Together they want
+  more of it than there is: the step goes to 54 ms and the ingestion from 7.6 to 11.7 s.
+- What was tried against that, none of it worth more than 10% and all of it the same 10%
+  (30.6 tok/s and 11.7 s with nothing): a ring and a thread of their own for the decode's jobs
+  in the worker (branch `flash-next-native`: 33.5 and 10.7 with 8 threads each; with 2 the
+  decode is slower than in one ring), 12 worker threads in one ring (32.9 and 10.8), 16 (31.2
+  and 11.1), the pinned arena, a streaming threshold of 2, 4 and 16 instead of 8. Own CUDA
+  streams for the lane were not tried: the cards are not the limit, and a block allocated on
+  one stream and last used on another (`seq.mtp_carry_hidden` is one) is handed out again in
+  the order of the first.
+- What does change the picture is on the other side of the same finding: fewer layers of a
+  decode step in the worker. See the next section.
+- The generating job's longest wait in the window is 0.5-0.6 s: the last chunk of the prompt,
+  96 tokens here, is shorter than a page and is waited for.
+
+### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
+
+The library's dynamic placement ranks the experts of a split layer by how often they were
+selected, every selection counting one. Prompt tokens outnumber generated ones by orders of
+magnitude, so prompts decide the placement alone. But a selection that misses VRAM does not cost
+the same in the two: a decode step waits for the worker in every layer that has one (above),
+while a prompt chunk sends its hot CPU-resident experts to the card and leaves the worker a
+tail.
+
+Measured (same night, same flags; placement adapted to the bench's own traffic in each case):
+
+| placement learnt from | share served from VRAM, generating job | its speed alone | share, prompt | its ingestion alone |
+|---|---|---|---|---|
+| job + prompt, equal weights (upstream) | 0.843 | 60.6 tok/s | 0.953 | 7.64 s |
+| the generating job only | 0.945 | 69.7 tok/s | 0.621 | 7.87 s |
+| job + prompt, prompt weight 0 | 0.929 | 66.7-68.3 tok/s | 0.627 | 7.77 s |
+| job + prompt, prompt weight 0.004 | 0.928 | 67.6-67.8 tok/s | 0.836 | 7.60 s |
+
+With 12 worker threads and weight 0: 67.8-69.9 tok/s and 7.50 s. In the overlap the two weights
+give 32-33 tok/s and 11.4-12.0 s (30.6 and 11.7 with equal weights).
+
+- `modules/block_sparse_mlp_cpu.py`: the selections of prefill-size batches (at least
+  `EXL3_MOE_STREAM_MIN_ROWS` rows, 32) are counted in `_split_hist_pf` instead of `_split_hist`,
+  and `run_pending_swap_sweeps` folds them into `_split_hist` with the weight, for every layer,
+  before it sweeps any (`_split_hist_fold`): a reader wrapped around `_split_sweep_layer`, like
+  the server's expert tier, sees the histogram the sweep uses. `split_hits()` gives both.
+- `EXL3_MOE_HIST_PREFILL_WEIGHT` is read at every sweep. Default 1: upstream's ranking. 0: the
+  placement follows generated tokens only. A small weight (0.004 is one prompt selection in
+  250, about the ratio of the two costs on this bench) lets prompts fill the slots the decode
+  leaves undecided.
+- What the server shows as hit rate is computed from `_split_hist` around a sweep: with a
+  weight below 1 it is the weighted share, close to the generating jobs' own.
+- Not seen on real traffic: the bench has one generating job on one prompt. How far a
+  placement learnt from many conversations' output gets is for production's telemetry to say.
+
+Tests: `tests/test_placement_weight.py` (the mixin on its own: where the selections are
+counted, what the sweep ranks by at weights 1, 0 and in between, the fold before any layer).
+
+### Building the extension on the machine
+
+Needed only for a change to `exllamav3_ext` (none on this branch). Found the hard way on
+2026-10-11:
+
+- The system's CUDA 13.4 (`/opt/cuda`) does not compile torch 2.11's headers, with any gcc:
+  its front end drops a `typename` the host compiler then asks for (`ATen/core/List_inl.h`).
+  The 1.5.4 wheel was built with CUDA 13.2: a conda prefix of that, used only as compiler
+  (no root, 2.2 GB), does it:
+  `conda create -p <prefix> --override-channels -c nvidia/label/cuda-13.2.0 -c conda-forge cuda-nvcc cuda-cudart-dev cuda-cccl cuda-driver-dev libcublas-dev libcurand-dev libcusparse-dev libcusolver-dev`
+- Host compiler gcc 13 (`CC`, `CXX`, `CUDAHOSTCXX`): the environment's `libstdc++` is gcc 15's.
+- `CUDA_HOME=<prefix> CPATH=<prefix>/targets/x86_64-linux/include LIBRARY_PATH=<prefix>/lib`
+  `TORCH_CUDA_ARCH_LIST=12.0 CUDA_VISIBLE_DEVICES= MAX_JOBS=14 python setup.py build_ext --inplace`
+  in a checkout of its own. Without `TORCH_CUDA_ARCH_LIST` torch asks the cards for their
+  architecture, which opens a CUDA context in the build process. 190 translation units,
+  3 min 45 s; a change to a header rebuilds what includes it (100 s for the worker's three).
+- The module lands in the checkout's root and wins over the wheel's when that root is ahead on
+  `PYTHONPATH`. Built from this branch's sources it has the wheel's 183 symbols and gives the
+  bench the same verdicts, hit rates and speeds.
+- Not with the server running: one C++ unit takes 2.5 GB, and the machine has no memory to
+  spare beside the model (the first attempt pushed 10 GB of the server into swap).
