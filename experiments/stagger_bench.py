@@ -685,6 +685,10 @@ def stage_devices(torch, model, split):
 class Bench:
     """A loaded model, its generator and the instruments; run() is one generation."""
 
+    # Most likely tokens recorded at each position of a forced run (two tell where the first
+    # one changed; a bench that compares distributions asks for more)
+    top_tokens = 2
+
     def __init__(self, env, gpu):
         self.env = env
         self.gpu = gpu
@@ -721,7 +725,7 @@ class Bench:
             n_new = tokens
             if forced is not None:
                 n_new = len(forced[name])
-                kwargs = {"return_probs": True, "return_top_tokens": 2}
+                kwargs = {"return_probs": True, "return_top_tokens": self.top_tokens}
             jobs[name] = env.Job(
                 input_ids = env.prompts[name],
                 max_new_tokens = n_new,
