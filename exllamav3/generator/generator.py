@@ -41,6 +41,11 @@ class _Flight:
         self.jobs = jobs
 
 
+# Shortest prompt chunk that may run on the prefill thread beside a decode step: one token past
+# the CPU expert worker's decode-size batches (Generator.__init__ says what stands behind it)
+SIDE_MIN_TOKENS = 33
+
+
 class _SidePass:
     """A chunk of a job's prompt being ingested on the prefill thread (Generator._prefill_round):
     the job, its prefill coroutine stopped at the chunk's forward passes, the future of those
@@ -287,12 +292,19 @@ class Generator:
         # Prompt ingestion on a second thread (_prefill_round). _side is the chunk under way;
         # the thread and its lane (util/lane.py) are made at the first use. What may overlap:
         # a chunk of at least side_min_tokens tokens and a decode step of at most side_max_rows
-        # rows x tokens. Those two never take the same path through a module (the decode graphs
-        # and the fused decode kernels serve up to 8 rows x tokens, the direct GEMM up to 144
-        # rows, and a chunk of a page or more is past every such threshold), so no buffer
-        # baked into a module at load time is used by both
+        # rows x tokens. Those two never take the same path through a module, so no buffer
+        # baked into a module at load time is used by both: the decode graphs, the fused decode
+        # kernels and the single-row buffers serve up to 8 rows x tokens, and a chunk above the
+        # CPU expert worker's decode-size batches (EXL3_MOE_STREAM_MIN_ROWS, 32: _side_plan
+        # raises the floor to that) goes through the prefill tiers of every module, whether
+        # the direct GEMM (up to 144 rows) or the reconstruct path. The floor was a page until
+        # the exact form of the bench's check existed (FORK.md): chunks of 33, 48, 64, 65, 96,
+        # 100, 144, 145, 199 and 249 tokens beside a decode come out identical to upstream,
+        # and the last chunk of a prompt, or a short prompt, no longer stops the jobs that are
+        # generating (their longest wait in the bench: 0.6 s before, 0.09 s after).
+        # EXL3_SIDE_MIN_TOKENS overrides (256 is the old behaviour)
         self.prefill_thread = prefill_thread or os.environ.get("EXL3_PREFILL_THREAD", "0") not in ("", "0")
-        self.side_min_tokens = PAGE_SIZE
+        self.side_min_tokens = max(SIDE_MIN_TOKENS, int(os.environ.get("EXL3_SIDE_MIN_TOKENS", "0") or 0))
         self.side_max_rows = 8
         self.side_stats = {
             "chunks": 0, "beside": 0, "decode_steps": 0, "errors": 0,
@@ -1119,9 +1131,9 @@ class Generator:
           - one chunk is under way at a time (self._side); with several jobs ingesting, they
             take turns at it;
           - a chunk and a decode step overlap only when they cannot meet inside a module
-            (side_min_tokens, side_max_rows: see __init__). A shorter chunk (the tail of a
-            prompt), or any chunk while the decode batch is larger than that, is waited for
-            like an inline one;
+            (side_min_tokens, side_max_rows: see __init__). A shorter chunk (a prompt of a
+            few tokens), or any chunk while the decode batch is larger than that, is waited
+            for like an inline one;
           - everything that is not a forward pass stays on this thread: the plan of the chunk,
             its record (sequence and page positions, page hashes), the checkpoint, the results.
             The page table and the recurrent cache are never touched from the other thread;
@@ -1227,6 +1239,10 @@ class Generator:
                     if slots is None:
                         why = "the CPU expert worker has a single slot (EXL3_MOE_CPU_SLOTS)"
                         break
+                    # A chunk the worker's host would treat as a decode-size batch is not one
+                    # that may run beside a decode step
+                    self.side_min_tokens = max(
+                        self.side_min_tokens, int(getattr(h, "stream_min_rows", 0) or 0) + 1)
             if why is None:
                 self._side_lane = Lane(1, devices)
                 self._side_pool = ThreadPoolExecutor(

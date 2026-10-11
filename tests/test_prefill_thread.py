@@ -492,3 +492,52 @@ def test_with_the_staggered_decode():
     assert out == ref
     assert g.side_stats["beside"] == 4
     assert g.stagger_stats["steps"] > 50 and g.stagger_stats["drains"] == 0
+
+
+# --------------------------------------------------------------------------------------------
+#   The shortest chunk that may run beside a decode
+# --------------------------------------------------------------------------------------------
+
+def planned(stream_min_rows = None, floor = None):
+    """A generator whose first round has set the prefill thread up, on a CPU expert host that
+    takes batches below stream_min_rows as decode-size ones (None: a host that does not say)."""
+    g = make_generator()
+    g.model.host = Slots()
+    if stream_min_rows is not None:
+        g.model.host.stream_min_rows = stream_min_rows
+    g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
+    g.prefill_thread = True
+    g.side_min_tokens = GEN.SIDE_MIN_TOKENS if floor is None else floor
+    try:
+        assert g._side_plan()
+    finally:
+        if g._side_pool is not None:
+            g._side_pool.shutdown(wait = True)
+    return g
+
+
+def test_the_floor_is_one_token_past_the_worker_s_decode_size_batches():
+    # Below a page: the last chunk of a prompt, and a short prompt, run beside the decode too
+    assert GEN.SIDE_MIN_TOKENS == 33
+    assert planned(32).side_min_tokens == 33
+    assert planned(None).side_min_tokens == 33
+    # A host told to take larger batches as decode-size ones raises it; one told smaller does
+    # not lower it
+    assert planned(128).side_min_tokens == 129
+    assert planned(8).side_min_tokens == 33
+    # and what was asked for above it stays (EXL3_SIDE_MIN_TOKENS)
+    assert planned(32, floor = 256).side_min_tokens == 256
+
+
+def test_a_chunk_at_the_floor_runs_beside_and_one_below_is_waited_for():
+    plan = {
+        "a": dict(prompt = PROMPTS["a"], max_new = 300),
+        "b": dict(prompt = long_prompt(5, 16 + 15 + 1), max_new = 10, at = 6, chunk = 16, steps = 3),
+    }
+    ref, _, _, _ = drive(False, plan)
+    out, g, jobs, _ = drive(True, plan, min_tokens = 16)
+    assert out == ref
+    # 31 prompt tokens in a chunk of 16 and one of 15: only the first is long enough
+    assert len(jobs["b"].chunk_threads) == 2
+    assert g.side_stats["beside"] == 1
+

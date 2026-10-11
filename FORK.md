@@ -136,10 +136,11 @@ server's `--decode-slice-ms`, not two passes at once.
   - one chunk under way at a time; a job whose chunk is under way gets no checkpoint and no
     decode step, and `cancel` / `clear_queue` let the chunk finish first;
   - a chunk and a decode step overlap only if they cannot meet inside a module: chunk of at
-    least a page (`side_min_tokens`), decode batch of at most 8 rows x tokens
-    (`side_max_rows`). Past those thresholds no path is common to the two (decode graphs and
-    fused decode kernels up to 8, direct GEMM up to 144 rows). A shorter chunk, the tail of
-    every prompt, is waited for like an inline one;
+    least `side_min_tokens` tokens (33: one past the CPU expert worker's decode-size batches;
+    a page until 2026-10-11, see the third session below), decode batch of at most 8 rows x
+    tokens (`side_max_rows`). Past those thresholds no path is common to the two (decode
+    graphs, fused decode kernels and single-row buffers up to 8 rows; every prefill tier
+    above the worker's 32). A shorter chunk is waited for like an inline one;
   - with nobody generating the round waits for its chunks, which still run on the second
     thread: the workspaces of a prefill pass exist once.
 - `exllamav3/model/moe_cpu_host.py`: `split_lanes` (a range of slots per lane: on one rotation
@@ -276,8 +277,17 @@ flags with 8 worker threads, MTP 1):
   the order of the first.
 - What does change the picture is on the other side of the same finding: fewer layers of a
   decode step in the worker. See the next section.
-- The generating job's longest wait in the window is 0.5-0.6 s: the last chunk of the prompt,
-  96 tokens here, is shorter than a page and is waited for.
+- **The last chunk of a prompt no longer stops the decode.** It is shorter than a page (a
+  recurrent model ingests the last partial page as a pass of its own), and so is a whole short
+  prompt; with the floor at a page it was waited for: 0.5-0.7 s without a token for the
+  generating job, once per prompt ingested beside it. With the exact check at hand the floor
+  went down to 33 tokens (`SIDE_MIN_TOKENS`; `_side_plan` raises it to one past the worker
+  host's `stream_min_rows`; `EXL3_SIDE_MIN_TOKENS=256` is the old behaviour). Checked exactly
+  with last chunks of 33, 48, 64, 65, 96, 100, 144, 145, 199 and 249 tokens running beside a
+  decode: identical probabilities in the three comparisons every time, and the same accepted
+  and rejected drafts job by job (the MTP head's cache does not show in the probabilities).
+  The generating job's longest wait in the window: 78-120 ms. Below 33 tokens a chunk takes
+  the worker's decode-size path and is still waited for: not checked, and short.
 
 ### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
 
