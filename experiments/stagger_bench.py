@@ -646,6 +646,11 @@ def placement_counts(torch, model):
     with torch.inference_mode():
         for m in mods:
             hist = m._split_hist.detach().to("cpu", torch.float64)
+            # (prompt ingestion's selections are counted apart until the sweep: the library
+            # may weigh them differently in the placement; here every selection is one)
+            pf = getattr(m, "_split_hist_pf", None)
+            if pf is not None:
+                hist = hist + pf.detach().to("cpu", torch.float64)
             smap = m._split_map.detach().to("cpu")
             total += float(hist.sum())
             gpu += float(hist[smap < m.cpu_split_first].sum())

@@ -49,6 +49,28 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 """
 
 
+def hist_prefill_weight() -> float:
+    """
+    What one expert selection made while ingesting a prompt counts in the placement, against 1
+    for a selection made while generating (EXL3_MOE_HIST_PREFILL_WEIGHT, default 1: every
+    selection counts the same, as upstream).
+
+    The two do not cost the same. A decode step waits for the CPU worker in every layer that
+    picked at least one CPU-resident expert, so a missed selection there is paid in full, token
+    after token; a prompt chunk sends its hot CPU-resident experts to the card and the worker
+    computes only the tail. Measured on Flash-Next at 2.05 bpw, 2x RTX 5060 Ti, 8 worker
+    threads (2026-10-11): with the placement learnt from generated tokens only, the share of a
+    generating job's selections served from VRAM goes from 0.84 to 0.95 and its speed from 60.6
+    to 69.7 tok/s, while a prompt's share falls from 0.95 to 0.62 and its ingestion goes from
+    7.64 to 7.87 s. Prompt tokens outnumber generated ones by orders of magnitude, so with
+    equal weights they decide the placement alone.
+    """
+    try:
+        return max(0.0, float(os.environ.get("EXL3_MOE_HIST_PREFILL_WEIGHT", "1")))
+    except ValueError:
+        return 1.0
+
+
 @torch.inference_mode()
 def run_pending_swap_sweeps(infer_params):
     """Run any pending dynamic-placement sweep (see BlockSparseMLP._split_swap_tick). Called
@@ -76,6 +98,12 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
+    # Every layer's prompt-ingestion counts go into its histogram now, with their weight, before
+    # any layer is swept: whoever reads the histograms around a sweep (the sweep itself, a
+    # server's telemetry wrapped around _split_sweep_layer) then sees one consistent set
+    w_pf = hist_prefill_weight()
+    for m in reg:
+        m._split_hist_fold(w_pf)
     budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 64))
     total = 0
     for m in reg:
@@ -100,6 +128,10 @@ def trellis_rate(tile_width: int):
 
 
 class BlockSparseMLP_CPU:
+
+    # Dynamic placement: selections of prefill-size batches since the last sweep, kept apart
+    # from _split_hist until the sweep folds them in with their weight (hist_prefill_weight)
+    _split_hist_pf = None
 
     def _cpu_init_state(self):
         self.cpu_offload = False
@@ -192,6 +224,7 @@ class BlockSparseMLP_CPU:
             dev = torch.device(self.device)
             self._split_map = torch.arange(self.num_experts, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
+            self._split_hist_pf = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
             self._split_selcpu_t = None
             self._swap_tick_count = 0
             ip2 = self.config.infer_params
@@ -216,6 +249,7 @@ class BlockSparseMLP_CPU:
                     reg.remove(self)
                 self._split_map = None
                 self._split_hist = None
+                self._split_hist_pf = None
         if self.cpu_offload:
             host = getattr(self, "cpu_host", None)
             if host is not None:
@@ -255,17 +289,21 @@ class BlockSparseMLP_CPU:
             sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
-        sel_cpu = self._split_translate(selected_experts)
+        sel_cpu = self._split_translate(selected_experts, prefill = True)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 
-    def _split_translate(self, selected_experts):
+    def _split_translate(self, selected_experts, prefill = False):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
         in-place physical-slot translate -- the bsz-1 routing statics are read by captured
         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
-        GPU-resident picks); the static split is a tail offset."""
+        GPU-resident picks); the static split is a tail offset. The hits of a prefill-size
+        batch are counted apart (_split_hist_fold)."""
         if self._split_map is None:
             return (selected_experts - self.cpu_split_first).clamp_min(-1)
+        hist = self._split_hist_pf if prefill else None
+        if hist is None:
+            hist = self._split_hist
         n = selected_experts.numel()
         buf = self._split_selcpu_t
         if buf is None or buf.numel() < n:
@@ -273,7 +311,7 @@ class BlockSparseMLP_CPU:
                 max(n, 64), dtype = torch.long, device = selected_experts.device)
         sel_cpu = buf[:n].view(selected_experts.shape)
         ext.moe_split_map(
-            selected_experts.view(-1), self._split_map, self._split_hist,
+            selected_experts.view(-1), self._split_map, hist,
             buf[:n], self.cpu_split_first)
         return sel_cpu
 
@@ -634,6 +672,22 @@ class BlockSparseMLP_CPU:
 
     def _split_sweep_layer_reset(self):
         self._swap_tick_count = 0
+
+    def _split_hist_fold(self, weight: float):
+        """Add the prefill-size batches' selections since the last sweep to the histogram the
+        sweep ranks the experts by, `weight` each (0: they do not count), and start over."""
+        pf = self._split_hist_pf
+        if pf is None or self._split_hist is None:
+            return
+        if weight > 0:
+            self._split_hist.add_(pf, alpha = weight)
+        pf.zero_()
+
+    def split_hits(self):
+        """Selections counted since the last sweep, whatever their weight in the placement:
+        (of generating jobs, of prompt ingestion), two (E,) tensors in router order."""
+        pf = self._split_hist_pf
+        return self._split_hist, (pf if pf is not None else torch.zeros_like(self._split_hist))
 
     def _split_sweep_layer(self, budget):
         """One placement sweep for this layer: repeatedly swap the hottest CPU-resident
