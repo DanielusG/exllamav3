@@ -80,6 +80,7 @@ class Generator:
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
+        recurrent_tail_checkpoint: int | bool = False,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
@@ -192,6 +193,20 @@ class Generator:
         :param recurrent_checkpoint_interval_pp]:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
             multiple of the page size. Default is 32768 tokens
+
+        :param recurrent_tail_checkpoint:
+            Keep one more checkpoint behind a job that is generating, moved on every this many tokens
+            (True: every page; a multiple of the page size). A job that ends then leaves a checkpoint
+            at the last page boundary of its answer, and the next turn of the conversation resumes
+            there instead of ingesting the answer again from the prompt's last page (no checkpoint
+            is taken at the end of a generation otherwise: the next one falls a whole
+            recurrent_checkpoint_interval after the prompt). The checkpoint replaces the one it
+            left a page before, so a job holds one more at most; a job that itself resumed from
+            such a checkpoint gives up its prompt's last-page one for it, since the client has
+            shown it sends answers back as they were. Each move is a stash of the state (a copy
+            to system RAM), and a draft is cut at the boundary: tail_stats has the count and the
+            time. EXL3_TAIL_CHECKPOINT=1 (or a number of tokens) in the environment turns it on
+            for callers that do not pass the argument. Default False
 
         :param kwargs:
         """
@@ -373,6 +388,19 @@ class Generator:
         recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
+
+        # The checkpoint that follows a generating job (Job.is_checkpoint_boundary): tokens between
+        # two of its positions, 0 = none. Read at every step, so it can be switched while jobs run
+        if not recurrent_tail_checkpoint:
+            env = os.environ.get("EXL3_TAIL_CHECKPOINT", "0").strip() or "0"
+            recurrent_tail_checkpoint = True if env == "1" else int(env)
+        if recurrent_tail_checkpoint is True:
+            recurrent_tail_checkpoint = PAGE_SIZE
+        assert recurrent_tail_checkpoint % PAGE_SIZE == 0, "tail checkpoint interval must be a multiple of the page size (256)"
+        self.tail_checkpoint_interval = int(recurrent_tail_checkpoint) if self.recurrent_cache is not None else 0
+        # stashes: tail checkpoints taken; replaced: checkpoints they took the place of; t_stash:
+        # seconds spent taking them (the copy of the state, and the wait for the step before it)
+        self.tail_stats = {"stashes": 0, "replaced": 0, "t_stash": 0.0}
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):

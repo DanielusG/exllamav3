@@ -95,6 +95,7 @@ class RecurrentCache(OrderedDict):
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
             "stash_evictions_live_kv": 0,   # of those, checkpoints whose anchor KV page was still cached
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
+            "stash_replaced": 0,            # checkpoints taken out by discard() (a job's tail checkpoint moving on)
         }
 
 
@@ -150,6 +151,24 @@ class RecurrentCache(OrderedDict):
 
             self[key] = state.stash()
             self.update_total_size()
+
+
+    def discard(self, key) -> bool:
+        """
+        Drop one checkpoint its owner has no more use for (Job.maybe_stash_recurrent: the checkpoint that
+        follows a generating job from page to page leaves the previous page's behind). Not an eviction:
+        nothing was short of room. Returns whether it was there.
+        """
+        popped = self.pop(key, None)
+        if popped is None:
+            return False
+        self.metrics["stash_replaced"] += 1
+        host_pool.give(popped)
+        note_freed(popped["checkpoint_size"])
+        if self.model.loaded_tp:
+            self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+        self.update_total_size()
+        return True
 
 
     def prune_stranded(self) -> int:

@@ -300,6 +300,12 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+        # Generator.tail_checkpoint_interval: the key of the checkpoint that follows this job while it
+        # generates, of the one its prompt's last page got, and whether the job resumed from a
+        # checkpoint an earlier job left behind in that way
+        self.tail_checkpoint_key = None
+        self.prompt_tail_key = None
+        self.resumed_from_tail = False
 
         # Loop detector
         self.loop_detector = None
@@ -661,6 +667,10 @@ class Job:
         rc = self.generator.recurrent_cache
         if rc is not None and old_hash in rc and new_hash not in rc:
             rc[new_hash] = rc.pop(old_hash)
+            if self.tail_checkpoint_key == old_hash:
+                self.tail_checkpoint_key = new_hash
+            if self.prompt_tail_key == old_hash:
+                self.prompt_tail_key = new_hash
 
         # If another referenced page has the same hash, switch to referencing that instead
         if new_hash in self.pagetable.referenced_pages:
@@ -1699,6 +1709,8 @@ class Job:
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+                    self.resumed_from_tail = isinstance(stashed_recurrent_state, dict) \
+                        and bool(stashed_recurrent_state.get("tail"))
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1760,9 +1772,23 @@ class Job:
         if override_interval:
             return seq_pos % override_interval == 0
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+            if (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0:
+                return True
+            return self.is_tail_boundary()
         else:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+
+
+    def is_tail_boundary(self):
+        """
+        Whether the checkpoint that follows a generating job moves on to the current position
+        (Generator.tail_checkpoint_interval). Never before the job's first token: the prompt has
+        its own checkpoints, the last of them where generation starts from.
+        """
+        tail = getattr(self.generator, "tail_checkpoint_interval", 0)
+        if not tail or self.new_tokens <= 0:
+            return False
+        return self.sequences[0].kv_position % tail == 0
 
 
     def mm_exact_spans(self, seq):
@@ -1800,7 +1826,38 @@ class Job:
 
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
-            cache.put(page.phash, self.recurrent_state)
+
+            # The checkpoint that follows a generating job: this one is such a checkpoint when no
+            # other rule asked for it. Whatever it is, the one left at an earlier page of this
+            # answer goes first, so the cache never holds more than one per job and never has to
+            # make room for it; a job that resumed from one gives up its prompt's last-page
+            # checkpoint the same way (it would be the second of this turn)
+            tail = interval is None and self.is_tail_boundary() and (
+                (seq.kv_position - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval != 0)
+            stats = getattr(self.generator, "tail_stats", None)
+            for key in (self.tail_checkpoint_key, self.prompt_tail_key if tail and self.resumed_from_tail else None):
+                if key is not None and key != page.phash and cache.discard(key):
+                    stats["replaced"] += 1
+            if tail and self.resumed_from_tail:
+                self.prompt_tail_key = None
+            self.tail_checkpoint_key = None
+
+            if tail:
+                t0 = time.perf_counter()
+                cache.put(page.phash, self.recurrent_state)
+                # (the entry in system RAM itself: a cache with tiers below answers get() for those too)
+                stashed = dict.get(cache, page.phash) if isinstance(cache, dict) else None
+                if isinstance(stashed, dict):
+                    stashed["tail"] = True
+                self.tail_checkpoint_key = page.phash
+                stats["stashes"] += 1
+                stats["t_stash"] += time.perf_counter() - t0
+            else:
+                cache.put(page.phash, self.recurrent_state)
+                # the prompt's last page (the pass prefill makes for it): the one a tail checkpoint
+                # may take the place of
+                if interval is not None and self.new_tokens <= 0:
+                    self.prompt_tail_key = page.phash
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position

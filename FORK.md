@@ -338,6 +338,51 @@ give 32-33 tok/s and 11.4-12.0 s (30.6 and 11.7 with equal weights).
 Tests: `tests/test_placement_weight.py` (the mixin on its own: where the selections are
 counted, what the sweep ranks by at weights 1, 0 and in between, the fold before any layer).
 
+### A checkpoint that follows the answer (`Generator(recurrent_tail_checkpoint = True)`, `EXL3_TAIL_CHECKPOINT=1`)
+
+Off by default. For models with recurrent states (Qwen3.8-Flash-Next: 36 of 48 layers).
+
+**What upstream does.** A cached prompt is resumable only from a page that has a stashed
+recurrent state. Prompt ingestion stashes one at the prompt's last page boundary (a pass of
+its own for it); generation stashes one every `recurrent_checkpoint_interval` tokens counted from
+the end of the cached prefix, and one when a job is requeued. **Nothing is stashed when a job
+ends.** The next turn of the conversation, whose prompt is the old prompt plus the answer plus
+the new message, therefore resumes at the old prompt's last page and reads the whole answer
+again, although its K/V pages are in the cache (three days of production: one prefill token in
+nine, 2460 turns of 636 tokens on average).
+
+**What the switch does.** While a job generates, one more checkpoint is kept, at the last page
+boundary it has crossed (`Job.is_tail_boundary`, read by `is_checkpoint_boundary`, so a draft is
+cut there as at any other checkpoint). When it moves on a page, the checkpoint of the page
+before is taken out first (`RecurrentCache.discard`, counted in `stash_replaced`): the cache
+holds one of them per job and never has to make room for it, which matters to a cache with a
+disk tier below, where an eviction is a file written. A regular checkpoint that falls on the
+same page takes the place of the tail one and stays, as upstream's. The job that ends leaves
+its tail checkpoint behind, flagged (`"tail": True` in the stashed dict).
+
+A job whose state was resumed from a flagged checkpoint (`Job.resumed_from_tail`) has a client
+that sends answers back as they were, so it also gives up the checkpoint of its own prompt's
+last page when its first tail checkpoint comes: a turn then leaves one checkpoint, the answer's
+instead of the prompt's, and the count per turn is upstream's. A job that did not resume from
+one keeps both (the first turn of a conversation, or a client that rewrites the answer, e.g. by
+dropping the reasoning: for that client the tail checkpoint is never used, and costs its
+stashes and one more checkpoint per turn for nothing).
+
+`gen.tail_checkpoint_interval` is the distance in tokens (a page; a multiple of it to stash
+less often, 0 = off) and is read at every step; `gen.tail_stats` counts the stashes, the
+checkpoints they replaced and the seconds spent in them.
+
+**Measured** (2026-10-11, on the production model in the exact form of the check, with a bench
+that is not in the tree yet: a prompt of 8.1k tokens and a forced answer of 1100, two rounds
+each way): generation 56.0 ->
+55.7 tok/s (-0.7%), four stashes of 25 ms, the probabilities of the forced tokens identical;
+the next turn resumes 768 tokens later (264 to read instead of 1032) and has its first token in
+0.88 s instead of 1.62. Not seen yet: real traffic, several jobs at once, the staggered decode
+together with it (the checkpoint is offered between two passes, as the regular ones).
+
+Tests: `tests/test_tail_checkpoint.py` (the job's real rules and the real cache over a stub
+job).
+
 ### Building the extension on the machine
 
 Needed only for a change to `exllamav3_ext` (none on this branch). Found the hard way on
