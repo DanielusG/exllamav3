@@ -859,8 +859,117 @@ folded by a sweep held back; at weight 1 the same histograms, maps and swaps, bi
 with every selection counted as a decode-size one; promote-on-miss; the saved profile; load and
 unload). Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
-### Still to come
+### Page-cache hygiene in the disk tier (`EXL3_DISK_CACHE_UNCACHE=1`)
 
-Ported from the v1.5.4 branches in the step after this one, into a section of its own:
+Off by default; with it off the tier makes upstream's system calls and not one more. For 1.6.2's
+persistent disk tier (`generator/disk_cache.py`, `Generator(disk_cache_dir = ...)`). The
+variable goes in the environment of the process (the server's wrapper); the server reads nothing
+of it. Also in `doc/env_vars.md`.
 
-- page-cache hygiene in the disk tier (`generator/disk_cache.py`).
+**Why.** The tier writes one file per K/V page (about 4.45 MB on Flash-Next, `pages/<hh>/<phash>.kv`)
+and one per recurrent checkpoint (about 57 MiB with fp16 states, `states/<phash>.rs`), about
+180 GiB a day in production by estimate: buffered writes from the CPU tier's slabs (pinned) and
+from stash buffers on the writer thread, reads by four reader threads with `readinto` into a CPU
+tier slot. Every byte written or read is in a RAM slot already, so the kernel's page-cache copy
+of the file is a second one. On production's 32 GB host, already short of memory, the page cache
+also holds the hot rows of the 24.4 GB n-gram table, read per token with `pread`
+(`modules/row_table.py`): the tier's copies push those rows out (to be read from the drive again
+at the next token that needs them) and, behind them, anonymous memory to swap.
+
+**What the switch does.** `DiskPageCache._uncache_file`, at four points, each only for what this
+process writes or reads on its own:
+
+- `_do_write_page`, non-TP page (`markers is None`): after the image is written, the file being
+  complete (magic, header and tokens by `_create_page_file`, the image here), and before
+  `_publish_page` renames it into place: `fdatasync`, then `posix_fadvise(fd, 0, 0, DONTNEED)`.
+  `fdatasync` works on the inode, so it also covers the header and tokens written through the
+  other descriptor; the advice covers the whole file, header page included.
+- `_do_write_state`, a checkpoint with no tensor-parallel side (`layout["markers"] is None`):
+  the same, after the last tensor and before `_publish_state`'s rename.
+- `read_page_into`, no tensor-parallel group: the advice after `readinto` and its length check.
+  The checksum that follows is computed over the slot, not the file, so it is unaffected and
+  still drops a damaged page (test). The header reads of `_read_tokens` are of the same file and
+  go with it.
+- `read_state`, no tensor-parallel side: the advice after the last tensor is in its pooled buffer.
+
+Why the sync: the advice does not drop dirty pages, and right after a buffered write they all
+are (the earlier study's probe: 244 MB of 285 left; here, without the sync, every page of every
+file stays: the residency test fails that way). Not used: `POSIX_FADV_RANDOM` / `NOREUSE` (no
+effect for this pattern), `O_DIRECT` (header offsets unaligned, the checkpoint layout, and btrfs
+falls back to buffered I/O for checksummed files).
+
+**The power-loss window.** Upstream's comment in `_do_write_page`: the file gets its full size
+before the image is written, so a power loss between the rename and the data's writeback can
+leave a published page file of the right size with zeros in it, which the checksum finds on
+read. With the sync before the rename the data is on the drive before the name; that closes the
+window for pages, and for checkpoints, which have no checksum. The rename itself is not synced
+(no `fsync` of the directory): after a power loss a file can be missing, which the reconcile of
+the index at open already handles.
+
+**Errors and platforms.** An `OSError` of the sync or of the advice is counted
+(`uncache_stats["errors"]`), logged once, and the file is published as without the switch;
+upstream does not sync, so it would not have seen the error either. Making a failed sync a write
+failure (temporary file removed, page not published, `_write_failed`'s pause or disable) would be
+the stricter choice; not taken, to keep the switch to page-cache hygiene. A write error of the
+flush of Python's buffer before the sync is raised, as the close would raise it without the
+switch. Without `os.posix_fadvise` (Windows, macOS) nothing is done (a warning when the tier is
+made); without `os.fdatasync`, `os.fsync` takes its place.
+
+- The switch is read when the tier is made; `DiskPageCache.uncache` can be changed at run time.
+  `DiskPageCache.uncache_stats`: files synced and dropped after a write (`writes`), dropped after
+  a read (`reads`), seconds in the sync on the writer thread (`sync_s`), `errors`.
+- Not covered: tensor-parallel transfers. The ranks write and read their chunks of the file
+  through `np.memmap` (`model_tp_fn.DiskRankWorker`); a write is already `msync`ed there
+  (`mm.flush()`), so the advice after the mapping is gone is all the rank side would need, and
+  the main process's header page of such a file with it. Left as it is: production runs a layer
+  split. Not covered either: the header reads at open of files the index lacks (one page or a
+  readahead window each, once).
+- Where the generator waits for the writer, it waits longer: `CPUPageCache._evict_one` calls
+  `flush()` when every entry of the CPU tier is busy (a write queued for each), and
+  `flush_cache_to_disk(wait = True)` and `close()` wait for the queue. The writer goes through a
+  page file in 4.7 ms instead of 2.5 (below), so about 950 MB/s instead of 1.8 GB/s into the page
+  cache; prompt ingestion produces pages at 3-6 a second, the idle flush in bursts within its
+  budget.
+- With the tail checkpoint: a checkpoint write under way lasts about 13 ms more, the window in
+  which a discard finds it under way (`disk_left`). In the steady state a tail checkpoint is
+  withdrawn as a candidate before its page lands, and nothing of it is written.
+
+**Cost, recurring.** At the estimated 180 GiB a day: 40-100 s a day of writer-thread time
+(43k page files at 2.2 ms if it were all pages, 3.2k checkpoints at 13 ms if it were all
+checkpoints), none on the generator's thread unless it waits for the writer as above; the
+advice after a read about 0.4 ms per page read. Nothing more is written: the bytes reach the
+drive anyway, sooner. What it frees at any moment depends on the kernel's reclaim and was not
+measured on production's traffic.
+
+**Measured locally** (2026-10-17, on the development machine, not the production workstation:
+btrfs zstd:1 on NVMe, kernel 7.1.13; `DiskPageCache` and `CPUPageCache` of this branch on CPU, the K/V pool a host
+tensor, as in the tail checkpoint's run; 64 page files of 4452352 random bytes and two
+checkpoints of 57 MiB per variant, 405 MB; written through `CPUPageCache.store`, read back
+through `CPUPageCache.promote` and `read_state` in a fresh tier on the same directory, after
+dropping the files' pages, i.e. from the drive in both cases):
+
+| | switch off | switch on |
+|---|---|---|
+| page file write, mean / p50 / max | 2.48 / 1.93 / 9.5 ms | 4.67 / 4.36 / 27.6 ms |
+| checkpoint write | 16.5 ms | 29.5 ms |
+| left in the page cache after the writes | 285 MB pages + 120 MB checkpoints | 0 |
+| the same 35 s later (past the dirty expiry) | 285 + 120 MB | 0 |
+| page read, per file | 3.36 ms (1201 MB/s) | 3.75 ms (1148 MB/s) |
+| left in the page cache after the reads | 285 + 120 MB | 0 |
+
+The pages and checkpoints came back bit-exact in both. `sync_s` 0.144 s for the 66 files. The
+earlier read-only study measured the same write pattern outside the tier (no checksum) at 1.45
+and 3.69 ms per page file.
+
+Tests (no GPU, no extension): `tests/test_disk_uncache.py`. Upstream's `DiskPageCache`, writer
+thread, reader pool and index, over a stand-in for the CPU tier with random slots: off by default
+and then no call of the four (only the two renames); with the switch on, for a page and for a
+checkpoint, a sync of the complete file through the descriptor that wrote it, then the advice on
+the whole file, then the rename, in that order and nothing else; a read dropped without a sync,
+bit-exact, the checksum still in force; errors of either call swallowed and logged once;
+without `posix_fadvise` nothing, without `fdatasync` `fsync`; a tensor-parallel group's page and
+a checkpoint's tensor-parallel side left alone. The residency test (`mincore` on the files) runs
+where the advice drops pages: on tmpfs it skips, so set `EXL3_TEST_DISK_DIR` to an existing
+directory on a real disk (a subdirectory is made there and removed). Upstream's own
+`tests/cache/test_disk_cache.py` needs CUDA (`CPUPageCache` asserts CUDA cache tensors).
+Marked `nogpu`; run with `--noconftest` without the compiled extension.
