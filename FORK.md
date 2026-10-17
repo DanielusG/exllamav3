@@ -385,8 +385,8 @@ MTP 1):
   in 18 ms, is ahead of it. A prompt alone keeps the worker busy about half the time (tail jobs
   of 64 rows, 3-9 ms each, 55 a second). Together they want more of it than there is: the step
   goes to 54 ms and the ingestion from 7.6 to 11.7 s. Fewer layers of a decode step in the
-  worker is what changes that (the placement weighted on the decode, a later step of this
-  branch).
+  worker is what changes that (the placement weighted on the decode: *Expert placement that
+  follows the decode*, below).
 - What was tried against that, none of it worth more than 10% and all of it the same 10%
   (30.6 tok/s and 11.7 s with nothing): a ring and a thread of their own for the decode's jobs
   in the worker (branch `flash-next-native`: 33.5 and 10.7 with 8 threads each), 12 worker
@@ -747,9 +747,120 @@ idle flush and the flag through a new process; upstream's `rekey`; the generator
 offer beside a group in flight and a chunk under way; the switch). Marked `nogpu`; run with
 `--noconftest` without the compiled extension.
 
+### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
+
+Off by default: at the default weight, 1, nothing of it runs and the placement is upstream's,
+histogram for histogram. For a model with CPU split experts placed by the dynamic sweep. In the
+server: `--moe-swap-prefill-weight` (rule 20 of its `AGENTS.md`), which sets the variable in
+`apply_env` and shows `hist_prefill_weight()` as `/status.moe.prefill_weight`.
+
+The library's dynamic placement ranks the experts of a split layer by how often they were
+selected, every selection counting one. Prompt tokens outnumber generated ones by orders of
+magnitude, so prompts decide the placement alone. But a selection that misses VRAM does not cost
+the same in the two: a decode step waits for the worker in every layer that has one (third
+session of the prefill thread, above), while a prompt chunk sends its hot CPU-resident experts to
+the card and leaves the worker a tail.
+
+Measured **on the v1.5.4 base** (2026-10-11, night, server stopped; Flash-Next 2.05 bpw,
+production's flags with 8 worker threads, MTP 1; placement adapted to the bench's own traffic in
+each case):
+
+| placement learnt from | share served from VRAM, generating job | its speed alone | share, prompt | its ingestion alone |
+|---|---|---|---|---|
+| job + prompt, equal weights (upstream) | 0.843 | 60.6 tok/s | 0.953 | 7.64 s |
+| the generating job only | 0.945 | 69.7 tok/s | 0.621 | 7.87 s |
+| job + prompt, prompt weight 0 | 0.929 | 66.7-68.3 tok/s | 0.627 | 7.77 s |
+| job + prompt, prompt weight 0.004 | 0.928 | 67.6-67.8 tok/s | 0.836 | 7.60 s |
+
+With 12 worker threads and weight 0: 67.8-69.9 tok/s and 7.50 s. In the overlap the two weights
+give 32-33 tok/s and 11.4-12.0 s (30.6 and 11.7 with equal weights).
+
+- `exllamav3/modules/block_sparse_mlp_cpu.py`: while the weight is not 1, the selections of a
+  prefill-size batch (at least the CPU expert host's `stream_min_rows` rows,
+  `EXL3_MOE_STREAM_MIN_ROWS`, 32) are counted in `_split_hist_pf` instead of `_split_hist`
+  (`_split_hist_apart`, which makes it on first use), and `run_pending_swap_sweeps` folds them
+  into `_split_hist` with the weight, for every layer, before it sweeps any
+  (`_split_hist_fold`): a reader wrapped around `_split_sweep_layer`, like the server's expert
+  tier, sees the histogram the sweep uses, and so does one that reads the layers the swap budget
+  does not reach after the sweep. `split_hits()` gives both histograms.
+- `EXL3_MOE_HIST_PREFILL_WEIGHT` is read at every sweep, for the fold, and at every prefill-size
+  batch of a split layer, for whether to count it apart: the weight in force decides, whenever
+  it was set. 1 (the default, and what a value that is not a number reads as): nothing is
+  counted apart, no second histogram is made, a sweep neither reads the variable nor folds. 0:
+  the placement follows generated tokens only. A small weight (0.004 is one prompt selection in
+  250, about the ratio of the two costs on that bench) lets prompts fill the slots the decode
+  leaves undecided.
+- What the server shows as hit rate is computed from `_split_hist` around a sweep: with a weight
+  below 1 it is the weighted share, close to the generating jobs' own.
+
+What it costs when it runs: nothing written anywhere; one more histogram per split layer (E
+floats on its card); two small kernels per layer at each sweep; one read of the environment per
+split layer and prefill-size batch.
+
+**What changed with 1.6.2.** The fork's weight was written against 1.5.4; on this base:
+
+- *Where the selections are counted.* A decode-size batch's in the fused issue
+  (`exl3_moe_split_issue_fused`, which doubles as `moe_split_map` with the histogram in place),
+  or in the copy path's map kernel when the fused issue declines a shape or is switched off
+  (`EXL3_MOE_SPLIT_FUSED=0`); a prefill-size batch's in the copy path's map kernel, before
+  `submit_prefill` (streamed or not). Which is which is the module's own fork between the two
+  paths, `bsz < cpu_host.stream_min_rows`, the threshold promote-on-miss uses for a decode-size
+  step and `_side_plan` keeps the prefill thread's floor above; it is the v1.5.4 branch's rule
+  too. The weight is about what a miss costs, and that is the path's. The decode-size paths are
+  untouched: they count into `_split_hist` in their kernels, and the choice is made on the
+  prefill path only, in Python.
+- *Lanes.* The rows decide, not the thread. A chunk beside the decode, on the prefill thread or
+  on either lane of the pipeline, has more than `stream_min_rows` rows (`side_min_tokens` is one
+  past it) and is counted apart, translated into the lane's own buffer as before. A chunk below
+  `stream_min_rows` (a short prompt, or a prompt's last pages as a pass of their own), which the
+  generator waits for anyway, takes the fused decode issue and costs the worker what a decode
+  step costs: it counts one per selection, on any thread, as on the v1.5.4 branch. A
+  prefill-size batch from the generator's own thread (a chunk run inline, a verification pass
+  that wide) is counted apart. A layer's prefill-size batches come from one thread at a time
+  (the generator's, the prefill thread's, or the lane of the layer's card), so the second
+  histogram, made on first use, needs no lock; a decode and a chunk beside it count into two
+  tensors, in the order of the stream they share.
+- *The sweep.* `run_pending_swap_sweeps` is reached from the queue's drain (no chunk under way:
+  `_side_drop` and `_pipe_drop` come first) and from `_split_swap_tick`'s inline fallback for an
+  overdue sweep, which the prefill thread's guard refuses on a lane and while a lane has a pass
+  under way (and the server defers to the drain). The fold is inside it, after the all-device
+  synchronize: a sweep held back folds nothing, and the counts wait for the sweep that runs.
+- *Promote-on-miss* (`EXL3_MOE_CPU_PROMOTE`, spare GPU slots with the pinned arena; off in
+  production) replaces the sweep: at every step it decays and snapshots `_split_hist` and reads
+  the step's routes from the difference. The weight is the sweep's only: when the first
+  registered split module has spare slots (the mode `_split_swap_tick` follows) nothing is
+  counted apart and every selection counts one, as upstream; `hist_prefill_weight()` still
+  returns what the variable says.
+- *The saved expert profile* (`save_expert_stats`, `_expert_stats_load`; the server keeps it off
+  and points `EXPERT_STATS_DIR` elsewhere) saves what the sweep ranks by: `_split_hist` with the
+  counts kept apart since the last sweep added at the current weight, without folding them in.
+  The profile seeds the next load's placement; seeded from the raw counts it would start from
+  the prompts' placement and the first sweeps would swap it back, a checkpoint read per swap. At
+  weight 1, and under promote-on-miss, it is upstream's.
+- *Load and unload.* `cpu_post_load` starts a layer with nothing counted apart; `cpu_unload`
+  drops it with the rest of the placement state.
+
+Differences from the v1.5.4 branch: that branch counted prompt chunks apart at any weight and
+folded them in at weight 1, so the sweep ranked the same but `_split_hist` between two sweeps
+held the decode's selections only (on this base the saved profile reads it there); here nothing
+is apart at 1. Whether to count apart is decided at every batch, not once. Promote-on-miss and
+the saved profile are 1.6.x's.
+
+Not seen on real traffic, on either base: the bench has one generating job on one prompt, and
+how far a placement learnt from many conversations' output gets is for production's telemetry to
+say. Not yet run on this base: the bench's shares and speeds at weights 1, 0 and 0.004 are the
+check to repeat.
+
+Tests (no GPU, no extension): `tests/test_placement_weight.py` (the mixin on its own, with a host
+that records what it is handed and counts in its fused issue as the kernel does: where the
+selections are counted on each path and thread, at the host's threshold; what the sweep ranks by
+at weights 1, 0 and in between; every layer folded once and before any is swept, and nothing
+folded by a sweep held back; at weight 1 the same histograms, maps and swaps, bit for bit, as
+with every selection counted as a decode-size one; promote-on-miss; the saved profile; load and
+unload). Marked `nogpu`; run with `--noconftest` without the compiled extension.
+
 ### Still to come
 
-Ported from the v1.5.4 branches in the steps after this one, each into a section of its own:
+Ported from the v1.5.4 branches in the step after this one, into a section of its own:
 
-- expert placement weighted on the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`);
 - page-cache hygiene in the disk tier (`generator/disk_cache.py`).
