@@ -903,6 +903,29 @@ weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing 
 a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
 component.
 
+## Disk cache tier
+
+### `EXL3_DISK_CACHE_UNCACHE` (default: `0`)
+
+Page-cache hygiene for the persistent disk tier (`Generator(disk_cache_dir = ...)`). Every page
+image and checkpoint the tier writes comes from a CPU-tier slot or a stash buffer, and every one
+it reads goes into one, so the kernel's page-cache copy of the file holds bytes that are already
+in system memory; under memory pressure it pushes out other files' pages and, behind them,
+anonymous memory to swap. With `1`, a file the tier writes is synced (`fdatasync`) and dropped
+from the page cache (`posix_fadvise(POSIX_FADV_DONTNEED)`) once it is complete and before the
+rename that publishes it, and a file the tier reads is dropped after the read. The advice alone
+would not do: the kernel keeps dirty pages.
+
+Cost: the sync, on the tier's writer thread (about 2.2 ms more per 4.45 MB page file and 13 ms
+per 57 MiB checkpoint on an NVMe drive with btrfs); the generator waits for it only where it
+already waits for the writer (a CPU tier whose every slot has a write queued, a flush). A page
+the generator needs again comes from the drive instead of the page cache. The sync also closes
+the window in which a power loss could leave a published file without its data. An error of
+the sync or of the advice is counted (`DiskPageCache.uncache_stats`) and logged once; the
+file is kept as without the switch. Read when the tier is created. POSIX only: without
+`os.posix_fadvise` (Windows, macOS) the switch does nothing. Tensor-parallel transfers, which
+the ranks write and read themselves, are left as they are.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
