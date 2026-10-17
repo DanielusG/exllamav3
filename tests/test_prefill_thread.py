@@ -79,11 +79,13 @@ class Slots:
     def begin_pass(self):
         self.passes += 1
 
-    def split_lanes(self, decode_slots = 2):
-        d = min(decode_slots, self.n - 1)
+    def split_lanes(self, decode_slots = 2, lanes = 2):
+        # (the real one's arithmetic: tests/test_moe_host_lanes.py)
+        d = min(decode_slots, self.n - (lanes - 1))
         if d < 1:
             return None
-        self.split = (d, self.n - d)
+        rest = self.n - d
+        self.split = (d,) + tuple(rest // (lanes - 1) + (i < rest % (lanes - 1)) for i in range(lanes - 1))
         return self.split
 
 
@@ -120,11 +122,12 @@ def long_prompt(seed, n):
 
 
 def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4, min_jobs = 2,
-          min_tokens = 16, max_rows = 8, setup = None):
+          min_tokens = 16, max_rows = 8, setup = None, pipeline = False):
     """
-    Run jobs to the end. plan: {name: dict(prompt, max_new, at, chunk, steps)}: the job is
-    enqueued before iteration `at`, ingests `chunk` tokens per chunk and each chunk lasts
-    `steps` decode steps when it runs beside a decode. setup(generator) runs before the first
+    Run jobs to the end. plan: {name: dict(prompt, max_new, at, chunk, steps, ckpt, halves)}: the
+    job is enqueued before iteration `at`, ingests `chunk` tokens per chunk and each chunk (each
+    half of it, in the pipeline) lasts `steps` decode steps when it runs beside a decode; a
+    checkpoint is due at every multiple of `ckpt`. setup(generator) runs before the first
     iteration. Returns (tokens per job, generator, jobs, the stage and job of every result in
     order).
     """
@@ -132,6 +135,7 @@ def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4,
     g.model.host = Slots(slots)
     g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
     g.prefill_thread = thread
+    g.prefill_pipeline = pipeline
     g.side_min_tokens = min_tokens
     g.side_max_rows = max_rows
     if setup is not None:
@@ -147,6 +151,8 @@ def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4,
                 spec = pending.pop(name)
                 job = ToyJob(g.model, name, spec["prompt"], spec.get("max_new", 40), chunk = spec.get("chunk", 0))
                 job.hurry = threading.Event()
+                job.ckpt_every = spec.get("ckpt", 0)
+                job.halves = spec.get("halves", True)
                 if spec.get("steps"):
                     job.on_chunk = lasting(spec["steps"])
                 jobs[name] = job
@@ -160,9 +166,10 @@ def drive(thread, plan, script = None, draft = True, stagger = False, slots = 4,
             n += 1
             assert n < 20000, "the generator does not finish"
     finally:
-        if g._side_pool is not None:
-            g._side_pool.shutdown(wait = True)
-    assert g._side is None
+        for pool in (g._side_pool, g._pipe_pool):
+            if pool is not None:
+                pool.shutdown(wait = True)
+    assert g._side is None and not g._pipe
     for name, job in jobs.items():
         if not job.cancelled:
             assert seen.get(name, []) == job.out, f"{name}: results differ from what the job sampled"
@@ -879,12 +886,18 @@ def test_a_prompt_chunk_stages_nothing_for_a_rewind():
     # views only on a pass with history. To run before taking a newer upstream
     job = ast.parse(_source("exllamav3", "generator", "job.py"))
     co = next(n for n in ast.walk(job) if isinstance(n, ast.FunctionDef) and n.name == "_prefill_co")
-    run = next(n for n in ast.walk(co) if isinstance(n, ast.FunctionDef) and n.name == "run")
-    keys = {k.value for n in ast.walk(run) if isinstance(n, ast.Dict) for k in n.keys if isinstance(k, ast.Constant)}
+    # (the passes and their params: run(), and with the MTP head the same passes in pieces,
+    # Generator.prefill_pipeline, all of them over chunk_params())
+    passes = [n for n in ast.walk(co) if isinstance(n, ast.FunctionDef)
+              and n.name in ("run", "chunk_params", "first", "rest", "after", "draft_update")]
+    assert {"run", "chunk_params"} <= {n.name for n in passes}
+    keys = {k.value for fn in passes for n in ast.walk(fn) if isinstance(n, ast.Dict) for k in n.keys
+            if isinstance(k, ast.Constant)}
     assert "cache_seqlens" in keys and "recurrent_states" in keys
     assert not {"recurrent_history", "recurrent_spec_step"} & keys
     assert not any(isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
-                   and n.slice.value in ("recurrent_history", "recurrent_spec_step") for n in ast.walk(run))
+                   and n.slice.value in ("recurrent_history", "recurrent_spec_step")
+                   for fn in passes for n in ast.walk(fn))
 
     for name in ("gated_delta_net.py", "mamba2.py"):
         src = _source("exllamav3", "modules", name)

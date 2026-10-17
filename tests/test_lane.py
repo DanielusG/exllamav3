@@ -126,7 +126,15 @@ def test_a_chunk_says_how_long_it_is():
     # runs it carries the chunk's length (Job needs the extension to be imported, so this
     # reads the source: the attribute is set on the yielded function, before the yield)
     src = open(os.path.join(REPO, "exllamav3", "generator", "job.py")).read()
-    body = src.split("def _prefill_co(self, results: list):", 1)[1].split("\n    def ", 1)[0]
+    body = src.split("def _prefill_co(self, results: list, at: int | None = None):", 1)[1].split("\n    def ", 1)[0]
     assert body.count("sent = yield run") == 1
     before = body.split("sent = yield run", 1)[0]
-    assert "run.tokens = prefill_ids.shape[-1]" in before.split("def run():", 1)[1]
+    after_run = before.split("def run():", 1)[1]
+    assert "run.tokens = prefill_ids.shape[-1]" in after_run
+    # and, for chunks in flight on two cards (Generator._pipe_round): where the chunk ends,
+    # whether its record takes a checkpoint, its passes in pieces, and the mark of a chunk
+    # planned ahead of its record
+    for line in ("run.end = prefill_end", "run.checkpoint = recurrent_last_page",
+                 "run.halves = (first, rest, after) if self.generator.mtp_draft else None",
+                 "run.followed = False"):
+        assert line in after_run

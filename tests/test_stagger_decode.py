@@ -176,6 +176,9 @@ class ToyState:
     inputs in the layer's state (ToyLayerState) and a rewind of rejected positions replays the
     accepted prefix from base over them, reading them when it runs."""
 
+    # As GDNState: no layer reads `position` during a pass
+    pass_reads_position = False
+
     def __init__(self, model, slot, layers):
         self.model = model
         self.slot = slot
@@ -186,6 +189,9 @@ class ToyState:
         self.spec_shape = None
         self.acc = {l: 0 for l in layers}
         self.base = dict(self.acc)
+        # Prompt position each layer's value stands at (a chunk in two halves moves the first
+        # card's layers before the second card's)
+        self.at = {l: 0 for l in layers}
         self.freed = False
 
     def post_advance(self):
@@ -333,6 +339,11 @@ class ToyModel:
         self.stage_prefill = False
         self.rewind_hook = None
         self.layer_hook = None
+        # The job whose prompt chunk is on each card (ToyJob._prefill_co), and the card the
+        # MTP head is on
+        self.cards = [None, None]
+        self.card_lock = threading.Lock()
+        self.head_card = 1
 
     def prepare_inputs(self, input_ids, params):
         return input_ids
@@ -434,8 +445,10 @@ class ToyJob:
         # What a test hooks into a chunk's forward passes (the job, start and end position)
         self.on_chunk = None
         self.chunk_threads = []
-        self.chunk_planned = False      # a chunk's passes are handed out and not recorded yet
-        self.chunk_running = False
+        self.chunk_planned = 0          # chunks whose passes are handed out and not recorded yet
+        self.chunk_running = 0
+        self.planned_end = None         # where the last of them ends
+        self.ckpt_every = 0             # a checkpoint is due at every multiple of this (0: never)
         self.checkpoints = []
         # A job's own pages, the same in every run
         self.first_page = 1000 * ord(name)
@@ -458,6 +471,8 @@ class ToyJob:
         self.cancelled = False
         self.droppable = False      # clear_queue() may release a job in the middle of its pass
         self.fail_first = None      # raised on the job's first sampled token (as NonFiniteLogits)
+        self.halves = True          # a chunk's passes can be issued in two halves (the MTP head)
+        self.head_threads = []
         self.requeues = 0
         self.released = 0
         self._reset(self.prompt)
@@ -467,6 +482,7 @@ class ToyJob:
         self.new_tokens = 0
         self.mtp_last_hidden = None
         self.prefill_left = self.prefill_iters
+        self.head_at = 0            # prompt position the MTP head's own update stands at
 
     # Queueing
     def prepare_for_queue(self, generator, serial_number, rq = False):
@@ -500,13 +516,19 @@ class ToyJob:
             return 0
         return max(len(seq.sequence_ids) for seq in self.sequences)
 
-    def is_checkpoint_boundary(self, override_interval = None):
-        return False
+    def is_checkpoint_boundary(self, override_interval = None, at = None):
+        pos = self.sequences[0].kv_position if at is None else at
+        return bool(self.ckpt_every) and pos % self.ckpt_every == 0
 
     def maybe_stash_recurrent(self, cache, interval = None):
         assert not self.mid_pass, f"{self.name}: checkpoint offered during its pass"
         assert not self.chunk_planned, f"{self.name}: checkpoint offered during a chunk of its prompt"
-        self.checkpoints.append(self.sequences[0].kv_position)
+        pos = self.sequences[0].kv_position
+        if not self.new_tokens and self.chunk:
+            # A state is stashed whole: every layer at the position the checkpoint is for
+            at = self.recurrent_state.target.at
+            assert all(v == pos for v in at.values()), f"{self.name}: checkpoint at {pos} on a state at {at}"
+        self.checkpoints.append(pos)
 
     def prefill(self, results):
         # As Job.prefill: the coroutine, with each chunk's passes run here
@@ -519,9 +541,15 @@ class ToyJob:
         except StopIteration:
             pass
 
-    def _prefill_co(self, results):
+    def _prefill_co(self, results, at = None):
         assert not self.mid_pass, f"{self.name}: prefill called during its pass"
-        assert not self.chunk_planned, f"{self.name}: a chunk planned before the last one was recorded"
+        if at is None:
+            assert not self.chunk_planned, f"{self.name}: a chunk planned before the last one was recorded"
+        else:
+            # Planned ahead (Generator._pipe_ahead): from where the chunk under way ends, and
+            # never past a position where a checkpoint is due
+            assert self.chunk_planned and at == self.planned_end, f"{self.name}: planned ahead from {at}"
+            assert not self.is_checkpoint_boundary(at = at), f"{self.name}: planned past a checkpoint at {at}"
         if self.is_prefill_done():
             return
         if self.prefill_left > 0:
@@ -530,55 +558,116 @@ class ToyJob:
                 return
         seq = self.sequences[0]
         n = len(seq.sequence_ids) - 1
-        a = seq.kv_position
+        a = seq.kv_position if at is None else at
         b = min(n, a + self.chunk) if self.chunk else n
+        if b <= a:
+            return
         state = self.recurrent_state.target
         tokens = seq.sequence_ids.ids[a:b]
+        cards = self.model.cards
 
-        def run():
-            # The forward passes: the layers' carried values and nothing else
-            self.chunk_running = True
-            self.chunk_threads.append(threading.current_thread().name)
+        def passes(layers, card, x = None, head = False):
+            # The forward passes: the layers' carried values and nothing else. A card has one
+            # chunk at a time (the MTP head's update is a pass on its card too, a short one),
+            # and a layer takes the chunks in order. Returns the hidden state after the layers
+            if not head:
+                self.chunk_threads.append(threading.current_thread().name)
+            with self.model.card_lock:
+                for c in card:
+                    assert not cards[c], f"{self.name}: two chunks on card {c} at once ({cards[c]} there)"
+                for c in card:
+                    cards[c] = self.name
+            self.chunk_running += 1
             try:
                 assert not state.freed, f"{self.name}: a chunk ran on a released state"
-                assert state.position == a, f"{self.name}: state out of step with its chunk"
-                if self.on_chunk is not None:
+                if self.on_chunk is not None and not head:
                     self.on_chunk(self, a, b)
-                if self.model.chunks_through_layers:
+                if self.model.chunks_through_layers and layers:
                     params = {
                         "input_ids": torch.tensor([tokens], dtype = torch.long),
                         "cache_seqlens": torch.tensor([a], dtype = torch.int32),
                         "block_table": seq.block_index_tensor,
                         "recurrent_states": [state],
                     }
-                    x = params["input_ids"].clone()
+                    if x is None:
+                        x = params["input_ids"].clone()
                     for module in self.model.modules:
-                        if isinstance(module, ToyLayer):
+                        if isinstance(module, ToyLayer) and module.idx in layers:
+                            assert state.at[module.idx] == a, \
+                                f"{self.name}: layer {module.idx} at {state.at[module.idx]} for a chunk from {a}"
                             if self.model.layer_hook is not None:
                                 self.model.layer_hook(self, module.idx, "before")
                             x = module.forward(x, params)
+                            state.at[module.idx] = b
                             if self.model.layer_hook is not None:
                                 self.model.layer_hook(self, module.idx, "after")
                 else:
-                    for layer in self.model.layers:
+                    for layer in layers:
+                        assert state.at[layer] == a, f"{self.name}: layer {layer} at {state.at[layer]} for a chunk from {a}"
                         layer_step(state, layer, tokens, a, self.first_page)
-                # What the pass writes into the chunk's pages (Job's writes their K/V)
-                for i, t in enumerate(tokens):
-                    page = seq.allocated_pages[(a + i) // PAGE]
-                    page.sequence[0, (a + i) % PAGE] = t
-                state.position = b
+                        state.at[layer] = b
+                if layers:
+                    # What the pass writes into the chunk's pages (Job's writes their K/V, each
+                    # half its own card's layers')
+                    for i, t in enumerate(tokens):
+                        page = seq.allocated_pages[(a + i) // PAGE]
+                        page.sequence[0, (a + i) % PAGE] = t
+                return x
             finally:
-                self.chunk_running = False
+                with self.model.card_lock:
+                    for c in card:
+                        cards[c] = None
+                self.chunk_running -= 1
+
+        def run():
+            assert state.position == a, f"{self.name}: state out of step with its chunk"
+            passes(self.model.layers, (0, 1))
+            state.position = b
+            self.head_at = b
+
+        # The same in pieces (Job._prefill_co: halves): the first card's layers, then the
+        # second card's, which also advance the state's position as the end of a pass does,
+        # then the MTP head's update, a pass of its own on the head's card
+        def first(stop):
+            assert stop == 4, "the toy model changes card at module 4"
+            return a, passes([l for l in self.model.layers if l < stop], (0,))
+
+        def rest(held):
+            start, x = held
+            assert start == a and state.position == a, f"{self.name}: second half out of step"
+            passes([l for l in self.model.layers if l >= 4], (1,), x)
+            state.position = b
+            return b
+
+        def after(end):
+            assert end == b and state.position >= b, f"{self.name}: head updated before its chunk's pass"
+            assert self.head_at == a, f"{self.name}: head at {self.head_at} for a chunk from {a}"
+            passes([], (self.model.head_card,), head = True)
+            self.head_at = b
+            self.head_threads.append(threading.current_thread().name)
 
         run.tokens = b - a
-        self.chunk_planned = True
+        run.end = b
+        run.checkpoint = False
+        run.halves = (first, rest, after) if self.halves else None
+        run.followed = False
+        self.chunk_planned += 1
+        self.planned_end = b
         try:
             sent = yield run
         finally:
-            self.chunk_planned = False
+            self.chunk_planned -= 1
         if sent is not None:
             results = sent
 
+        # The record, chunk after chunk, each with all its pieces done
+        assert seq.kv_position == a, f"{self.name}: chunk from {a} recorded at {seq.kv_position}"
+        assert self.head_at >= b, f"{self.name}: chunk to {b} recorded with the head at {self.head_at}"
+        # As Job's record (1.6.2): a state found past the chunk's end is taken back to it, unless
+        # the next chunk was planned ahead of this record (Generator._pipe_fill marks this one:
+        # that chunk's passes may have advanced the state by now)
+        if state.position > b and not run.followed:
+            state.position = b
         # The record; a prompt page that is complete gets its content hash (Job.hash_completed_page)
         left = b
         for p, page in enumerate(seq.allocated_pages):
@@ -716,7 +805,7 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
     g.side_max_rows = 8
     g.side_stats = {
         "chunks": 0, "beside": 0, "decode_steps": 0, "errors": 0,
-        "t_chunks": 0.0, "t_waited": 0.0,
+        "t_chunks": 0.0, "t_waited": 0.0, "piped": 0, "ahead": 0,
     }
     g._side = None
     g._side_ok = None
@@ -725,6 +814,15 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
     g._side_pool = None
     g._side_turn = 0
     g._side_stretch = None
+    g.prefill_pipeline = False
+    g.pipe_depth = 2
+    g._pipe = []
+    g._pipe_ok = None
+    g._pipe_why = None
+    g._pipe_lanes = None
+    g._pipe_pool = None
+    g._pipe_stop = None
+    g._pipe_head_first = False
     g.on_queue_drained = g.pagetable.defrag
     return g
 
