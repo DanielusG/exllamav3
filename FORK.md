@@ -233,7 +233,7 @@ server's former `--decode-slice-ms`, not two passes at once.
   ones. While a chunk and a decode step overlap only the chunk streams (the decode is at most 8
   rows, below `stream_min_rows`), so the weight-staging slots, the stage ring and the
   per-device stream state have one user at a time and need no lock (two prompt lanes at once
-  are the pipeline's business). On the prefill lane the worker's flags are waited for on the
+  are the pipeline's business: `_stage_lock`, next section). On the prefill lane the worker's flags are waited for on the
   copy stream and the landed batch by the host: the pass's stream, which the decode shares,
   never waits for a DMA (`tests/test_moe_host_lanes.py` reads it off the sources). The arena
   blocks the DMA reads are rewritten only by the placement sweep (at the queue's drain, never
@@ -417,11 +417,219 @@ MTP 1):
   after the other; a request abandoned in the middle of its ingestion left no error and the
   server went on answering. No error of the thread or of the engine in 36 chunks.
 
+### Two prompt chunks in flight on the two cards (`Generator(prefill_pipeline = True)`, `EXL3_PREFILL_PIPELINE=1`)
+
+Off by default. For a model whose layers are split over two cards, with the MTP head. Measured
+on the machine **on the v1.5.4 base** on 2026-10-11 (below): same computation exactly, a long
+prompt in a third less time alone, and beside jobs that are generating a quarter faster at their
+expense. Not yet run on this base. In the server: `--prefill-pipeline` (rule 26 of its
+`AGENTS.md`), which also asks for six worker slots (`ask_worker_slots` puts 6 in
+`EXL3_MOE_CPU_SLOTS` and on `moe_cpu_host.TUNING.num_slots` before the first load).
+
+**The idea.** A prompt is ingested a chunk at a time, and a chunk's pass works on one card at a
+time: each card is idle for half of it. Every layer keeps its own state (K/V pages, recurrent
+state) and needs that state after the previous chunk and the output of the layer before it for
+this one, so nothing stops the next chunk from starting on the first card while this one is on
+the second:
+
+    first card    A(0)  A(1)  A(2) ...
+    second card         B(0)  B(1) ...
+
+with A(k+1) after A(k) and B(k+1) after B(k).
+
+**What the switch does.** It turns the prefill thread on and adds a second one. A chunk's
+passes are issued in pieces (`Job._prefill_co`: the `halves` of the yielded function, a
+`ForwardCursor` stopped where the pass changes card, held, and finished by the other thread;
+then the MTP head's update): the first half by the prefill thread, the second by the new one.
+Each thread takes the chunks in the order they are handed over, which is the two rules above.
+Up to two chunks are under way (`pipe_depth`, `EXL3_PREFILL_PIPELINE_DEPTH`), of two jobs or of
+one. The pipeline is available only where the prefill thread is (so not with promote-on-miss,
+a tensor-parallel load or a draft model other than MTP), and needs the MTP head (a prompt chunk
+is then one forward pass a cursor can split), exactly two cards and three worker slots;
+`prefill_pipeline_state` (`off`, `pending`, `on`, `unavailable`) and `prefill_pipeline_reason`
+say which, `side_stats` counts the chunks `piped` (started with another under way) and
+`ahead` (of those, planned before the previous chunk of the same job was recorded).
+
+**The MTP head's update takes its turn on the head's card.** The head loads first and is on
+the first card. Its update of a chunk needs the end of that chunk's pass, so it follows the
+second half; run by the second half's thread it was on the first card while the next chunk's
+first half was there, and although the kernels of the two never overlap (one stream), their
+memory did: on the v1.5.4 base, 0.4 GiB more at the peak on the first card, and a 179k-token
+prompt that no longer fitted at production's split. With the head on the first card the update
+is therefore handed to the prefill thread when the second half is done, and runs between two
+first halves (`_pipe_head_first`, `_pipe_after`): every prompt pass on the first card, the
+head's included, is issued by that one thread. `EXL3_PREFILL_PIPELINE_HEAD=second` is the
+earlier behaviour, for telling the two apart.
+
+- `exllamav3/generator/generator.py`: `_pipe_round` and the `_pipe_*` helpers; its docstring
+  has the rules. Everything the round of one chunk at a time says still holds, card by card:
+  only forward passes leave the generator's thread, a chunk and a decode step overlap only if
+  they cannot meet inside a module, a job with a chunk under way gets no checkpoint and no
+  decode step, `cancel` lets its chunks finish the half they are in (and tells them to go no
+  further). Chunks are recorded in the order they started, each once all its pieces (the
+  head's update included) are done.
+- **A chunk of the same job is planned ahead of the record of the one before it**
+  (`_pipe_ahead`, `Job._prefill_co(results, at)`), and that is refused where it could go wrong:
+  several sequences, embeddings, a state whose position a module reads during a pass (the
+  state class says: `GDNState.pass_reads_position = False`; on 1.6.2 every side of the
+  `PairedState` is asked, and a class that does not say counts as one that reads it), a chunk
+  whose record may swap a page (below), and **any position where a recurrent checkpoint is
+  due**. A checkpoint stashes the whole state at one position, and the first half of the next
+  chunk would have moved the first card's layers past it; so the chunk that ends at a
+  checkpoint is recorded with nothing else of its job under way, and the next one starts in the
+  round after the checkpoint. That is one chunk without overlap per checkpoint: every
+  `recurrent_checkpoint_interval_pp` tokens (32768), every `recurrent_checkpoint_interval` in
+  the last two chunks of the prompt (with 4096 for both that interval and the chunk: the last
+  two chunks are in line), and the prompt's last page. A prompt of one chunk gains nothing.
+- **Two lanes** (`util/lane.py`). The first half issues on lane 1, the prefill thread's own,
+  the second on lane 2. Each lane has its passes on one card (the head's update is on the first
+  card's lane when the head is there, on the second's otherwise), so its workspaces are that
+  card's: the two lanes together hold what the prefill thread's one lane held, and a card still
+  runs one prompt chunk at a time beside the decode.
+- `exllamav3/model/moe_cpu_host.py`: `split_lanes(lanes = 3)` gives the decode its two slots
+  and the two halves an even share of the rest (with the default four: one each; the pipeline
+  says so at start-up, and `EXL3_MOE_CPU_SLOTS=6` gives each two, which is what the probe and
+  the server run with). Two lanes of prompt chunks at once is new to the host: the rotation of
+  the weight-staging slots and the stager's ring of the streamed path were one lane's, and are
+  now taken under `_stage_lock`, down to the enqueue of the copy the stager waits for.
+
+**What changed with 1.6.2.** The fork's pipeline was written against 1.5.4; on this base:
+
+- *Two lanes on the streamed prefill path.* With one lane of prompt chunks the streamed path had
+  one user at a time (previous section); with two, each card's lane streams its layers' hot
+  experts while the other does. They share the rotation of the weight-staging slots (`ws`), the
+  sequence number (`wseq`), the stage ring and each slot's pinned side and stage flags; what is
+  per device (the VRAM slots, their `wready_ev` / `wconsumed_ev`, `wslot_used`, the copy
+  stream) has one lane on it, because each lane's layers are on one card and an MTP head with
+  split experts has a host of its own. Under `_stage_lock`: the slot and its sequence number,
+  the stage job, the record of the slot's tenant (`wslot_prev_seq`) and, for the staged path,
+  the copy stream's wait for the stager, the copy and the `pinned_free` flag, so that every
+  stream's waits on the stage flags come in the order of their sequence numbers. Without it two
+  stage jobs can land in one ring entry and a lane waits for good
+  (`tests/test_moe_host_lanes.py` runs both paths from two lanes against a model of the streams,
+  the re-recorded events and the stager). The pinned-arena DMA takes its slot under the same
+  lock; what the slot indexes there is per card. The rotation being shared, a lane can get the
+  slot it used last, and its next DMA then waits for its last batch's compute instead of
+  overlapping it: as on the v1.5.4 branch, measured there with this rotation. A host made
+  without `__init__` (upstream's tests of the streamed path) takes a class-level lock. The
+  sources a host-waiting lane holds for its copies (`_handoff_held`) are kept by both lanes now;
+  the trim of a leaked entry tolerates the other lane's pop.
+- *The recurrent states.* Paired target / draft states: the draft side is absent with an MTP
+  head (1.6.2 refuses MTP heads with recurrent layers). A prompt chunk's pass reads and writes
+  the base row of its own slot (`2 * slot + parity`; the parity moves only in a speculative
+  rewind) and stages nothing in `spec_conv` / `spec_beta` / `spec_g`, so two chunks of one job
+  in flight touch only that row, and consecutive first halves run on one thread and one
+  stream: a chunk's first half reads what the previous chunk's first half wrote, in stream
+  order (the toy asserts that a layer takes the chunks in order; chunk halves from two threads
+  between a speculative pass and its rewind leave the decode's tokens as they are). A pass
+  reads the state's slot and parity (`prepare_for_recurrence`), never its position, which the
+  second half advances at its end. 1.6.2's record takes a state found past the chunk's end
+  back to it (`rewind_to` on the pair, for the extension an atomic multimodal prefill feeds
+  twice); with the next chunk planned ahead and through both cards by then (the generator's
+  thread late to the record), that would take back its work. The generator marks the chunk
+  under way when it plans the next one (`run.followed`) and the record leaves such a state
+  alone; upstream's rewind is untouched with the switch off (the v1.5.4 branch keyed the
+  rewind on `atomic_mm_prefill` instead). Checkpoints, `rekey` and the paired stashes stay on
+  the generator's thread after the record, with nothing of the job under way; so do the
+  persistent disk tier's checkpoint candidates (`note_state`, `state_candidates`).
+- *The block table.* The record gives the pages a chunk completes their content hash
+  (`Job.hash_completed_page`), and a page still under a random hash may be swapped there for
+  another job's referenced page of the same hash: the table rebuilt, the page's reference
+  dropped, while a chunk planned ahead still reads the table it was planned with. Such a chunk
+  is not followed by one planned ahead. In practice the one page concerned is the last prompt
+  page the MTP head leaves out of the cached prefix, which is in the prompt's last chunk anyway.
+- *The persistent disk tier.* Write-behind reads the sequence position, which is the start of
+  the job's oldest chunk under way until that chunk is recorded, all its pieces done (the head's
+  update writes the draft cache's pages of the chunk); it keeps two pages behind it, so no page
+  of a chunk in flight is queued (test: with two chunks of one job under way, one planned ahead,
+  and the head on either card). The prefetch at `enqueue` touches host slots only. `close()`,
+  `clear_queue()`, `cancel()` and a cache taken over stop both chunks at the half they are in
+  and wait for it; `close()` then lets both threads go, before it flushes.
+- *The MTP head on 1.6.2.* Flash-Next's head is full-attention blocks (QSA) and a MoE; no
+  recurrent state of its own. Its input layer calls the target's embedding, which stages
+  through a shared pinned buffer only for the decode (`pinned_staging`), not for a prompt
+  chunk. With the head on the first card its update also issues a few kernels on the second
+  card (the shifted hidden state, the carry) from the first card's thread: tensor ops, stream
+  ordered behind the second half that made their inputs.
+- *The hybrid draft*: the decode is counted at `1 + max_draft_tokens` rows, as for the thread.
+- *Promote-on-miss*: the thread is not offered, nor the pipeline (`unavailable`, with the
+  thread's reason).
+- *The staggered decode* is never on while a job is ingesting; *graph capture* stays on the
+  generator's thread, thread-local, on a stream of its own (a third thread changes nothing);
+  *NonFiniteLogits* on a decode step leaves the chunks in flight to `clear_queue()` or `close()`;
+  the inline expert *sweep* is held back on any lane but 0 and while either half is under way
+  (`current_lane()`, `lanes_busy()`).
+- *Memory: the quantized cache's prefill staging.* With a quantized cache, 1.6.2's two-pass
+  prefill (`EXL3_QC_STAGING=1`, the default; chunks from 256 tokens on, `EXL3_QC_PF_TWO_PASS_MIN_Q`)
+  stages the window an attention layer reads as fp16 K and V in a transient of one fixed size
+  per call, freed when the layer returns: for QSA layers in their dense regime (Flash-Next's
+  full attention and its head) `sparse_threshold + chunk` tokens' worth of pages, for other
+  attention layers the whole pool. So a card holds one such transient per prompt pass under
+  way on it. With the head's turn every prompt pass on the first card is issued by one thread,
+  and the first card holds at most one of them for prompt chunks, as with one chunk at a time
+  (the decode beside them takes the decode kernels, which stage nothing); the second card has
+  its own for the second half. With `EXL3_PREFILL_PIPELINE_HEAD=second` the head's update and
+  the next chunk's first half can each hold one on the first card at the same time. A chunk
+  waiting between the two cards holds its activations as well (about 130 MiB on Flash-Next at
+  chunk 4096, measured on the v1.5.4 base).
+- `prefill_pipeline_state` is `off` once the prefill thread is switched off at run time.
+
+What it costs when it runs: a second host thread (idle between chunks), one lane more in the
+worker's slots, nothing written anywhere, about 130 MiB less free on the first card after a
+long prompt (on the v1.5.4 base), and the jobs that are generating: both halves want the CPU
+expert worker, which is what limits the overlap of one chunk with the decode already, so a
+prompt that goes in faster beside them takes that time from them.
+
+**Measured on the v1.5.4 base** (2026-10-11, server stopped; reports in
+`~/exl3-pipeline-20261011/reports` on the machine):
+
+- `experiments/prefill_bench.py` of the v1.5.4 branch, phases `speed,check,pipe`, exact form,
+  six worker slots, a 33334-token document in chunks of 4096, split `23:262,25:285`. **Same
+  computation**: the nine comparisons identical, the three with two chunks in flight among them
+  (the prompt alone, the prompt beside a job generating, that job beside the prompt). The
+  prompt alone: 1170 tokens a second in line, 1104 on the thread, **1540 in flight** (21.6 s
+  against 30.2). Beside a job generating at 49.3 tok/s alone: on the thread the prompt at 614
+  and the job at 29.1; in flight the prompt at 777 and the job at 24.5. The same work one after
+  the other takes within 1% of either: in flight moves time from the decode to the prompt. Six
+  chunks of ten were planned ahead.
+- A test instance of the server, production's flags and split (`23:226,25:253`), the switch
+  from the environment, six slots, against the same requests without it: prompts of 5.5k
+  tokens the same (770 against 765 tokens a second); 29.5k alone 25.6 s against 33.8; 32k
+  beside one job generating 865 tokens a second against 706, the job at 16.0 tok/s against 20.0
+  (its longest wait 0.6 s against 0.2 in that run, 0.2 in the run before the head's turn: not
+  explained); **179k alone 143 s against 207**. Free memory after all of it: 254 and 166 MiB
+  against 384 and 146.
+- Before the head's turn the same instance ran out of memory on the first card at the 179k
+  prompt (24 MiB free before it). With the update left to the second thread and eight split
+  units given back on the first card (`23:234`) the 179k prompt goes in, with 22 MiB to spare:
+  the turn is the way out, not the split.
+- The probe (`experiments/pipeline_probe.py` of the v1.5.4 branch: the chunks of one job run by
+  hand from two threads; 32768 tokens in 8 chunks of 4096, exact form): in line 27.2-27.5 s, on
+  the prefill thread 30.9 s, in flight 19.8 s (+38% against in line); the logits of every
+  chunk's last token identical bit for bit in the three orders.
+
+Not seen, on either base: images in a prompt (they are ingested one chunk at a time, in the same
+pieces), several prompts at once on real traffic, a decode batch above eight rows, the checkpoint
+disk tier filling while chunks are in flight. On this base, nothing yet: the exact form of the
+bench's check with two chunks in flight is the one to repeat first.
+
+Tests (no GPU, no extension): `tests/test_prefill_pipeline.py` (the real round over the toy
+model, whose job turns the rules into assertions: one chunk per card at a time, the head's
+update included, a layer takes the chunks in order, records in order with every piece done, a
+checkpoint on a whole state and never past one, no page released under a half; the 1.6.2 points
+above; and Job's own coroutine planning ahead the chunks it plans in turn, at production's
+sizes), `tests/test_moe_host_lanes.py` (the split into three lanes, the streamed path from two
+lanes on two cards, the lock's coverage), `tests/test_split_lanes.py` (lane 2 and the sweep,
+the halves' translate buffers), `tests/test_lane.py`. Marked `nogpu`; run with `--noconftest`
+without the compiled extension.
+
+The bench of the v1.5.4 branches (`experiments/prefill_bench.py`, its phase `pipe`) is not on
+this branch.
+
 ### Still to come
 
 Ported from the v1.5.4 branches in the steps after this one, each into a section of its own:
 
-- two prompt chunks in flight on the two cards (`prefill_pipeline`);
 - a recurrent checkpoint that follows the answer (`recurrent_tail_checkpoint`);
 - expert placement weighted on the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`);
 - page-cache hygiene in the disk tier (`generator/disk_cache.py`).
