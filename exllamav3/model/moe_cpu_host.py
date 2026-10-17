@@ -886,6 +886,10 @@ def _pinning_exhausted(e: Exception) -> bool:
 
 class MoeCpuHost:
 
+    # (the instance's own is made in __init__; a host made without it, as upstream's tests of the
+    # streamed path make theirs, takes this one: one thread, nothing to contend for)
+    _stage_lock = threading.Lock()
+
     def __init__(self, config):
         self.config = config
         self.model_dir = config.directory
@@ -908,6 +912,9 @@ class MoeCpuHost:
         # _handoff: per device, the stream a lane that must not make the pass's stream wait
         # for the worker issues its copies and flag waits on (_handoff_stream)
         self._issue_lock = threading.Lock()
+        # Two lanes of prompt chunks (one per card: Generator.prefill_pipeline) also share the
+        # weight-staging slots and the stager's ring of the streamed path, under _stage_lock
+        self._stage_lock = threading.Lock()
         self._lanes = None
         self._handoff = {}
         self._handoff_held = {}
@@ -1283,11 +1290,13 @@ class MoeCpuHost:
 
         threading.Thread(target = wd, daemon = True).start()
 
-    def split_lanes(self, decode_slots = 2):
+    def split_lanes(self, decode_slots = 2, lanes = 2):
         """
-        Reserve the first decode_slots slots for lane 0 and give the rest to lane 1, for a
-        second thread that issues passes beside the first (Generator.prefill_thread). Returns
-        the two slot counts, or None when there are too few slots to split (EXL3_MOE_CPU_SLOTS).
+        Reserve the first decode_slots slots for lane 0 and give the rest to the other lanes,
+        for threads that issue passes beside the first: lane 1 alone (Generator.prefill_thread),
+        or lanes 1 and 2 with an even share each (Generator.prefill_pipeline: a lane of prompt
+        chunks per card). Returns the slot counts, lane 0's first, or None when there are too
+        few slots for a lane each (EXL3_MOE_CPU_SLOTS).
 
         A slot's next tenant waits, on its stream, for the previous tenant's output to have been
         read back (the consumed flag), and a pass that issues more jobs than there are slots
@@ -1300,14 +1309,25 @@ class MoeCpuHost:
 
         To be called between two modules of a pass at the earliest, by the thread that issues
         them: the slots change hands with their last tenants already read back in stream order.
+        A split into more lanes than the one in force replaces it, and is for a moment when no
+        other lane has a pass under way (a slot's next tenant waits for the last one's consumed
+        flag whichever lane it is on, as on one rotation).
         """
-        if self._lanes is not None:
-            return self._lanes[0][1], self._lanes[1][1]
-        d = min(decode_slots, self.num_slots - 1)
+        if self._lanes is not None and len(self._lanes) >= lanes:
+            return tuple(self._lanes[i][1] for i in sorted(self._lanes))
+        others = lanes - 1
+        d = min(decode_slots, self.num_slots - others)
         if d < 1:
             return None
-        self._lanes = {0: [0, d, 0], 1: [d, self.num_slots - d, 0]}
-        return d, self.num_slots - d
+        split = {0: [0, d, 0]}
+        first, left = d, self.num_slots - d
+        for i in range(1, lanes):
+            n = -(-left // (lanes - i))
+            split[i] = [first, n, 0]
+            first += n
+            left -= n
+        self._lanes = split
+        return tuple(split[i][1] for i in range(lanes))
 
     def _lane_slots(self):
         """Slots the calling thread's lane rotates over."""
@@ -1553,8 +1573,13 @@ class MoeCpuHost:
         held = self._handoff_held
         held[id(jobs)] = (jobs, y_pad, sel32, routing_weights)
         if len(held) > 64:
-            # (a pass that failed between issue and collect never comes back for its entry)
-            del held[next(iter(held))]
+            # (a pass that failed between issue and collect never comes back for its entry.
+            # With two lanes of prompt chunks the other one inserts and pops here too: the oldest
+            # entry may be gone, or the dict change size, between the two steps)
+            try:
+                del held[next(iter(held))]
+            except (KeyError, RuntimeError, StopIteration):
+                pass
         return jobs, rtmp
 
     def _issue_jobs(self, layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h):
@@ -2118,53 +2143,62 @@ class MoeCpuHost:
 
         for i0 in range(0, len(streamed), per_slot):
             batch = streamed[i0:i0 + per_slot]
-            ws = self.next_wslot
-            self.next_wslot = (self.next_wslot + 1) % self.num_wslots
-            self.wseq += 1
-            seq = self.wseq
+            # Two lanes of prompt chunks (one per card, Generator.prefill_pipeline) share the
+            # rotation of the weight-staging slots, the stage ring and the pinned staging side of
+            # each slot: the slot, the sequence number and the stage job are taken under the
+            # lock, and the copy that frees the slot's pinned side (what the stager waits for
+            # before it stages the slot's next tenant) is enqueued before it is released, so
+            # that every stream's waits on the stage flags come in the order of their sequence
+            # numbers. What is per device (the VRAM slots, their events, the copy stream) has one
+            # lane on it: each lane's layers are on one card
+            with self._stage_lock:
+                ws = self.next_wslot
+                self.next_wslot = (self.next_wslot + 1) % self.num_wslots
+                self.wseq += 1
+                seq = self.wseq
 
-            if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
-                # Pinned arena: DMA each expert's contiguous block straight out of the
-                # registered arena mapping on the copy stream (no worker involvement, the
-                # stager thread stays idle)
-                with torch.cuda.stream(copy_stream):
-                    if st["wslot_used"][ws]:
-                        copy_stream.wait_event(st["wconsumed_ev"][ws])
-                    raw = st["vram_slots"][ws]
+                if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
+                    # Pinned arena: DMA each expert's contiguous block straight out of the
+                    # registered arena mapping on the copy stream (no worker involvement, the
+                    # stager thread stays idle)
+                    with torch.cuda.stream(copy_stream):
+                        if st["wslot_used"][ws]:
+                            copy_stream.wait_event(st["wconsumed_ev"][ws])
+                        raw = st["vram_slots"][ws]
+                        for bi, e in enumerate(batch):
+                            ci, off = blocks[e]
+                            raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
+                                self.arena_views[ci][off // 2 : (off + exp_b) // 2],
+                                non_blocking = True)
+                else:
+                    # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
+                    # the weight memcpys overlap the compute pool's work on the tail
+                    stail = int(self.v_stage_tail[0])
+                    while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
+                        import time
+                        if self.v_abort[0] or not self.proc.is_alive():
+                            raise RuntimeError("CPU MoE worker failed (stage ring stall)")
+                        time.sleep(0.0002)
+                    job = self.v_stage_jobs[stail % MOE_STAGE_RING]
+                    _set_job_seq(job, seq)
+                    job[1] = layer_idx
+                    job[2] = len(batch)
+                    job[3] = 0
+                    job[4] = ws
+                    job[5] = 1    # MOE_JOB_KIND_STAGE
+                    job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
                     for bi, e in enumerate(batch):
-                        ci, off = blocks[e]
-                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
-                            self.arena_views[ci][off // 2 : (off + exp_b) // 2],
-                            non_blocking = True)
-            else:
-                # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
-                # the weight memcpys overlap the compute pool's work on the tail
-                stail = int(self.v_stage_tail[0])
-                while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
-                    import time
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (stage ring stall)")
-                    time.sleep(0.0002)
-                job = self.v_stage_jobs[stail % MOE_STAGE_RING]
-                _set_job_seq(job, seq)
-                job[1] = layer_idx
-                job[2] = len(batch)
-                job[3] = 0
-                job[4] = ws
-                job[5] = 1    # MOE_JOB_KIND_STAGE
-                job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
-                for bi, e in enumerate(batch):
-                    job[7 + bi] = e
-                self.v_stage_tail[0] = stail + 1
-                self.wslot_prev_seq[ws] = seq
+                        job[7 + bi] = e
+                    self.v_stage_tail[0] = stail + 1
+                    self.wslot_prev_seq[ws] = seq
 
-                used = (len(batch) * exp_b) // 2
-                with torch.cuda.stream(copy_stream):
-                    if st["wslot_used"][ws]:
-                        copy_stream.wait_event(st["wconsumed_ev"][ws])
-                    ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
-                    st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
-                    ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
+                    used = (len(batch) * exp_b) // 2
+                    with torch.cuda.stream(copy_stream):
+                        if st["wslot_used"][ws]:
+                            copy_stream.wait_event(st["wconsumed_ev"][ws])
+                        ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
+                        st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
+                        ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
             if restore and st["native_slots"] is None:
                 # First batch on this device that needs native-order bytes: adopt the ring the

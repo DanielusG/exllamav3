@@ -61,11 +61,11 @@ def _lane_zero():
             delattr(LANE._tls, name)
 
 
-def on_lane(fn):
+def on_lane(fn, index = 1, device = 0):
     out = {}
 
     def body():
-        LANE.Lane(1, [0]).enter()
+        LANE.Lane(index, [device]).enter()
         try:
             out["value"] = fn()
         except BaseException as e:
@@ -123,6 +123,33 @@ def test_no_inline_sweep_while_a_chunk_is_under_way_on_the_prefill_thread(monkey
     assert swept == [ip]
 
 
+def test_no_inline_sweep_from_the_second_half_s_thread(monkeypatch):
+    # Generator.prefill_pipeline: the second half of a chunk is issued on lane 2, by a thread of
+    # its own. The first registered split module is on the first card, so its tick comes from
+    # lane 1 or the decode; from lane 2 (a model with no split layer on the first card) the
+    # sweep stays pending as well
+    m, ip, swept = overdue_module(monkeypatch)
+    on_lane(m._split_swap_tick, index = 2, device = 1)
+    assert swept == [] and ip.moe_cpu_swap_pending
+
+
+def test_no_inline_sweep_while_either_half_of_a_chunk_is_under_way(monkeypatch):
+    # The decode's tick (lane 0) while the second half is on the second card, then while the
+    # first half alone is: no sweep until neither lane has a pass under way
+    m, ip, swept = overdue_module(monkeypatch)
+    first, second = LANE.Lane(1, [0]), LANE.Lane(2, [1])
+    with second.passing():
+        m._split_swap_tick()
+    assert swept == []
+    with first.passing():
+        with second.passing():
+            m._split_swap_tick()
+        m._split_swap_tick()
+    assert swept == [] and ip.moe_cpu_swap_pending
+    m._split_swap_tick()
+    assert swept == [ip]
+
+
 # --------------------------------------------------------------------------------------------
 #   The copy path's selection translate
 # --------------------------------------------------------------------------------------------
@@ -158,3 +185,21 @@ def test_the_prefill_thread_translates_into_a_buffer_of_its_own():
     # The decode's next translate leaves the chunk's selection as it was
     m._split_translate(torch.tensor([[7, 6]]))
     assert chunk.tolist() == [[2, -1], [3, 0], [-1, 1]]
+
+
+def test_the_two_halves_of_a_chunk_translate_into_buffers_of_their_own():
+    # Two lanes of prompt chunks at once (Generator.prefill_pipeline): neither writes the
+    # module's buffer, and each selection stays as it was while the other lane and the decode
+    # translate
+    m, calls = translating_module()
+    m._split_translate(torch.tensor([[1, 5]]))
+    shared = m._split_selcpu_t
+    a = on_lane(lambda: m._split_translate(torch.tensor([[6, 2], [7, 4]])), index = 1, device = 0)
+    b = on_lane(lambda: m._split_translate(torch.tensor([[5, 7], [0, 6]])), index = 2, device = 1)
+    m._split_translate(torch.tensor([[7, 6]]))
+    assert a.tolist() == [[2, -1], [3, 0]] and b.tolist() == [[1, 3], [-1, 2]]
+    assert m._split_selcpu_t is shared
+    spans = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in (shared, a, b)]
+    for i in range(3):
+        for j in range(i + 1, 3):
+            assert spans[i][1] <= spans[j][0] or spans[j][1] <= spans[i][0]

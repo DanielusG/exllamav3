@@ -89,6 +89,20 @@ def test_devices_of_the_models():
 
     assert LANE.cuda_devices(model("cuda:1", None, "cuda:0", "cuda:1"), None, model("cpu", "cuda:1")) == [0, 1]
     assert LANE.cuda_devices(model("cpu"), None) == []
+    # and of a run of modules (Generator._pipe_plan: the two halves of a pass)
+    mods = model("cpu", "cuda:0", None, "cuda:0", "cuda:1").modules
+    assert LANE.module_devices(mods[:4]) == [0] and LANE.module_devices(mods[4:]) == [1]
+    assert LANE.module_devices([]) == []
+
+
+def test_each_of_two_lanes_beside_lane_zero_has_its_own_workspaces():
+    # Generator.prefill_pipeline: lanes 1 and 2, one per card, beside the decode's
+    cache = TENSOR.GTensorCache()
+    a = cache.get("cpu", (4, 8), torch.float, "scratch")
+    b = on_lane(lambda: cache.get("cpu", (4, 8), torch.float, "scratch"), index = 1)
+    c = on_lane(lambda: cache.get("cpu", (4, 8), torch.float, "scratch"), index = 2)
+    assert len({a.data_ptr(), b.data_ptr(), c.data_ptr()}) == 3
+    assert on_lane(lambda: cache.get("cpu", (4, 8), torch.float, "scratch"), index = 2) is c
 
 
 def test_each_lane_has_its_own_workspaces():

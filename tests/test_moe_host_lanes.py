@@ -57,7 +57,10 @@ class Stream:
         self.ops.append(op)
 
     def wait_event(self, ev):
-        self.put(("wait_event", ev))
+        if isinstance(ev, VEvent):
+            self.put(("vwait", ev, ev.version))
+        else:
+            self.put(("wait_event", ev))
 
     def synchronize(self):
         """A host wait for everything issued on this stream so far."""
@@ -78,6 +81,28 @@ class Event:
         assert self.done.wait(self.sim.patience), "a host wait never ends"
 
 
+class VEvent:
+    """A CUDA event as the streamed path keeps one per weight-staging slot and device: recorded
+    again for every batch, and a wait, on a stream or on the host, is for the record that was the
+    most recent when the wait was made."""
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.version = 0
+        self.done_v = 0
+
+    def record(self, stream = None):
+        self.version += 1
+        (stream or self.sim.current()).put(("vrecord", self, self.version))
+
+    def synchronize(self):
+        v = self.version
+        deadline = time.time() + self.sim.patience
+        while self.done_v < v:
+            assert time.time() < deadline, "a host wait never ends"
+            time.sleep(0.0002)
+
+
 class Sim:
     """Streams, flags and the worker. step() runs whatever can run and says whether it did."""
 
@@ -93,6 +118,7 @@ class Sim:
         self.tenant = {}            # slot -> seq of the job whose inputs it holds
         self.served = []
         self.stop = False
+        self.stager = None          # the worker's stager thread, for the streamed path
 
     def current(self):
         return getattr(self.tls, "stream", None) or self.default
@@ -103,7 +129,13 @@ class Sim:
             return self.flags[op[1]] >= op[2]
         if kind == "wait_event":
             return op[1].done.is_set()
-        if kind == "record":
+        if kind == "vwait":
+            return op[1].done_v >= op[2]
+        if kind == "vrecord":
+            op[1].done_v = max(op[1].done_v, op[2])
+        elif kind in ("copy", "read"):
+            op[1]()
+        elif kind == "record":
             op[1].done.set()
         elif kind == "write":
             what, slot = op[1]
@@ -135,6 +167,8 @@ class Sim:
                 self.served.append(seq)
                 host.v_jobs_head[0] = head + 1
                 progress = True
+        if self.stager is not None and self.stager(self):
+            progress = True
         return progress
 
     def settle(self):
@@ -255,8 +289,10 @@ def load():
         return m
 
     stub("")
-    for p in ("model", "util"):
+    for p in ("model", "util", "modules"):
         stub(p)
+    # (imported by the streamed path, used by its batched tier only)
+    stub("modules.moe_batch_recon", plan_groups = None)
     stub("ext", exllamav3_ext = types.SimpleNamespace(
         exl3_moe_cpu_set_memops = lambda on: None, exl3_moe_cpu_core_order = lambda: ([], 0)))
     stub("util.device_copy", host_to_device = lambda t, device: t)
@@ -356,6 +392,31 @@ def test_split_lanes(monkeypatch):
     assert make_host(monkeypatch, sim, 2).split_lanes() == (1, 1)
     h1 = make_host(monkeypatch, sim, 1)
     assert h1.split_lanes() is None and h1._lanes is None
+
+
+def test_split_lanes_for_a_lane_of_prompt_chunks_per_card(monkeypatch):
+    # Generator.prefill_pipeline: lane 0 for the decode, lanes 1 and 2 for the two halves of a chunk
+    sim = Sim()
+    assert make_host(monkeypatch, sim, 6).split_lanes(lanes = 3) == (2, 2, 2)
+    assert make_host(monkeypatch, sim, 8).split_lanes(lanes = 3) == (2, 3, 3)
+    assert make_host(monkeypatch, sim, 5).split_lanes(lanes = 3) == (2, 2, 1)
+    assert make_host(monkeypatch, sim, 4).split_lanes(lanes = 3) == (2, 1, 1)
+    assert make_host(monkeypatch, sim, 3).split_lanes(lanes = 3) == (1, 1, 1)
+    h2 = make_host(monkeypatch, sim, 2)
+    assert h2.split_lanes(lanes = 3) is None and h2._lanes is None
+    # It replaces the split of the prefill thread alone: lane 0 keeps its slots, lane 1 the
+    # bottom of its range. Asking for fewer lanes afterwards changes nothing
+    h = make_host(monkeypatch, sim, 6)
+    assert h.split_lanes() == (2, 4)
+    assert h.split_lanes(lanes = 3) == (2, 2, 2)
+    assert [h._lanes[i][:2] for i in range(3)] == [[0, 2], [2, 2], [4, 2]]
+    assert h.split_lanes() == (2, 2, 2)
+    # Each lane rotates over its own range
+    taken = {}
+    for lane in (0, 1, 2):
+        LANE._tls.lane = lane
+        taken[lane] = [h._take_slot() for _ in range(4)]
+    assert taken == {0: [0, 1, 0, 1], 1: [2, 3, 2, 3], 2: [4, 5, 4, 5]}
 
 
 def test_one_thread_alone_is_what_it_was(monkeypatch):
@@ -749,3 +810,276 @@ def test_the_streamed_prefill_never_makes_a_shared_stream_wait():
     # The tail goes through the lane-aware issue and collect
     calls = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
     assert {"self._issue_compute", "self._collect_compute"} <= calls
+
+
+# --------------------------------------------------------------------------------------------
+#   Two lanes of prompt chunks on the streamed path (Generator.prefill_pipeline)
+# --------------------------------------------------------------------------------------------
+
+E = 4               # experts of a layer, all of them streamed
+EXP_B = 96          # bytes of an expert (three projections of 32)
+ROWS = 8
+
+
+class FakeVram:
+    """A weight-staging slot's VRAM side on one card: which expert each block holds, written by
+    the copies when the copy stream gets to them."""
+
+    def __init__(self, device, ws):
+        self.device = device
+        self.ws = ws
+        self.blocks = {}
+
+    def __getitem__(self, sl):
+        return FakeVramSlice(self, sl.start or 0)
+
+
+class FakeVramSlice:
+    def __init__(self, vram, start):
+        self.vram = vram
+        self.start = start
+
+    def view(self, *shape):
+        return self
+
+    def copy_(self, src, non_blocking = False):
+        sim = src.sim
+        vram, start = self.vram, self.start
+
+        def run():
+            if isinstance(src, ArenaSlice):
+                # Pinned arena: one expert's block straight out of the arena
+                vram.blocks[start // (EXP_B // 2)] = src.expert
+            else:
+                # Staged: whatever the worker's stager left in the slot's pinned side
+                staged = sim.pinned.get(src.ws)
+                if staged is None:
+                    sim.errors.append(f"cuda:{vram.device} slot {vram.ws}: copied an empty pinned slot")
+                    return
+                for bi, e in enumerate(staged[1]):
+                    vram.blocks[bi] = e
+
+        sim.current().put(("copy", run))
+        return self
+
+
+class ArenaSlice:
+    def __init__(self, sim, expert):
+        self.sim = sim
+        self.expert = expert
+
+
+class FakeArena:
+    def __init__(self, sim):
+        self.sim = sim
+
+    def __getitem__(self, sl):
+        return ArenaSlice(self.sim, (sl.start * 2) // EXP_B)
+
+
+class PinnedSlice:
+    def __init__(self, sim, ws):
+        self.sim = sim
+        self.ws = ws
+
+
+class FakePinned:
+    def __init__(self, sim, ws):
+        self.sim = sim
+        self.ws = ws
+
+    def __getitem__(self, sl):
+        return PinnedSlice(self.sim, self.ws)
+
+
+def stager(sim):
+    """The worker's stager thread: the stage ring in order, a job staged once the previous
+    tenant of its slot has been copied out of the slot's pinned side (pinned_free)."""
+    h = sim.host
+    head, tail = int(h.v_stage_head[0]), int(h.v_stage_tail[0])
+    if head >= tail:
+        return False
+    jobs = getattr(h.v_stage_jobs, "arr", h.v_stage_jobs)
+    job = jobs[head % HOST.MOE_STAGE_RING]
+    seq = int(job[0]) | (int(job[HOST.MOE_JOB_SEQ_HI]) << 32)
+    ws, n, prev = int(job[4]), int(job[2]), int(job[6])
+    if sim.flags[("pinned_free", ws)] < prev:
+        return False
+    sim.pinned[ws] = (seq, [int(e) for e in job[7:7 + n]])
+    sim.staged.append(seq)
+    sim.flags[("stage_done", ws)] = seq
+    h.v_stage_head[0] = head + 1
+    return True
+
+
+SPEC = dict(
+    num_experts = E, hi = H, ho = H, activation = 3, act_limit = 0,
+    proj_dims = {"g": (16, 16, 1), "u": (16, 16, 1), "d": (16, 16, 1)},
+    proj_bytes = (32, 32, 32), expert_bytes = EXP_B,
+    stream_layout = (((0, 0), (0, 0), (0, 0)), False),
+)
+
+
+def streaming_host(monkeypatch, sim, pinned, layers):
+    """A host whose streamed path runs on two cards, its experts' compute replaced by reads that
+    check, when the pass's stream gets to them, that the VRAM slot holds the expert streamed."""
+    h = make_host(monkeypatch, sim, 6)
+    assert h.split_lanes(lanes = 3) == (2, 2, 2)
+    h._stage_lock = threading.Lock()
+    h.num_wslots = 2
+    h.next_wslot = 0
+    h.wseq = 0
+    h.wslot_prev_seq = [0] * HOST.MOE_MAX_WSLOTS
+    h.wslot_size = 2 * EXP_B
+    h.batch_experts = 2
+    h.batch_recon = False
+    h.pinned = pinned
+    h.arena_registered = None
+    h.layer_blocks = [{e: (0, e * EXP_B) for e in range(E)}] * layers
+    h.arena_views = [FakeArena(sim)]
+    h.v_stage_jobs = np.zeros((HOST.MOE_STAGE_RING, HOST.MOE_JOB_BYTES // 4), dtype = np.uint32)
+    h.v_stage_tail = np.zeros(1, dtype = np.uint32)
+    h.v_stage_head = np.zeros(1, dtype = np.uint32)
+    h.stage_done_addr = [("stage_done", s) for s in range(HOST.MOE_MAX_WSLOTS)]
+    h.pinned_free_addr = [("pinned_free", s) for s in range(HOST.MOE_MAX_WSLOTS)]
+    h.wviews = [FakePinned(sim, s) for s in range(HOST.MOE_MAX_WSLOTS)]
+    marks = [types.SimpleNamespace(expert = e) for e in range(E)]
+    h.aux = {l: {f"{k}_{p}": marks for k in ("suh", "svh") for p in "gud"} for l in range(layers)}
+
+    def dq(x, tv, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
+        vram, bi, e = tv.vram, tv.start // (EXP_B // 2), suh.expert
+
+        def check():
+            if vram.blocks.get(bi) != e:
+                sim.errors.append(f"cuda:{vram.device} slot {vram.ws} block {bi}: expert "
+                                  f"{vram.blocks.get(bi)} where {e} was streamed")
+        sim.current().put(("read", check))
+        return torch.zeros((x.shape[0], dims[1]), dtype = out_dtype)
+
+    h._dq_linear = dq
+    h._act = lambda spec, g, u: torch.zeros_like(u)
+    sim.pinned = {}
+    sim.staged = []
+    sim.stager = stager
+    return h
+
+
+def stream_state(sim, device):
+    return dict(
+        copy_stream = Stream(sim, f"copy{device}"),
+        vram_slots = [FakeVram(device, ws) for ws in range(2)],
+        native_slots = None,
+        wready_ev = [VEvent(sim) for _ in range(2)],
+        wconsumed_ev = [VEvent(sim) for _ in range(2)],
+        wslot_used = [False] * 2,
+        w_scratch = None, fused_bufs = {}, recon = {},
+    )
+
+
+def streamed_layers(h, sim, lane, device, layers, start = None):
+    """What a lane of prompt chunks issues on its card: the streamed path, layer after layer, on
+    the card's pass stream; then a host wait for that stream (the half is done)."""
+    LANE.Lane(lane, [device]).enter()
+    sim.tls.stream = sim.passes[device]
+    st = sim.states[device]
+    if start is not None:
+        assert start.wait(5)
+    sel = torch.tensor([[0, 1], [2, 3]] * (ROWS // 2), dtype = torch.long)
+    w = torch.ones((ROWS, TOPK), dtype = torch.half)
+    y = torch.zeros((ROWS, H), dtype = torch.half)
+    flat = sel.reshape(-1)
+    for layer in range(layers):
+        h._submit_prefill_streamed(layer, y, sel, w, SPEC, list(range(E)), st, [ROWS * TOPK // E] * E,
+                                   flat, flat + 1, 0)
+    sim.passes[device].synchronize()
+
+
+def two_lanes_streaming(monkeypatch, pinned, layers = 6, hold = 0.2, patience = 10.0):
+    sim = Sim(patience = patience)
+    h = streaming_host(monkeypatch, sim, pinned, layers)
+    sim.passes = {d: Stream(sim, f"pass{d}") for d in (0, 1)}
+    sim.states = {d: stream_state(sim, d) for d in (0, 1)}
+    ring = None
+    if not pinned:
+        # Lane 1's first write of a stage job held up: the interpreter switching threads in the
+        # middle of the slot's and the ring's bookkeeping, which are bytecodes apart
+        ring = h.v_stage_jobs = _SlowRing(h.v_stage_jobs, hold)
+    bg = sim.run()
+    failed = []
+
+    def lane(index, device, start = None):
+        try:
+            streamed_layers(h, sim, index, device, layers, start)
+        except BaseException as e:
+            failed.append(e)
+
+    threads = [threading.Thread(target = lane, args = (1, 0)),
+               threading.Thread(target = lane, args = (2, 1, ring.held if ring is not None else None))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(4 * patience)
+    sim.stop = True
+    bg.join(5)
+    return sim, h, failed, threads
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_two_lanes_of_prompt_chunks_stream_at_once(monkeypatch, pinned):
+    # The two halves of a chunk in flight on two cards stream their layers' hot experts at the
+    # same time: one rotation of weight-staging slots, one stage ring and one set of pinned
+    # slots for both (the VRAM slots, their events and the copy streams are per card). Every
+    # expert's compute finds its own weights in its card's VRAM slot, and everything issued runs
+    sim, h, failed, threads = two_lanes_streaming(monkeypatch, pinned)
+    assert not any(t.is_alive() for t in threads) and not failed, failed
+    assert sim.errors == []
+    assert all(not s.ops for s in sim.streams)
+    batches = 2 * 6 * E // 2
+    assert h.wseq == batches
+    if pinned:
+        assert sim.staged == [] and int(h.v_stage_tail[0]) == 0
+    else:
+        # One stage job per batch, served in the order of their sequence numbers
+        assert sim.staged == list(range(1, batches + 1))
+        assert int(h.v_stage_head[0]) == int(h.v_stage_tail[0]) == batches
+
+
+def test_the_stage_lock_covers_the_slot_the_stage_ring_and_the_copy_that_frees_it():
+    # What has to be taken in one go by a lane of prompt chunks, read off the source: the slot
+    # and its sequence number, the stage job and the record of the slot's tenant, and the copy
+    # stream's wait for the stager, the copy and the flag that frees the slot's pinned side (a
+    # stream whose waits on the stage flags came out of the order of their sequence numbers
+    # would wait for a tenant staged behind it)
+    import ast
+    fn = _host_function("_submit_prefill_streamed")
+    locks = [n for n in ast.walk(fn) if isinstance(n, ast.With)
+             and any(ast.unparse(i.context_expr) == "self._stage_lock" for i in n.items)]
+    assert len(locks) == 1
+    inside = {id(n) for n in ast.walk(locks[0])}
+    stores = [n for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AugAssign))
+              and any(ast.unparse(t).startswith(("self.next_wslot", "self.wseq", "self.v_stage_tail", "self.wslot_prev_seq"))
+                      for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
+    assert len(stores) == 4 and all(id(n) in inside for n in stores)
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in (
+        "ext.exl3_moe_flag_wait", "ext.exl3_moe_flag_write", "_set_job_seq")]
+    assert len(calls) == 3 and all(id(n) in inside for n in calls)
+    reads = [n for n in ast.walk(fn) if isinstance(n, ast.Subscript) and ast.unparse(n.value) == "self.v_stage_jobs"]
+    assert reads and all(id(n) in inside for n in reads)
+
+
+def test_the_trim_of_held_sources_survives_the_other_lane(monkeypatch):
+    # With two lanes of prompt chunks both keep the sources of their copies in _handoff_held:
+    # the oldest entry may be gone by the time a lane trims it
+    sim = Sim()
+    h = make_host(monkeypatch, sim, 6)
+    h.split_lanes(lanes = 3)
+
+    class Gone(dict):
+        def __iter__(self):
+            return iter([("taken", "by the other lane")])
+
+    h._handoff_held = Gone({i: None for i in range(64)})
+    LANE.Lane(2, [1]).enter()
+    y, sel, w = rows(CAP)
+    h._issue_compute(0, y, sel, w, h.specs[0], torch.zeros((CAP, H)), H)
+    assert len(h._handoff_held) == 65
