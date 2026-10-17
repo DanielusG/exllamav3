@@ -82,17 +82,26 @@ def save_expert_stats(infer_params):
     the load-time permutation) so the next load of this model starts from the hot/cold ranking
     instead of the arbitrary head/tail split. A session too short to have routed a meaningful
     sample keeps the file's previous entries (it must not overwrite a settled profile); the
-    counts themselves are decayed, so the threshold is in decode steps, not hits"""
+    counts themselves are decayed, so the threshold is in decode steps, not hits.
+    The counts saved are the ones the sweep ranks by: with a prefill weight
+    (hist_prefill_weight) the prefill-size selections counted apart since the last sweep are
+    added at that weight, without folding them in (the sweep does that, once)"""
     import json, tempfile
     reg = getattr(infer_params, "moe_cpu_swap_modules", None)
     if not reg or reg[0]._split_step_count < _STATS_MIN_STEPS:
         return
     config, E = reg[0].config, reg[0].num_experts
     layers = _expert_stats_load(config, E)
+    w_pf = None
     for m in reg:
         if m._split_hist is None or getattr(m, "tid2eid_key", None):
             continue
         hist = m._split_hist.tolist()
+        pf = getattr(m, "_split_hist_pf", None)
+        if pf is not None:
+            if w_pf is None:
+                w_pf = hist_prefill_weight()
+            hist = [c + w_pf * p for c, p in zip(hist, pf.tolist())]
         if m.num_experts != E or sum(hist) <= 0.0:
             continue
         perm = m._split_perm or list(range(E))
@@ -111,6 +120,32 @@ def save_expert_stats(infer_params):
         os.replace(tmp, path)
     except OSError as e:
         print(f" !! expert stats not saved ({path}): {e}")
+
+
+def hist_prefill_weight() -> float:
+    """
+    What one expert selection of a prefill-size batch (at least the CPU expert host's
+    stream_min_rows rows: a prompt chunk) counts in the dynamic placement, against 1 for a
+    selection of a decode-size batch (EXL3_MOE_HIST_PREFILL_WEIGHT, read at every sweep and at
+    every prefill-size batch; default 1: every selection counts the same, as upstream).
+
+    The two do not cost the same. A decode step waits for the CPU worker in every layer that
+    picked at least one CPU-resident expert, so a missed selection there is paid in full, token
+    after token; a prompt chunk sends its hot CPU-resident experts to the card and the worker
+    computes only the tail. Measured on Flash-Next at 2.05 bpw, 2x RTX 5060 Ti, 8 worker
+    threads, on the v1.5.4 base (2026-10-11): with the placement learnt from generated tokens
+    only, the share of a generating job's selections served from VRAM goes from 0.84 to 0.95
+    and its speed from 60.6 to 69.7 tok/s, while a prompt's share falls from 0.95 to 0.62 and
+    its ingestion goes from 7.64 to 7.87 s. Prompt tokens outnumber generated ones by orders of
+    magnitude, so with equal weights they decide the placement alone.
+
+    With the weight at 1 nothing is counted apart (no second histogram, no fold). The sweep is
+    where it applies: under promote-on-miss, which does not sweep, the library ignores it.
+    """
+    try:
+        return max(0.0, float(os.environ.get("EXL3_MOE_HIST_PREFILL_WEIGHT", "1")))
+    except ValueError:
+        return 1.0
 
 
 @torch.inference_mode()
@@ -140,6 +175,16 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
+    # The prefill-size counts kept apart (hist_prefill_weight not 1) go into every layer's
+    # histogram now, with their weight, before any layer is swept: whoever reads the histograms
+    # around a sweep (the sweep itself, a server's telemetry wrapped around _split_sweep_layer,
+    # also for the layers the swap budget does not reach) then sees one consistent set. Nothing
+    # is kept apart at weight 1, and nothing is read or folded then
+    apart = [m for m in reg if getattr(m, "_split_hist_pf", None) is not None]
+    if apart:
+        w_pf = hist_prefill_weight()
+        for m in apart:
+            m._split_hist_fold(w_pf)
     budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 64))
     total = 0
     for m in reg:
@@ -393,6 +438,11 @@ def trellis_rate(tile_width: int):
 
 class BlockSparseMLP_CPU:
 
+    # Dynamic placement: selections of prefill-size batches since the last sweep, kept apart
+    # from _split_hist (made on first use, _split_hist_apart) while the prefill weight is not 1,
+    # until the sweep folds them in with their weight (hist_prefill_weight, _split_hist_fold)
+    _split_hist_pf = None
+
     def _cpu_init_state(self):
         self._split_spares = 0
         self._split_pending = None
@@ -491,6 +541,7 @@ class BlockSparseMLP_CPU:
             mp = [r if r < first - spares else first + (r - (first - spares)) for r in range(self.num_experts)]
             self._split_map = torch.tensor(mp, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
+            self._split_hist_pf = None
             self._split_selcpu_t = None
             self._swap_tick_count = 0      # steps since the last placement sweep (the sweep zeroes it)
             self._split_step_count = 0     # steps since load: the profile save gates on this one
@@ -540,6 +591,7 @@ class BlockSparseMLP_CPU:
                     reg.remove(self)
                 self._split_map = None
                 self._split_hist = None
+                self._split_hist_pf = None
                 self._split_pending = None
                 self.config.infer_params.moe_cpu_promote_state = None
         if self.cpu_offload:
@@ -561,7 +613,9 @@ class BlockSparseMLP_CPU:
         the flag waits land AFTER the caller's GPU expert work (cpu_split_combine collects);
         big prefill batches take the single-phase streamed path, which overlaps internally.
         Expert ids ship in the worker's local range with -1 sentinels for GPU-resident
-        picks."""
+        picks. The selections of a prefill-size batch, from whichever thread, are the ones a
+        prefill weight applies to (_split_hist_apart): the decode-size paths count into
+        _split_hist, the fused issue in its kernel."""
         if self._split_map is not None:
             self._split_submit_rows = bsz
             self._split_swap_tick()
@@ -587,17 +641,21 @@ class BlockSparseMLP_CPU:
             sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
-        sel_cpu = self._split_translate(selected_experts)
+        sel_cpu = self._split_translate(selected_experts, prefill = True)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 
-    def _split_translate(self, selected_experts):
+    def _split_translate(self, selected_experts, prefill = False):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
         in-place physical-slot translate -- the bsz-1 routing statics are read by captured
         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
-        GPU-resident picks); the static split is a tail offset."""
+        GPU-resident picks); the static split is a tail offset. The hits of a prefill-size
+        batch go where _split_hist_apart says."""
         if self._split_map is None:
             return (selected_experts - self.cpu_split_first).clamp_min(-1)
+        hist = self._split_hist_apart() if prefill else None
+        if hist is None:
+            hist = self._split_hist
         n = selected_experts.numel()
         buf = self._split_selcpu_t
         if current_lane():
@@ -609,9 +667,32 @@ class BlockSparseMLP_CPU:
                 max(n, 64), dtype = torch.long, device = selected_experts.device)
         sel_cpu = buf[:n].view(selected_experts.shape)
         ext.moe_split_map(
-            selected_experts.view(-1), self._split_map, self._split_hist,
+            selected_experts.view(-1), self._split_map, hist,
             buf[:n], self.cpu_split_first)
         return sel_cpu
+
+    def _split_hist_apart(self):
+        """
+        The histogram a prefill-size batch's selections are counted in when they are kept apart
+        from _split_hist: _split_hist_pf, made on first use (a layer's batches of that size come
+        from one thread at a time: the generator's, the prefill thread's, or the pipeline lane of
+        the layer's card). None, and they go to _split_hist as upstream's, while the prefill
+        weight is 1 (hist_prefill_weight, read here at every such batch so the weight in force
+        decides, whenever it was set) or under promote-on-miss: the first registered split
+        module has spare GPU slots, and _split_swap_tick steps promotions instead of sweeping.
+        Promote decays and snapshots _split_hist at every step and reads the routes of a step
+        from it; nothing would fold a second histogram in.
+        """
+        if hist_prefill_weight() == 1.0:
+            return None
+        reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
+        if reg and getattr(reg[0], "_split_spares", 0):
+            return None
+        pf = self._split_hist_pf
+        if pf is None:
+            with torch.inference_mode():
+                pf = self._split_hist_pf = torch.zeros_like(self._split_hist)
+        return pf
 
     def cpu_offload_issue(self, shape, y, selected_experts, routing_weights, params):
         """Whole-layer offload: the routed sum (of the given shape) comes entirely from the
@@ -997,6 +1078,25 @@ class BlockSparseMLP_CPU:
 
     def _split_sweep_layer_reset(self):
         self._swap_tick_count = 0
+
+    def _split_hist_fold(self, weight: float):
+        """Add the prefill-size batches' selections counted apart since the last sweep to the
+        histogram the sweep ranks the experts by, `weight` each (0: they do not count), and
+        start over. run_pending_swap_sweeps calls it for every layer before it sweeps any."""
+        pf = self._split_hist_pf
+        if pf is None or self._split_hist is None:
+            return
+        if weight > 0:
+            self._split_hist.add_(pf, alpha = weight)
+        pf.zero_()
+
+    def split_hits(self):
+        """(_split_hist, the selections of prefill-size batches counted apart since the last
+        sweep), two (E,) tensors in router order: the second is zeros when nothing is counted
+        apart. Every selection is one in either, whatever its weight in the placement; the first
+        also holds what earlier sweeps folded in, at their weight, and decayed."""
+        pf = self._split_hist_pf
+        return self._split_hist, (pf if pf is not None else torch.zeros_like(self._split_hist))
 
     def _split_sweep_layer(self, budget):
         """One placement sweep for this layer: repeatedly swap the hottest CPU-resident
