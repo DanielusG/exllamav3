@@ -34,8 +34,8 @@ What follows from one stream for two threads:
   - A kernel sequence that goes through a buffer baked into a module at load time (the decode
     graphs and their statics, the fused decode kernels' scratch) is safe only against passes
     that never take the same path. Passes on different lanes must differ in kind: decode-sized
-    on lane 0 (at most 8 rows x tokens), prompt chunks of at least a page on the other. Whoever
-    runs the lanes keeps to that (Generator._prefill_round).
+    on lane 0 (at most 8 rows x tokens), prompt chunks above the decode-size batches on the
+    other. Whoever runs the lanes keeps to that (Generator._prefill_round).
   - A lane's thread enters inference mode itself: grad mode is per thread.
 """
 
