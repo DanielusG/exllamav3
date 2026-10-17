@@ -626,10 +626,130 @@ without the compiled extension.
 The bench of the v1.5.4 branches (`experiments/prefill_bench.py`, its phase `pipe`) is not on
 this branch.
 
+### A checkpoint that follows the answer (`Generator(recurrent_tail_checkpoint = True)`, `EXL3_TAIL_CHECKPOINT=1`)
+
+Off by default; with it off the generator behaves as upstream. For models with recurrent states
+(Qwen3.8-Flash-Next: 36 of 48 layers). In the server: `--recurrent-tail-checkpoint` (rule 25 of
+its `AGENTS.md`), asked for only of a library whose `Generator` takes the argument; its tracker
+reads `RecurrentCache.metrics["stash_replaced"]` to tell a replacement from a loss.
+
+**What upstream does.** A cached prompt is resumable only from a page that has a stashed
+recurrent state. Prompt ingestion stashes one at the prompt's last page boundary (a pass of
+its own for it); generation stashes one every `recurrent_checkpoint_interval` tokens counted from
+the end of the cached prefix, and one when a job is requeued. **Nothing is stashed when a job
+ends** (1.6.2's disk tier writes the last checkpoint of each chain at idle, but it makes none).
+The next turn of the conversation, whose prompt is the old prompt plus the answer plus the new
+message, therefore resumes at the old prompt's last page and reads the whole answer again,
+although its K/V pages are in the cache (three days of production on the v1.5.4 base: one
+prefill token in nine, 2460 turns of 636 tokens on average).
+
+**What the switch does.** While a job generates, one more checkpoint is kept, at the last page
+boundary it has crossed (`Job.is_tail_boundary`, read by `is_checkpoint_boundary`, so a draft is
+cut there as at any other checkpoint). When it moves on a page, the checkpoint of the page
+before is taken out first (`RecurrentCache.discard`, counted in `stash_replaced`): the cache
+holds one of them per job and never has to make room for it, which matters to a cache with a
+disk tier below, where an eviction is a file written. A regular checkpoint due where the tail
+one would move takes its place and stays, as upstream's. The job that ends leaves
+its tail checkpoint behind, flagged (`"tail": True` in the stashed dict, given by
+`RecurrentCache.put(key, state, tail = True)`).
+
+A job whose state was resumed from a flagged checkpoint (`Job.resumed_from_tail`) has a client
+that sends answers back as they were, so it also gives up the checkpoint of its own prompt's
+last page when its first tail checkpoint comes: a turn then leaves one checkpoint, the answer's
+instead of the prompt's, and the count per turn is upstream's. A job that did not resume from
+one keeps both (the first turn of a conversation, or a client that rewrites the answer, e.g. by
+dropping the reasoning: for that client the tail checkpoint is never used, and costs its
+stashes and one more checkpoint per turn for nothing).
+
+A job discards only checkpoints it stashed itself under a key the cache did not have, in RAM or
+on disk (`Job._stash_with_tail`). A key that is there already is someone else's checkpoint of
+the same text (generated again, or by a twin job): the tail checkpoint is not stashed over it
+(the one in RAM is touched, as a regular put would), and a prompt's last-page checkpoint that
+was there is not given up. So whatever the disk tier holds under a key a job tracks came from
+that job's stash, and it can go with it.
+
+`gen.tail_checkpoint_interval` is the distance in tokens (a page; a multiple of it to stash
+less often, 0 = off) and is read at every step; a tail checkpoint still outstanding when it is
+switched off goes at the job's next regular checkpoint. `gen.tail_stats` counts the stashes, the
+checkpoints taken out of RAM for them, the seconds spent stashing, and what the disk tier held
+of the ones taken out (`disk_withdrawn`, `disk_dropped`, `disk_left`, below).
+
+**What changed with 1.6.2.** The fork's checkpoint was written against 1.5.4; on this base:
+
+- *The release path.* 1.6.2 hands a stash back through `RecurrentCache._release`: the host pool
+  gets its buffers, the tensor-parallel ranks drop their copies (one handle per side of a
+  `PairedState` stash, target and draft), and the release waits while the disk tier still
+  writes the stash (`release_after_write`). `discard` goes through it like an eviction (the
+  v1.5.4 branch gave the buffers to the pool at once and read a top-level `tp_handle`, which a
+  paired stash does not have) and recounts the size as `prune_stranded` does.
+- *The persistent disk tier* (`generator/disk_cache.py`). A checkpoint there is a write candidate
+  until its anchor page is on disk (`state_candidates`), a write queued or under way
+  (`pending_states`), or a file (`states`). A replaced tail checkpoint is one nobody asked to
+  keep, so before the release, under the tier's lock (`RecurrentCache._discard_on_disk`): a
+  candidate is withdrawn (else `release_after_write` would write it if its page had landed,
+  or count it in `state_candidates_dropped`, which the server's tracker reads), a write still in
+  the queue is taken back as `DiskPageCache.rekey_state` takes one back (`disk_withdrawn` for
+  both), a file is removed (`disk_dropped`; also when the RAM copy had been evicted before, its
+  file written then: `discard` returns False and `stash_replaced` does not move, nothing left
+  RAM for it). A write the writer thread has started, or that the ranks of a tensor-parallel
+  side are doing, cannot be taken back (`disk_left`): the release waits for it and the file
+  stays, for `prune_states` (which keeps it if it is `min_state_distance` past the checkpoint
+  kept below it). In the steady state none of that is written: write-behind queues no page
+  within two of the position, so a tail checkpoint has moved on before its page reaches the disk
+  and its candidate is withdrawn. A file is written at once when the page is on disk already (the
+  same text again) or when upstream's `rekey` moves the checkpoint (below). The idle flush
+  (`flush_cache_to_disk`) writes the checkpoint a job left, as the last of its chain, whatever its
+  spacing: what the next turn resumes from, also after a restart.
+- *The flag through the disk tier.* A checkpoint whose page is on disk is laid out for writing
+  inside `put`, so the flag is set there, before anything reads the stash (the v1.5.4 branch set
+  it after `put` returned: such a file would have lost it). The tier keeps a stash's top-level
+  ints in the file's header (`top` for a paired stash, the side's `ints` for a bare one) and
+  `read_state` puts them back, so a job resuming from a copy read back from disk knows it was a
+  tail checkpoint. A file written by a process without the switch has no flag: such a checkpoint
+  counts as a regular one.
+- *Keys.* 1.6.2 has `RecurrentCache.has(key)` (RAM or disk) and `rekey(old, new)`, which `Job`
+  calls when a page that completed during a banned-string hold gets its content hash: it moves
+  the RAM entry only when there is none under the new hash, and writes the stash under the new
+  hash on disk (`rekey_state`). The job's tracked keys follow only a move that happened; onto a
+  key the disk had already, the moved checkpoint is left to the cache like any other (the copy
+  on disk is not this job's). A stash under a random hash is never written by the tier.
+- *Paired states and fp16.* The stash is `{position, checkpoint_size, target, draft}` (the draft
+  side is absent with an MTP head, which has no recurrent layers); the size accounting is the
+  cache's own (`update_total_size`, by stash, whatever the sides' dtype).
+- *With the other fork features.* A tail checkpoint is offered where every checkpoint is
+  (`Generator.recurrent_checkpoint`, on the generator's thread, as `discard` and its disk side
+  are): a job of the staggered group in flight, or with a prompt chunk under way on the prefill
+  thread or in the pipeline, is passed over and offered it at rest, at the same position. The
+  pipeline asks `is_checkpoint_boundary(at = end)` of a position a chunk would end at, and the
+  tail boundary answers for that position (`_pipe_ahead` does not plan ahead for a job that has
+  generated tokens anyway; a banned-string replay is one). `NonFiniteLogits` comes on a job's
+  first token, before any tail checkpoint. A hybrid draft's long verification pass is cut at
+  every tail boundary too (production runs MTP alone).
+
+Differences from the v1.5.4 branch besides the above: a key already in the cache is not taken
+over (the v1.5.4 branch flagged it and could later discard another job's checkpoint); a replay
+that comes back to the job's own tail checkpoint keeps it as the job's.
+
+**Measured on the v1.5.4 base** (2026-10-11, on the production model in the exact form of the
+check, a prompt of 8.1k tokens and a forced answer of 1100, two rounds each way): generation
+56.0 -> 55.7 tok/s (-0.7%), four stashes of 25 ms, the probabilities of the forced tokens
+identical; the next turn resumes 768 tokens later (264 to read instead of 1032) and has its
+first token in 0.88 s instead of 1.62. Not yet run on this base, where a stash is a different
+size (fp16 states by default) and the disk tier is upstream's: the checks to make first are the
+next turn's resume point with the disk tier on, its writes per turn (`tail_stats`, the tier's
+`state_writes`), and the same forced-token check. Not seen on either base: real traffic, several
+jobs at once, the staggered decode together with it.
+
+Tests: `tests/test_tail_checkpoint.py` (no GPU, no extension: the job's real rules and the real
+checkpoint cache over a stub job; upstream's `DiskPageCache`, writer thread and index, over a
+stand-in for the CPU page tier, for every state a discarded checkpoint can be in on disk, the
+idle flush and the flag through a new process; upstream's `rekey`; the generator's checkpoint
+offer beside a group in flight and a chunk under way; the switch). Marked `nogpu`; run with
+`--noconftest` without the compiled extension.
+
 ### Still to come
 
 Ported from the v1.5.4 branches in the steps after this one, each into a section of its own:
 
-- a recurrent checkpoint that follows the answer (`recurrent_tail_checkpoint`);
 - expert placement weighted on the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`);
 - page-cache hygiene in the disk tier (`generator/disk_cache.py`).
