@@ -339,6 +339,19 @@ class DiskPageCache:
             "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
         }
 
+        # Fork: page-cache hygiene (EXL3_DISK_CACHE_UNCACHE=1, off by default; FORK.md). What this tier writes
+        # comes from a CPU-tier slot or a stash buffer and what it reads goes into one, so the kernel's copy
+        # of the file in its page cache is a second copy of bytes already in system memory, and it pushes
+        # other files' pages (and, behind them, anonymous memory) out. With the switch on, a file written by
+        # this process is synced and dropped from the page cache before it is published, and a file read by
+        # this process is dropped after the read (_uncache_file). Tensor-parallel transfers, which the ranks
+        # write and read, are left as they are. Read here, once; the attribute can be changed at run time
+        self.uncache = os.environ.get("EXL3_DISK_CACHE_UNCACHE", "0") not in ("", "0")
+        self.uncache_stats = {"writes": 0, "reads": 0, "sync_s": 0.0, "errors": 0}
+        self._uncache_warned = False
+        if self.uncache and not hasattr(os, "posix_fadvise"):
+            logger.warning("Disk cache tier: EXL3_DISK_CACHE_UNCACHE has no effect on this platform (no posix_fadvise)")
+
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
         self._queue = deque()
@@ -1296,6 +1309,43 @@ class DiskPageCache:
             pass
 
 
+    def _uncache_file(self, f, written: bool):
+        """
+        Fork (EXL3_DISK_CACHE_UNCACHE): drop the file open as `f` from the page cache, the whole file. After a
+        write (writer thread, before the rename that publishes the file) the data is synced first:
+        POSIX_FADV_DONTNEED leaves dirty pages where they are. fdatasync works on the inode, so it also covers
+        the header and tokens written through the descriptor of _create_page_file / _create_state_file. After a
+        read (a reader thread, or the main thread for a checkpoint) the pages are clean and only dropped.
+
+        Raises nothing of its own: an OSError of the sync or of the advice is counted in uncache_stats, logged
+        once, and the file is published as without the switch (upstream does not sync, so it would not have
+        seen the error either). What it can raise is a write error of the flush of Python's buffer, which the
+        close would raise without the switch. Without posix_fadvise (Windows, macOS) nothing is done, and
+        without fdatasync os.fsync takes its place.
+        """
+        fadvise = getattr(os, "posix_fadvise", None)
+        if fadvise is None:
+            return
+        if written:
+            # Python's buffer, if anything is left in it; a write error surfaces here as it would at close()
+            f.flush()
+        try:
+            fd = f.fileno()
+            if written:
+                t0 = time.perf_counter()
+                getattr(os, "fdatasync", os.fsync)(fd)
+                self.uncache_stats["sync_s"] += time.perf_counter() - t0
+            fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            self.uncache_stats["writes" if written else "reads"] += 1
+        except OSError as e:
+            self.uncache_stats["errors"] += 1
+            if not self._uncache_warned:
+                self._uncache_warned = True
+                logger.warning(f"Disk cache tier: page cache not dropped after a {'write' if written else 'read'} "
+                               f"({e}); the file is kept as without EXL3_DISK_CACHE_UNCACHE, later failures are "
+                               f"only counted")
+
+
     def _do_write_page(self, conn, phash, prev_hash, tokens_bytes, slot, events, size, markers = None):
         for ev in events:
             ev.synchronize()
@@ -1317,6 +1367,10 @@ class DiskPageCache:
             with open(tmp, "r+b") as f:
                 f.seek(data_offset)
                 f.write(memoryview(slab.numpy()))
+                if self.uncache and markers is None:
+                    # Fork: the file is complete (header and tokens above, the image here); synced and out of
+                    # the page cache before the rename publishes it
+                    self._uncache_file(f, written = True)
         if markers is not None:
             # The ranks' chunks are still landing; finished by _poll_tp_waits
             self._tp_waits.append(("page", phash, markers, (prev_hash, size, tmp, path)))
@@ -1400,6 +1454,10 @@ class DiskPageCache:
             for offset, tensor in layout["local"]:
                 f.seek(data_offset + offset)
                 f.write(_raw(tensor))
+            if self.uncache and layout["markers"] is None:
+                # Fork: every tensor of the checkpoint is in; synced and out of the page cache before the
+                # rename publishes it
+                self._uncache_file(f, written = True)
         if layout["markers"] is not None:
             self._tp_waits.append(("state", phash, layout["markers"], (tmp, path, size, stashed.get("position", 0))))
             return
@@ -1467,6 +1525,10 @@ class DiskPageCache:
                     f.seek(meta["image_offset"])
                     if f.readinto(memoryview(slab.numpy())) != self.local_bytes:
                         raise ValueError("short read")
+                    if self.uncache and not self.tp_groups:
+                        # Fork: the image is in the slot (the checksum below is computed over the slot); the
+                        # file, header included, out of the page cache. With TP the ranks read the same file
+                        self._uncache_file(f, written = False)
                 crc = meta.get("crc32")
                 if crc is not None and zlib.crc32(memoryview(slab.numpy()), zlib.crc32(tokens.numpy().tobytes())) != crc:
                     raise ValueError("checksum mismatch")
@@ -1529,6 +1591,10 @@ class DiskPageCache:
                                 tensors.append(tensor)
                             d[inverse.get(key, key)] = unpack_stash(entry["struct"], tensors)
                     sides_out[side] = d
+                if self.uncache and not any(self._side_is_tp(side) for side in meta["sides"]):
+                    # Fork: every tensor is in its pooled buffer; the file out of the page cache. A
+                    # tensor-parallel side's ranks read the same file: left alone
+                    self._uncache_file(f, written = False)
             if markers:
                 deadline = time.time() + 120
                 while not all(os.path.exists(m) or os.path.exists(m + ".err") for m in markers):
