@@ -145,8 +145,11 @@ stall the first card at its first MoE layer until the second card is done.
 Tests: `tests/test_stagger_decode.py` (no GPU, no extension: toy model on two pretend cards, stub
 jobs; tokens of a staggered run must equal those of a regular one). The toy's recurrent layers
 stage a speculative pass's inputs once for every pass and replay them in the rewind, as 1.6.2's
-do. Marked `nogpu`; upstream's `tests/conftest.py` imports the package, so without the compiled
-extension run it with `--noconftest` (the file then loads the sources it tests on their own).
+do, and `test_the_library_still_stages_what_the_hold_copies` reads off the library's sources the
+points the hold depends on (run it before taking a newer upstream: a library that staged
+elsewhere would leave the hold copying nothing). Marked `nogpu`; upstream's `tests/conftest.py`
+imports the package, so without the compiled extension run it with `--noconftest` (the file then
+loads the sources it tests on their own).
 
 The bench of the v1.5.4 branches (`experiments/stagger_bench.py`, `tests/test_stagger_bench.py`)
 is not on this branch.

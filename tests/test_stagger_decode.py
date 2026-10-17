@@ -809,6 +809,48 @@ def test_held_scan_inputs_are_handed_back_after_sampling():
             assert all(conv is not b for b in held)
 
 
+def _method_source(path: str, cls: str, name: str) -> str:
+    import ast
+    with open(path) as f:
+        src = f.read()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == name:
+                    return ast.get_source_segment(src, item)
+    raise AssertionError(f"{cls}.{name} not found in {path}")
+
+
+def test_the_library_still_stages_what_the_hold_copies():
+    """_stagger_hold_spec finds the layer states to copy by their attributes, so a library that
+    staged its scan inputs elsewhere would leave the hold silently copying nothing. Read off the
+    sources: the staging buffers, the rows a pass of (bsz, seqlen) stages (from row 0, row-major),
+    the record of its shape, and the replay reading the same buffers; no other module stages."""
+    mods = os.path.join(REPO, "exllamav3", "modules")
+    gdn = os.path.join(mods, "gated_delta_net.py")
+    tensors = _method_source(gdn, "GDNLayerState", "_tensors")
+    assert "[self.conv_state, self.recurrent_state, self.spec_conv, self.spec_beta, self.spec_g]" in tensors
+    staged = _method_source(gdn, "GDNLayerState", "staged_views")
+    assert "self.spec_shape = (bsz, seqlen, 1)" in staged
+    for t in ("spec_conv", "spec_beta", "spec_g"):
+        assert f"self.{t}[:n]" in staged
+    replay = _method_source(gdn, "GDNLayerState", "replay_job")
+    assert "assert self.spec_shape == spec_shape" in replay
+    for t in ("spec_conv", "spec_beta", "spec_g"):
+        assert f"self.{t}.data_ptr()" in replay
+    assert "self.device = device" in _method_source(gdn, "GDNLayerState", "alloc")
+    stagers = []
+    for root, _, files in os.walk(mods):
+        for fn in files:
+            if fn.endswith(".py"):
+                with open(os.path.join(root, fn)) as f:
+                    if "def staged_views" in f.read():
+                        stagers.append(fn)
+    assert stagers == ["gated_delta_net.py"]
+    with open(os.path.join(mods, "mamba2.py")) as f:
+        assert "self.layer_state_cls = GDNLayerState" in f.read()
+
+
 def test_the_two_halves_are_issued_in_turn_second_card_first():
     _, g, jobs = run("ab", stagger = True, lengths = {"a": 40, "b": 40})
     log = g.model.log
