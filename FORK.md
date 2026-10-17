@@ -863,8 +863,11 @@ unload). Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
 Off by default; with it off the tier makes upstream's system calls and not one more. For 1.6.2's
 persistent disk tier (`generator/disk_cache.py`, `Generator(disk_cache_dir = ...)`). The
-variable goes in the environment of the process (the server's wrapper); the server reads nothing
-of it. Also in `doc/env_vars.md`.
+variable goes in the environment of the process, before the generator makes the tier. The server
+(branch `migrate-1.6.2`, `openai/disk_tier.py`, `ask_page_cache_hygiene`) puts
+`EXL3_DISK_CACHE_UNCACHE=1` there itself whenever `--disk-cache-dir` is given and the variable is
+not in the environment already (an operator's value, `0` or empty included, is kept), and shows
+the tier's `uncache` and `uncache_stats` on `/status.disk_cache`. Also in `doc/env_vars.md`.
 
 **Why.** The tier writes one file per K/V page (about 4.45 MB on Flash-Next, `pages/<hh>/<phash>.kv`)
 and one per recurrent checkpoint (about 57 MiB with fp16 states, `states/<phash>.rs`), about
