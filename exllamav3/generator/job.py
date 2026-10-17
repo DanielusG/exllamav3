@@ -1384,6 +1384,33 @@ class Job:
         recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
         """
 
+        step = self._prefill_co(results)
+        try:
+            run = next(step)
+            while True:
+                run()
+                run = step.send(None)
+        except StopIteration:
+            pass
+
+
+    def _prefill_co(self, results: list):
+        """
+        prefill() as a coroutine that stops at each chunk's forward passes: it yields a function
+        that runs them (the target model over the chunk, then the draft model's cache update) and
+        is resumed, once that function has returned, to record the chunk: sequence and page
+        positions, page hashes, the checkpoint at the last page boundary, the progress event.
+        Returns without yielding when there is nothing to compute.
+
+        The yielded function touches the model, the caches' tensors of this job's pages and state,
+        and the job's draft carry; nothing of the page table, the recurrent cache or the results.
+        It may therefore run on another thread while this one keeps decoding other jobs
+        (Generator.prefill_thread), as long as nothing else is done to the job in the meantime.
+        Its `tokens` attribute is the length of the chunk.
+        Resume with a results list to have the progress event go there instead (the iterate()
+        call that collects a chunk is not the one that started it).
+        """
+
         if self.time_first_prefill is None:
             self.time_first_prefill = time.time()
 
@@ -1552,62 +1579,69 @@ class Job:
                         ids, self.embeddings, ids.shape[-1]
                     )
 
-                params = {
-                    "attn_mode": "flash_attn",
-                    "block_table": seq.block_index_tensor,
-                    "cache": self.generator.cache,
-                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
-                                        self.recurrent_state.target is not None else None,
-                    "indexed_embeddings": self.embeddings,
-                    "inv_freq": self.alt_rope_freqs,
-                    "mm_span_prefix": mm_span_prefix,
-                }
-                if self.generator.draft_model:
-                    params.update(self.generator.draft_model.draft_verifier_params)
-                if self.generator.mtp_draft:
-                    # MTP needs the target's post-final-norm state for every prompt token.
-                    # Normal prefill stops at the last cache-writing layer, before final norm.
-                    params["last_tokens_only"] = 1
-                    self.generator.model.forward(input_ids = prefill_ids, params = params)
-                else:
-                    self.generator.model.prefill(input_ids = prefill_ids, params = params)
-
-                if self.generator.dflash_draft:
-                    self.generator.draft_model.update_kv_from_target(
-                        target_hidden = params.get("export_states"),
-                        cache = self.generator.draft_cache,
-                        params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
-                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
-                                                and self.recurrent_state.draft is not None else None,
-                        }
-                    )
-                elif self.generator.draft_model:
+                def run():
+                    params = {
+                        "attn_mode": "flash_attn",
+                        "block_table": seq.block_index_tensor,
+                        "cache": self.generator.cache,
+                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                        "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
+                                            self.recurrent_state.target is not None else None,
+                        "indexed_embeddings": self.embeddings,
+                        "inv_freq": self.alt_rope_freqs,
+                        "mm_span_prefix": mm_span_prefix,
+                    }
+                    if self.generator.draft_model:
+                        params.update(self.generator.draft_model.draft_verifier_params)
                     if self.generator.mtp_draft:
-                        target_hidden = params.get("export_states")[-1]
-                        carry_hidden = seq.mtp_carry_hidden
-                        if carry_hidden is None:
-                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
-                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
-                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
-                        self.mtp_last_hidden = seq.mtp_carry_hidden
+                        # MTP needs the target's post-final-norm state for every prompt token.
+                        # Normal prefill stops at the last cache-writing layer, before final norm.
+                        params["last_tokens_only"] = 1
+                        self.generator.model.forward(input_ids = prefill_ids, params = params)
                     else:
-                        shifted_hidden = None
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
-                                                and self.recurrent_state.draft is not None else None,
-                        }
-                    )
+                        self.generator.model.prefill(input_ids = prefill_ids, params = params)
+
+                    if self.generator.dflash_draft:
+                        self.generator.draft_model.update_kv_from_target(
+                            target_hidden = params.get("export_states"),
+                            cache = self.generator.draft_cache,
+                            params = {
+                                "block_table": seq.block_index_tensor,
+                                "cache_seqlens": params["cache_seqlens"],
+                                "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                    and self.recurrent_state.draft is not None else None,
+                            }
+                        )
+                    elif self.generator.draft_model:
+                        if self.generator.mtp_draft:
+                            target_hidden = params.get("export_states")[-1]
+                            carry_hidden = seq.mtp_carry_hidden
+                            if carry_hidden is None:
+                                carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                            shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                            seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                            self.mtp_last_hidden = seq.mtp_carry_hidden
+                        else:
+                            shifted_hidden = None
+                        self.generator.draft_model.prefill(
+                            input_ids = prefill_ids,
+                            params = {
+                                "target_hidden": shifted_hidden,
+                                "attn_mode": "flash_attn",
+                                "block_table": seq.block_index_tensor,
+                                "cache": self.generator.draft_cache,
+                                "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                                "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                                "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                    and self.recurrent_state.draft is not None else None,
+                            }
+                        )
+
+                # (for whoever decides where the chunk runs: Generator._prefill_round)
+                run.tokens = prefill_ids.shape[-1]
+                sent = yield run
+                if sent is not None:
+                    results = sent
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the

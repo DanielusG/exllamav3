@@ -22,6 +22,7 @@ own, with the rest of the package stubbed.
 import importlib.util
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -96,6 +97,7 @@ def _load_stubbed():
     ru_mod = real("cache.recurrent_util")
     rc_mod = real("cache.recurrent")
     fc_mod = real("model.forward_cursor")
+    real("util.lane")
     gen_mod = real("generator.generator")
     return gen_mod, fc_mod, ru_mod, rc_mod
 
@@ -191,6 +193,8 @@ class ToyState:
 
     def rewind(self, n):
         if self.last_history > 0 and n > 0:
+            if self.model.rewind_hook is not None:
+                self.model.rewind_hook()
             prefix = self.last_history + 1 - n
             bsz, seqlen, _ = self.spec_shape
             r0 = self.spec_row * seqlen
@@ -253,9 +257,11 @@ class ToyLayer(ToyModule):
         seqlens = params["cache_seqlens"]
         table = params["block_table"]
         history = params.get("recurrent_history")
+        # (stage_prefill: a library that would stage a prompt chunk's inputs as well)
+        stage = history or self.model.stage_prefill
         rows, width = ids.shape
         ls = self.model.layer_states[self.idx]
-        if history:
+        if stage:
             ls.spec_shape = (rows, width, 1)
         out = x.clone()
         for r, state in enumerate(params["recurrent_states"]):
@@ -263,9 +269,10 @@ class ToyLayer(ToyModule):
             toks = ids[r].tolist()
             pos0, page0 = int(seqlens[r]), int(table[r, 0])
             vals = layer_step(state, self.idx, toks, pos0, page0)
-            if history:
+            if stage:
                 for i, t in enumerate(toks):
-                    ls.spec_conv[r * width + i] = torch.tensor([t, pos0 + i, page0])
+                    if r * width + i < ls.ROWS:      # (a prompt chunk's pass is wider than the buffers)
+                        ls.spec_conv[r * width + i] = torch.tensor([t, pos0 + i, page0])
             for i, v in enumerate(vals):
                 out[r, i] = mix(out[r, i], v) % 1000003
         return out
@@ -317,6 +324,15 @@ class ToyModel:
         self.layers = [m.idx for m in self.modules if isinstance(m, ToyLayer)]
         self.layer_states = {m.idx: ToyLayerState(m.device) for m in self.modules if isinstance(m, ToyLayer)}
         self._get_prefetch_layers = []
+        # Prompt chunks (ToyJob with chunk): through the layers' forward, as a prefill pass with
+        # no history (else folded into the states directly); stage_prefill makes the layers stage
+        # such a pass's inputs as they do a speculative one's; rewind_hook runs in a state's rewind
+        # before the replay reads the staged inputs; layer_hook(job, layer, "before" / "after")
+        # around each layer of such a chunk
+        self.chunks_through_layers = False
+        self.stage_prefill = False
+        self.rewind_hook = None
+        self.layer_hook = None
 
     def prepare_inputs(self, input_ids, params):
         return input_ids
@@ -406,13 +422,21 @@ class ToyJob:
     turned into assertions: nothing but its own pass touches a job between the staging of its
     inputs and its sampling."""
 
-    def __init__(self, model, name, prompt, max_new, prefill_iters = 1, rq_at = 0):
+    def __init__(self, model, name, prompt, max_new, prefill_iters = 1, rq_at = 0, chunk = 0):
         self.model = model
         self.name = name
         self.prompt = list(prompt)
         self.max_new = max_new
         self.prefill_iters = prefill_iters
         self.rq_at = rq_at
+        # Prompt tokens ingested per prefill call, 0 for the whole prompt at once
+        self.chunk = chunk
+        # What a test hooks into a chunk's forward passes (the job, start and end position)
+        self.on_chunk = None
+        self.chunk_threads = []
+        self.chunk_planned = False      # a chunk's passes are handed out and not recorded yet
+        self.chunk_running = False
+        self.checkpoints = []
         # A job's own pages, the same in every run
         self.first_page = 1000 * ord(name)
         self.out = []
@@ -435,6 +459,7 @@ class ToyJob:
         self.droppable = False      # clear_queue() may release a job in the middle of its pass
         self.fail_first = None      # raised on the job's first sampled token (as NonFiniteLogits)
         self.requeues = 0
+        self.released = 0
         self._reset(self.prompt)
 
     def _reset(self, ids):
@@ -460,6 +485,8 @@ class ToyJob:
 
     def deallocate_pages(self):
         assert not self.mid_pass or self.droppable, f"{self.name}: pages released during its pass"
+        assert not self.chunk_running, f"{self.name}: pages released while a chunk of its prompt runs"
+        self.released += 1
         if self.recurrent_state is not None:
             self.recurrent_state.free()
             self.recurrent_state = None
@@ -478,27 +505,94 @@ class ToyJob:
 
     def maybe_stash_recurrent(self, cache, interval = None):
         assert not self.mid_pass, f"{self.name}: checkpoint offered during its pass"
+        assert not self.chunk_planned, f"{self.name}: checkpoint offered during a chunk of its prompt"
+        self.checkpoints.append(self.sequences[0].kv_position)
 
     def prefill(self, results):
+        # As Job.prefill: the coroutine, with each chunk's passes run here
+        step = self._prefill_co(results)
+        try:
+            run = next(step)
+            while True:
+                run()
+                run = step.send(None)
+        except StopIteration:
+            pass
+
+    def _prefill_co(self, results):
         assert not self.mid_pass, f"{self.name}: prefill called during its pass"
-        if self.is_prefill_done() and self.prefill_left == 0:
+        assert not self.chunk_planned, f"{self.name}: a chunk planned before the last one was recorded"
+        if self.is_prefill_done():
             return
-        self.prefill_left -= 1
         if self.prefill_left > 0:
-            return
+            self.prefill_left -= 1
+            if self.prefill_left > 0:
+                return
         seq = self.sequences[0]
         n = len(seq.sequence_ids) - 1
+        a = seq.kv_position
+        b = min(n, a + self.chunk) if self.chunk else n
         state = self.recurrent_state.target
-        for layer in self.model.layers:
-            layer_step(state, layer, seq.sequence_ids.ids[:n], 0, self.first_page)
-        state.position = n
-        left = n
-        for page in seq.allocated_pages:
+        tokens = seq.sequence_ids.ids[a:b]
+
+        def run():
+            # The forward passes: the layers' carried values and nothing else
+            self.chunk_running = True
+            self.chunk_threads.append(threading.current_thread().name)
+            try:
+                assert not state.freed, f"{self.name}: a chunk ran on a released state"
+                assert state.position == a, f"{self.name}: state out of step with its chunk"
+                if self.on_chunk is not None:
+                    self.on_chunk(self, a, b)
+                if self.model.chunks_through_layers:
+                    params = {
+                        "input_ids": torch.tensor([tokens], dtype = torch.long),
+                        "cache_seqlens": torch.tensor([a], dtype = torch.int32),
+                        "block_table": seq.block_index_tensor,
+                        "recurrent_states": [state],
+                    }
+                    x = params["input_ids"].clone()
+                    for module in self.model.modules:
+                        if isinstance(module, ToyLayer):
+                            if self.model.layer_hook is not None:
+                                self.model.layer_hook(self, module.idx, "before")
+                            x = module.forward(x, params)
+                            if self.model.layer_hook is not None:
+                                self.model.layer_hook(self, module.idx, "after")
+                else:
+                    for layer in self.model.layers:
+                        layer_step(state, layer, tokens, a, self.first_page)
+                # What the pass writes into the chunk's pages (Job's writes their K/V)
+                for i, t in enumerate(tokens):
+                    page = seq.allocated_pages[(a + i) // PAGE]
+                    page.sequence[0, (a + i) % PAGE] = t
+                state.position = b
+            finally:
+                self.chunk_running = False
+
+        run.tokens = b - a
+        self.chunk_planned = True
+        try:
+            sent = yield run
+        finally:
+            self.chunk_planned = False
+        if sent is not None:
+            results = sent
+
+        # The record; a prompt page that is complete gets its content hash (Job.hash_completed_page)
+        left = b
+        for p, page in enumerate(seq.allocated_pages):
             page.kv_position = min(left, PAGE)
             left -= page.kv_position
-        seq.kv_position = n
-        seq.prefill_complete = True
-        results.append({"job": self, "stage": "prefill", "eos": False, "serial": self.serial_number})
+            if page.kv_position == PAGE and page.phash[:8] == bytes(8):
+                page.phash = b"\x02" * 8 + f"{self.name}:{self.requeues}:{p}".encode()
+        seq.kv_position = b
+        if b == n:
+            seq.prefill_complete = True
+        results.append({
+            "job": self, "stage": "prefill", "eos": False, "serial": self.serial_number,
+            "curr_progress": b, "max_progress": n,
+        })
 
     def get_input_ids_list(self, draft_tokens = None, idx = 0, add_to_cache = False):
         input_ids_list = []
@@ -617,6 +711,20 @@ def make_generator(draft = True, stagger = False, num_draft_tokens = 1, max_batc
     g.max_draft_tokens = g.num_draft_tokens
     g._stagger_init(stagger)
     g.stagger_min_jobs = min_jobs
+    g.prefill_thread = False
+    g.side_min_tokens = PAGE
+    g.side_max_rows = 8
+    g.side_stats = {
+        "chunks": 0, "beside": 0, "decode_steps": 0, "errors": 0,
+        "t_chunks": 0.0, "t_waited": 0.0,
+    }
+    g._side = None
+    g._side_ok = None
+    g._side_why = None
+    g._side_lane = None
+    g._side_pool = None
+    g._side_turn = 0
+    g._side_stretch = None
     g.on_queue_drained = g.pagetable.defrag
     return g
 
