@@ -179,6 +179,7 @@ class RecurrentCache(OrderedDict):
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
             "stash_evictions_live_kv": 0,   # of those, checkpoints whose anchor KV page was still cached
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
+            "stash_replaced": 0,            # checkpoints taken out by discard() (a job's tail checkpoint moving on)
         }
 
 
@@ -213,17 +214,21 @@ class RecurrentCache(OrderedDict):
                 self.disk_tier.rekey_state(old_key, new_key, stashed)
 
 
-    def put(self, key, state):
+    def put(self, key, state, tail: bool = False):
         """
         Add state to cache
+
+        tail: the checkpoint that follows a generating job (Job.maybe_stash_recurrent). The stash is flagged
+        ("tail": True) before anything reads it, the disk tier included, which keeps the flag in the file's
+        header: a job that resumes from it knows, also from a copy read back from disk
         """
         if key in self:
             self.move_to_end(key)
         else:
-            self._insert(key, None, persist = True, state = state)
+            self._insert(key, None, persist = True, state = state, tail = tail)
 
 
-    def _insert(self, key, stashed, persist: bool, state = None):
+    def _insert(self, key, stashed, persist: bool, state = None, tail: bool = False):
         """Make room for a checkpoint, then stash `state` (or take `stashed` as is) under key"""
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
         # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
@@ -261,10 +266,67 @@ class RecurrentCache(OrderedDict):
 
         if state is not None:
             stashed = state.stash()
+            if tail:
+                stashed["tail"] = True
         self[key] = stashed
         self.update_total_size()
         if persist and self.disk_tier is not None and is_content_hash(key):
             self.disk_tier.note_state(key, stashed)
+
+
+    def discard(self, key, stats: dict | None = None) -> bool:
+        """
+        Drop one checkpoint its owner has no more use for (Job.maybe_stash_recurrent: the checkpoint that
+        follows a generating job from page to page leaves the previous page's behind, and a job that resumed
+        from such a checkpoint gives up its prompt's last-page one). Not an eviction: nothing was short of
+        room, and nothing is written for it. Returns whether it was in RAM (counted in stash_replaced); the
+        stash goes back through _release, as an evicted one does.
+
+        The owner discards only a checkpoint it stashed itself under a key the cache did not have, so what
+        the disk tier holds under the key came from that stash, and goes too (_discard_on_disk). `stats`
+        (Generator.tail_stats) counts what happened there.
+        """
+        popped = self.pop(key, None)
+        if self.disk_tier is not None:
+            self._discard_on_disk(key, popped, stats)
+        if popped is None:
+            return False
+        self.metrics["stash_replaced"] += 1
+        self._release(popped)
+        self.update_total_size()
+        return True
+
+
+    def _discard_on_disk(self, key, popped: dict | None, stats: dict | None):
+        """
+        The disk tier's side of discard(), under its lock and before the stash is released (release_after_write
+        would write a candidate whose page has reached the disk): a write candidate is withdrawn, a write still
+        in the queue is taken back as DiskPageCache.rekey_state does (its pending reference goes, and with it a
+        release deferred by an eviction of the RAM copy), a written copy is removed. A write the writer thread
+        has started, or that the ranks of a tensor-parallel side are doing, cannot be taken back: it lands as
+        a file nobody asked to keep, left to the tier's own pruning (prune_states), and the release waits for
+        it as for any write.
+        """
+        disk = self.disk_tier
+        outcome = None
+        with disk._lock:
+            if popped is not None and disk.state_candidates.get(key) is popped:
+                del disk.state_candidates[key]
+                outcome = "disk_withdrawn"
+            elif key in disk.pending_states:
+                outcome = "disk_left"
+                for i, op in enumerate(disk._queue):
+                    if op[0] == "state" and op[1] == key and op[4]["markers"] is None:
+                        del disk._queue[i]
+                        disk.total_size -= op[3]
+                        disk._state_written(key)
+                        outcome = "disk_withdrawn"
+                        break
+            elif key in disk.states:
+                disk._drop("state", key)
+                outcome = "disk_dropped"
+        if outcome is not None and stats is not None:
+            stats[outcome] = stats.get(outcome, 0) + 1
 
 
     def prune_stranded(self) -> int:
