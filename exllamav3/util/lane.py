@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import torch
 
 """
-Lanes: forward passes issued by two threads at the same time.
+Lanes: forward passes issued by more than one thread at the same time.
 
 The library issues one pass at a time from one thread, and what its modules share between
 passes relies on it: workspaces are looked up by device, shape and tag and are safe because a
@@ -37,6 +37,16 @@ What follows from one stream for two threads:
     on lane 0 (at most 8 rows x tokens), prompt chunks above the decode-size batches on the
     other. Whoever runs the lanes keeps to that (Generator._prefill_round).
   - A lane's thread enters inference mode itself: grad mode is per thread.
+
+Two lanes beside lane 0 (Generator.prefill_pipeline): with the layers of a model on two cards a
+prompt chunk is issued in two halves, each by the thread of its card, so that the next chunk is
+on the first card while this one is on the second. Each of the two lanes then has its passes on
+one card only (the MTP head's update follows the second half: on the first card's lane when the
+head is there): its workspaces are that card's, a card still runs one prompt chunk at a time
+beside the decode, and all of the above holds card by card. What the two share that one lane of
+prompt chunks had to itself is in the CPU expert worker's host: the weight-staging slots and the
+stager's ring of the streamed path (model/moe_cpu_host.py: _stage_lock), and the slots, which
+split_lanes(lanes = 3) shares out between the three lanes.
 """
 
 _tls = threading.local()
@@ -67,19 +77,25 @@ def lanes_busy() -> bool:
     return _busy > 0
 
 
+def module_devices(modules) -> list[int]:
+    """Indices of the CUDA devices these modules are on, in order."""
+    found = set()
+    for module in modules:
+        dev = getattr(module, "device", None)
+        if dev is None:
+            continue
+        dev = torch.device(dev)
+        if dev.type == "cuda":
+            found.add(dev.index or 0)
+    return sorted(found)
+
+
 def cuda_devices(*models) -> list[int]:
     """Indices of the CUDA devices the modules of these models are on, in order."""
     found = set()
     for model in models:
-        if model is None:
-            continue
-        for module in getattr(model, "modules", ()):
-            dev = getattr(module, "device", None)
-            if dev is None:
-                continue
-            dev = torch.device(dev)
-            if dev.type == "cuda":
-                found.add(dev.index or 0)
+        if model is not None:
+            found.update(module_devices(getattr(model, "modules", ())))
     return sorted(found)
 
 
