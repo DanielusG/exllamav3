@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import time
+import threading
 import multiprocessing
 from multiprocessing import shared_memory
 import numpy as np
@@ -10,6 +12,7 @@ from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
+from ..util.lane import current_lane, host_waits
 from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
 from .model_tp_cuda import (
     cuda_host_register,
@@ -898,6 +901,16 @@ class MoeCpuHost:
         self.next_slot = 0
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
         self.num_slots = TUNING.num_slots
+        # Lanes (util/lane.py): threads that issue passes at the same time. They share the
+        # sequence counter and the job ring, under _issue_lock, and nothing else: each lane has
+        # its own range of slots and its own rotation in it (split_lanes). None while a single
+        # thread issues everything, which then rotates over all the slots (next_slot).
+        # _handoff: per device, the stream a lane that must not make the pass's stream wait
+        # for the worker issues its copies and flag waits on (_handoff_stream)
+        self._issue_lock = threading.Lock()
+        self._lanes = None
+        self._handoff = {}
+        self._handoff_held = {}
         self.cap_rows = TUNING.cap_rows
         # Per-component thread override: config.infer_params.moe_cpu_threads for the main model,
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
@@ -1270,6 +1283,105 @@ class MoeCpuHost:
 
         threading.Thread(target = wd, daemon = True).start()
 
+    def split_lanes(self, decode_slots = 2):
+        """
+        Reserve the first decode_slots slots for lane 0 and give the rest to lane 1, for a
+        second thread that issues passes beside the first (Generator.prefill_thread). Returns
+        the two slot counts, or None when there are too few slots to split (EXL3_MOE_CPU_SLOTS).
+
+        A slot's next tenant waits, on its stream, for the previous tenant's output to have been
+        read back (the consumed flag), and a pass that issues more jobs than there are slots
+        reads the oldest one back before it takes that slot again (_issue_compute). Both hold
+        only if nobody else takes slots out of the same rotation in between: with two threads on
+        one rotation a job lands in a slot whose previous tenant, issued by the same thread, is
+        read back further down the same stream, and that stream waits for itself. Hence a range
+        of slots per lane. The worker is not concerned: it takes the slot of a job from the
+        job's descriptor.
+
+        To be called between two modules of a pass at the earliest, by the thread that issues
+        them: the slots change hands with their last tenants already read back in stream order.
+        """
+        if self._lanes is not None:
+            return self._lanes[0][1], self._lanes[1][1]
+        d = min(decode_slots, self.num_slots - 1)
+        if d < 1:
+            return None
+        self._lanes = {0: [0, d, 0], 1: [d, self.num_slots - d, 0]}
+        return d, self.num_slots - d
+
+    def _lane_slots(self):
+        """Slots the calling thread's lane rotates over."""
+        if self._lanes is None:
+            return self.num_slots
+        return self._lanes[current_lane()][1]
+
+    def _take_slot(self):
+        """Next slot of the calling thread's lane (a lane is one thread: no lock)."""
+        if self._lanes is None:
+            slot_idx = self.next_slot
+            self.next_slot = (self.next_slot + 1) % self.num_slots
+        else:
+            lane = self._lanes[current_lane()]
+            slot_idx = lane[0] + lane[2]
+            lane[2] = (lane[2] + 1) % lane[1]
+        return slot_idx
+
+    def _publish(self, layer_idx, rows, topk, kind, slot_idx):
+        """
+        Take a sequence number and publish the job's descriptor (host-visible before the GPU
+        can publish the data flag); returns the sequence number. Throttles against ring
+        overflow: a long prefill enqueues every job of the pass with no host sync, and
+        overwriting unconsumed descriptors corrupts the whole stream.
+
+        The caller holds _issue_lock and keeps it until the write of the job's data flag is
+        enqueued. The worker serves the ring in order and waits for the data flag of the job
+        at its head: with two threads publishing, a descriptor whose flag write is not
+        enqueued yet could be overtaken by the other thread's whole pass, down to a host wait
+        for kernels that sit behind a job the worker will never reach. The lock also keeps the
+        ring's tail whole: this reads it and writes it back one higher several bytecodes later,
+        and the fused decode issue (submit_issue_fused) does the same inside the extension.
+        """
+        self.seq += 1
+        seq = self.seq
+
+        tail = int(self.v_jobs_tail[0])
+        if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+            while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                if self.v_abort[0] or not self.proc.is_alive():
+                    raise RuntimeError("CPU MoE worker failed (ring stall)")
+                time.sleep(0.0002)
+        job = self.v_jobs[tail % MOE_JOB_RING]
+        _set_job_seq(job, seq)
+        job[1] = layer_idx
+        job[2] = rows
+        job[3] = topk
+        job[4] = slot_idx
+        job[5] = kind
+        self.v_jobs_tail[0] = tail + 1
+        return seq
+
+    def _handoff_stream(self, device):
+        """
+        Stream for the copies and flag waits of the chunked path, for a thread that shares the
+        pass's stream with another lane (util/lane.py: host_waits); None for any other thread,
+        which issues them on the pass's stream as ever.
+
+        The chunked path makes its stream wait for the worker, job after job. On the stream
+        the kernels of both lanes run on, those waits would hold the other lane's kernels for
+        as long as the worker takes. The copies in and out of the slots and the flag memops
+        touch nothing the kernels share, so they go on a stream of their own, tied to the
+        pass's stream by an event at each end: one recorded before the first copy (the inputs
+        are computed), one waited for ON THE HOST after the last readback (_collect_compute),
+        so that what consumes the output is issued once it is there.
+        """
+        if not host_waits():
+            return None
+        key = torch.device(device).index or 0
+        hs = self._handoff.get(key)
+        if hs is None:
+            hs = self._handoff[key] = torch.cuda.Stream(device = device)
+        return hs
+
     def begin_pass(self):
         if not self.started:
             self.ensure_started()
@@ -1362,26 +1474,29 @@ class MoeCpuHost:
         if counts is None:
             counts = self.dev_count[dev] = \
                 torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
-        slot_idx = self.next_slot
-        self.next_slot = (self.next_slot + 1) % self.num_slots
-        self.seq += 1
-        seq = self.seq
+        slot_idx = self._take_slot()
         slot = self.slots[slot_idx]
         # One extension call: the job descriptor into the shared ring, the slot's consumed wait,
         # the issue kernel and the data_ready flag, all on the stream of y's device. It declines
         # (touching nothing) only when the job ring is near overflow, which a long prefill can
-        # reach; then throttle on the worker's progress and retry
-        args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
-                selected_experts.view(-1), split_map, split_hist, y, routing_weights,
-                slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
-                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
-        if not ext.exl3_moe_split_issue_fused(*args):
-            import time
-            while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                if self.v_abort[0] or not self.proc.is_alive():
-                    raise RuntimeError("CPU MoE worker failed (ring stall)")
-                time.sleep(0.0002)
-            ext.exl3_moe_split_issue_fused(*args)
+        # reach; then throttle on the worker's progress and retry. Under _issue_lock, sequence
+        # number included: the extension reads the ring's tail and writes it back one higher
+        # without a lock of its own, and the chunked path of a thread beside this one
+        # (_publish) does the same from Python, where the interpreter may switch threads
+        # between the read and the write
+        with self._issue_lock:
+            self.seq += 1
+            seq = self.seq
+            args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
+                    selected_experts.view(-1), split_map, split_hist, y, routing_weights,
+                    slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
+                    slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
+            if not ext.exl3_moe_split_issue_fused(*args):
+                while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                    if self.v_abort[0] or not self.proc.is_alive():
+                        raise RuntimeError("CPU MoE worker failed (ring stall)")
+                    time.sleep(0.0002)
+                ext.exl3_moe_split_issue_fused(*args)
         self.slot_last_seq[slot_idx] = seq
         return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
 
@@ -1399,8 +1514,9 @@ class MoeCpuHost:
         """
         Stage inputs and publish one compute job per cap_rows chunk (descriptors, D2H copies
         and data_ready flags only). Waits and readbacks are deferred to _collect_compute so
-        other GPU work can be enqueued in between. BUT! Only up to num_slots jobs deep: a
-        deeper batch inline-collects the (i - num_slots)-th job before reusing its slot.
+        other GPU work can be enqueued in between. BUT! Only up to num_slots jobs deep (the
+        slots of the calling thread's lane): a deeper batch inline-collects the
+        (i - num_slots)-th job before reusing its slot.
         Without the window, slot reuse inside one batch waits on a consumed flag whose write
         (in the deferred collect) sits BEHIND the wait on the same stream (an in-stream
         deadlock (second-prompt freeze)) and even under the old done-flag gating the
@@ -1417,50 +1533,60 @@ class MoeCpuHost:
         y_pad = torch.nn.functional.pad(y, (0, hi - h_)) if hi != h_ else y
         rtmp = torch.empty((min(self.cap_rows, rows), ho), dtype = torch.float, device = y.device) \
             if ho != h_ else None
+
+        hs = self._handoff_stream(y.device)
+        if hs is None:
+            return self._issue_jobs(layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h), rtmp
+        # The inputs are on their way on the pass's stream: the copies start after them
+        ready = torch.cuda.Event()
+        ready.record()
+        with torch.cuda.stream(hs):
+            hs.wait_event(ready)
+            jobs = self._issue_jobs(layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h)
+        # The copies of the later jobs run when the worker is done with the earlier ones, long
+        # after this returns, and from another stream than the one their sources were made
+        # on. Released here (they are temporaries of this call and of the caller's), the
+        # sources would go back to the allocator, which hands a block out again in the order
+        # of ITS stream: the pass's next kernels would write into memory these copies have
+        # yet to read, and the worker would compute on that. They live until the host has
+        # seen the last readback (_collect_compute)
+        held = self._handoff_held
+        held[id(jobs)] = (jobs, y_pad, sel32, routing_weights)
+        if len(held) > 64:
+            # (a pass that failed between issue and collect never comes back for its entry)
+            del held[next(iter(held))]
+        return jobs, rtmp
+
+    def _issue_jobs(self, layer_idx, y_pad, sel32, routing_weights, spec, out, rtmp, h):
+        """The jobs of _issue_compute, on the current stream."""
+        rows = y_pad.shape[0]
         jobs = []
+        window = self._lane_slots()
         for a in range(0, rows, self.cap_rows):
-            if len(jobs) >= self.num_slots:
+            if len(jobs) >= window:
                 self._collect_one(jobs.pop(0), out, rtmp, h)
             b = min(a + self.cap_rows, rows)
             n = b - a
-            slot_idx = self.next_slot
-            self.next_slot = (self.next_slot + 1) % self.num_slots
-            self.seq += 1
-            seq = self.seq
+            slot_idx = self._take_slot()
             slot = self.slots[slot_idx]
 
-            # Descriptor first (host-visible before the GPU can publish the data flag). Throttle
-            # against ring overflow: a long prefill enqueues every job of the pass with no host
-            # sync, and overwriting unconsumed descriptors corrupts the whole stream
-            tail = int(self.v_jobs_tail[0])
-            if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                import time
-                while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (ring stall)")
-                    time.sleep(0.0002)
-            job = self.v_jobs[tail % MOE_JOB_RING]
-            _set_job_seq(job, seq)
-            job[1] = layer_idx
-            job[2] = n
-            job[3] = spec["topk"]
-            job[4] = slot_idx
-            job[5] = 0    # MOE_JOB_KIND_COMPUTE
-            self.v_jobs_tail[0] = tail + 1
+            with self._issue_lock:
+                # Descriptor first (host-visible before the GPU can publish the data flag)
+                seq = self._publish(layer_idx, n, spec["topk"], 0, slot_idx)    # MOE_JOB_KIND_COMPUTE
 
-            # Serialize on the previous tenant's output having been read back (consumed flag,
-            # written by the collecting stream after its D2H), not merely computed (done flag):
-            # with offloaded layers spread over multiple devices, the previous tenant's collect
-            # may sit queued on a different stream than this issue
-            if self.slot_last_seq[slot_idx]:
-                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx], self.gpu_base_ptr + 128)
-            slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
-            slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
-            slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
-            ext.exl3_moe_flag_write(slot["data_ready"], seq)
+                # Serialize on the previous tenant's output having been read back (consumed flag,
+                # written by the collecting stream after its D2H), not merely computed (done flag):
+                # with offloaded layers spread over multiple devices, the previous tenant's collect
+                # may sit queued on a different stream than this issue
+                if self.slot_last_seq[slot_idx]:
+                    ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx], self.gpu_base_ptr + 128)
+                slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
+                slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
+                slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
+                ext.exl3_moe_flag_write(slot["data_ready"], seq)
             self.slot_last_seq[slot_idx] = seq
             jobs.append((seq, slot_idx, a, b, n))
-        return jobs, rtmp
+        return jobs
 
     def _collect_one(self, job, out, rtmp, h):
         seq, slot_idx, a, b, n = job
@@ -1478,9 +1604,26 @@ class MoeCpuHost:
     def _collect_compute(self, jobs, out, rtmp, h):
         """Wait for each still-pending job and read its output back; the padded width is
         trimmed on the GPU. Jobs beyond the slot count were already collected inline by the
-        issue loop's sliding window. Caller holds the device guard."""
-        for job in jobs:
-            self._collect_one(job, out, rtmp, h)
+        issue loop's sliding window. Caller holds the device guard. On a thread that keeps
+        these waits off the pass's stream (_handoff_stream) the HOST waits here for the last
+        readback: on return the output is complete."""
+        hs = self._handoff_stream(out.device)
+        if hs is None:
+            for job in jobs:
+                self._collect_one(job, out, rtmp, h)
+            return
+        # (blocking: the wait is as long as the worker takes, and a spinning wait would hold a
+        # core the worker's threads and the other lane's host thread can use)
+        done = torch.cuda.Event(blocking = True)
+        try:
+            with torch.cuda.stream(hs):
+                for job in jobs:
+                    self._collect_one(job, out, rtmp, h)
+                done.record(hs)
+            done.synchronize()
+        finally:
+            # Every copy of these jobs has run: their sources may go (_issue_compute)
+            self._handoff_held.pop(id(jobs), None)
 
     def _max_proj_numel(self):
         mx = 0
@@ -2045,8 +2188,12 @@ class MoeCpuHost:
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
-            # Compute the batch on the current stream once the DMA lands
-            torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
+            # Compute the batch on the current stream once the DMA lands. A thread that shares
+            # that stream with another lane waits for the DMA itself instead (util/lane.py)
+            if host_waits():
+                st["wready_ev"][ws].synchronize()
+            else:
+                torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
             vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
