@@ -976,3 +976,64 @@ where the advice drops pages: on tmpfs it skips, so set `EXL3_TEST_DISK_DIR` to 
 directory on a real disk (a subdirectory is made there and removed). Upstream's own
 `tests/cache/test_disk_cache.py` needs CUDA (`CPUPageCache` asserts CUDA cache tensors).
 Marked `nogpu`; run with `--noconftest` without the compiled extension.
+
+## The overnight exact check (`experiments/exact_check.py`)
+
+What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
+`config_bench.py`, `pipeline_probe.py` of `flash-next-placement`), rebuilt for this branch and run
+in one night before production switches to it. An orchestrator (standard library only) starts one
+process per model load (`experiments/exact_check_child.py`: the model loaded by the server's own
+`ModelContainer` from `--server-path`, so the expert split per card is the server's device plan,
+`--moe-device-split`, with its warm start from a copy of the placement file), forces on every
+compared job the tokens a reference run produced, and records at every position an integer digest
+of the raw logits, the forced token's log-probability, the most likely tokens and the MTP head's
+draft counters. A test run is **identical** when every compared position is; otherwise it is judged
+against the same reference run repeated (the noise floor) and, where there is one, a control run.
+
+The seven scenarios: (1) every switch off against stock upstream 1.6.2 (the installed wheel alone,
+in two processes for a floor across processes) and the page files upstream's disk tier writes;
+(2) the staggered decode with 2-5 jobs against each group alone; (3) the prefill thread beside 1-5
+jobs, last chunks of 33-249 tokens; (4) the pipeline: a 33334-token prompt alone and beside a job,
+`EXL3_PREFILL_PIPELINE_HEAD=second`, a cancel mid-ingestion, write-behind and the files read back
+by a new generator, a 179k-token prompt with the memory of the cards; (5) the tail checkpoint on and
+off, the next turn resumed from it in RAM and after a restart from the disk tier (a second process),
+labelled identical or within the noise; (6) the placement weight unset against stock, the same
+sweeps after the same traffic; (7) ten minutes of concurrent traffic with every production switch
+on, a watchdog on every library call (faulthandler: stacks of all threads in the process's
+`hang-stacks.txt`).
+
+What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
+whose sums depend on the arrival order of atomics; read on 1.6.2's sources) in every process but the
+stress, no sweep of the expert placement during the compared runs (the library's
+`run_pending_swap_sweeps` replaced by a no-op after the load: both of its callers read the module's
+global), promote-on-miss off, six CPU worker slots everywhere (`EXL3_MOE_HOST_CORES=0` with the 12
+worker threads, the guide's "12 as today"), the fork's switches from the environment removed. Graphs stay as production runs them (an uncaptured call issues the same
+kernels, `exllamav3_ext/graph.cu`). Nothing is written outside the run directory; its disk cache is
+removed at the end unless `--keep`.
+
+How to run it on the workstation (fish; production stopped first, its graceful stop and then
+`systemctl --user stop exllama-server.service`; the environment and the two worktrees of the
+server's `docs/MIGRAZIONE-1.6.2.md`, steps 3.1-3.3), the plan and the checks first, then the night.
+The dry run writes nothing and touches no card: with production still up it lists production's
+process on the cards as a problem and the rest as it will be.
+
+    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3-1.6.2/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
+    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3-1.6.2/experiments/exact_check.py --out /home/daniele/exl3-exact-check
+
+How long: the dry run's estimate is about 2.5 hours (prefill 700 tokens/s, decode 60 tokens/s for
+one job and 60 x sqrt(n) for n, 5 minutes per model load, never measured; ten loads); a scenario
+gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
+directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
+the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the
+report again from the records. A process whose
+model does not load with the split given is run again with the split the server's error suggests
+(at most `--split-retries` times), which the later processes keep; the report says so.
+
+What the check cannot tell: a difference the digest misses (two rows of logits with the same
+weighted sum of their bits: never for one changed value, about 2**-64 otherwise), a race that does
+not fire in one run, whether the exact mode makes 1.6.2 repeatable (the floors of the first report
+say it), and anything off the paths the scenarios take (images, a decode batch above
+eight rows beside a chunk, tensor parallelism). Tests (no GPU, no extension):
+`tests/test_exact_check.py`, with `--noconftest` (comparisons, floors and controls, plan, estimate,
+report, records, watchdog, orchestration and split retry with a fake child, the child over a fake
+library and server, the Runner and the stress over the toy model of the staggered tests).
