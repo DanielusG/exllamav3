@@ -13,6 +13,7 @@ from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
+from ..model.forward_cursor import ForwardCursor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
@@ -1394,7 +1395,7 @@ class Job:
             pass
 
 
-    def _prefill_co(self, results: list):
+    def _prefill_co(self, results: list, at: int | None = None):
         """
         prefill() as a coroutine that stops at each chunk's forward passes: it yields a function
         that runs them (the target model over the chunk, then the draft model's cache update) and
@@ -1406,9 +1407,22 @@ class Job:
         and the job's draft carry; nothing of the page table, the recurrent cache or the results.
         It may therefore run on another thread while this one keeps decoding other jobs
         (Generator.prefill_thread), as long as nothing else is done to the job in the meantime.
-        Its `tokens` attribute is the length of the chunk.
+        Its `tokens` attribute is the length of the chunk, `end` the position the chunk takes the
+        sequence to, `checkpoint` whether the record stashes a checkpoint there. With the MTP
+        head its `halves` are the same passes in three functions, for a model whose layers are
+        on two cards (Generator.prefill_pipeline): first(stop) issues the pass up to the module
+        at index stop and returns what rest(state) needs to issue what is left of it, which
+        returns what after(state) needs for the head's own update. None otherwise.
         Resume with a results list to have the progress event go there instead (the iterate()
         call that collects a chunk is not the one that started it).
+
+        at: plan the chunk that starts at this position, while the chunk that ends there is
+        still under way (its coroutine not resumed yet), whose run has to be marked `followed`
+        first. The two coroutines are then resumed in the order of their chunks. Only where nothing but the previous chunk stands between the
+        job and this one, which whoever asks sees to (Generator._pipe_ahead): one sequence, a
+        recurrent state whose position no module reads during a pass, no embeddings, no
+        checkpoint due at this position, and a record of the previous chunk that leaves the
+        block table as it is.
         """
 
         if self.time_first_prefill is None:
@@ -1421,9 +1435,13 @@ class Job:
                 continue
 
             cp_pos = self.recurrent_state.position if self.recurrent_state is not None else -1
+            # (planned ahead: the pages before `at` are the previous chunk's, and none of this
+            # chunk's is skipped, as after any chunk of a recurrent model)
+            if at is not None:
+                cp_pos = 0
 
-            prefill_start = seq.kv_position
-            prefill_end = seq.kv_position + self.generator.max_chunk_size
+            prefill_start = seq.kv_position if at is None else at
+            prefill_end = prefill_start + self.generator.max_chunk_size
             prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
@@ -1435,7 +1453,7 @@ class Job:
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
             for local_idx in range(p0, p1):
-                if 0 <= cp_pos <= seq.kv_position:
+                if 0 <= cp_pos <= prefill_start:
                     break
                 page = seq.allocated_pages[local_idx]
                 if page.kv_position == PAGE_SIZE:
@@ -1448,7 +1466,7 @@ class Job:
 
             p0 = prefill_start // PAGE_SIZE
             for local_idx in range(p0, p1):
-                if 0 <= cp_pos <= seq.kv_position:
+                if 0 <= cp_pos <= prefill_start:
                     break
                 page = seq.allocated_pages[local_idx]
                 if page.kv_position == PAGE_SIZE:
@@ -1579,7 +1597,7 @@ class Job:
                         ids, self.embeddings, ids.shape[-1]
                     )
 
-                def run():
+                def chunk_params():
                     params = {
                         "attn_mode": "flash_attn",
                         "block_table": seq.block_index_tensor,
@@ -1597,10 +1615,9 @@ class Job:
                         # MTP needs the target's post-final-norm state for every prompt token.
                         # Normal prefill stops at the last cache-writing layer, before final norm.
                         params["last_tokens_only"] = 1
-                        self.generator.model.forward(input_ids = prefill_ids, params = params)
-                    else:
-                        self.generator.model.prefill(input_ids = prefill_ids, params = params)
+                    return params
 
+                def draft_update(params):
                     if self.generator.dflash_draft:
                         self.generator.draft_model.update_kv_from_target(
                             target_hidden = params.get("export_states"),
@@ -1637,8 +1654,43 @@ class Job:
                             }
                         )
 
-                # (for whoever decides where the chunk runs: Generator._prefill_round)
+                def run():
+                    params = chunk_params()
+                    if self.generator.mtp_draft:
+                        self.generator.model.forward(input_ids = prefill_ids, params = params)
+                    else:
+                        self.generator.model.prefill(input_ids = prefill_ids, params = params)
+                    draft_update(params)
+
+                # The same passes in pieces, for a chunk that leaves the first card to the next
+                # chunk while it is on the second (Generator.prefill_pipeline). With the MTP head
+                # only: the chunk is then one whole forward pass, which a cursor can stop between
+                # two modules; the state left waiting is the cursor's own (hold). The head's
+                # update is a piece of its own: the head has a card too, and whoever runs the
+                # pieces decides when that card is free for it
+                def first(stop: int):
+                    params = chunk_params()
+                    cursor = ForwardCursor(self.generator.model, prefill_ids, params)
+                    cursor.run_to(stop)
+                    cursor.hold()
+                    return cursor, params
+
+                def rest(state):
+                    cursor, params = state
+                    cursor.wake()
+                    cursor.finish()
+                    return params
+
+                def after(params):
+                    draft_update(params)
+
+                # (for whoever decides where the chunk runs: Generator._prefill_round, _pipe_round)
                 run.tokens = prefill_ids.shape[-1]
+                run.end = prefill_end
+                run.checkpoint = recurrent_last_page
+                run.halves = (first, rest, after) if self.generator.mtp_draft else None
+                # (set by whoever plans the next chunk before this one is recorded)
+                run.followed = False
                 sent = yield run
                 if sent is not None:
                     results = sent
@@ -1647,7 +1699,11 @@ class Job:
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
-                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
+                # (not with the next chunk planned ahead of this record, Generator.prefill_pipeline:
+                # its passes may have advanced the state by now, and they are not something to
+                # take back; never the case with an atomic prefill, which is not planned ahead)
+                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end \
+                        and not run.followed:
                     self.recurrent_state.rewind_to(prefill_end)
 
                 seq.kv_position = prefill_end
@@ -1782,7 +1838,7 @@ class Job:
                 f.is_active = f.trigger_token is None and not self.filters_suspended
 
 
-    def is_checkpoint_boundary(self, override_interval = None):
+    def is_checkpoint_boundary(self, override_interval = None, at = None):
         """
         Return whether the current sequence position should stash a recurrent checkpoint.
 
@@ -1790,10 +1846,13 @@ class Job:
         sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
         interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
         interval.
+
+        at: the same question for a position the prompt has yet to reach (Generator._pipe_ahead: a chunk is not
+        planned past a position where a checkpoint is due before the chunk that ends there is recorded).
         """
         seq = self.sequences[0]
         prompt_len = len(seq.sequence_ids) - 1
-        seq_pos = seq.kv_position
+        seq_pos = seq.kv_position if at is None else at
         if override_interval:
             return seq_pos % override_interval == 0
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:

@@ -121,6 +121,12 @@ class GDNState:
     from the base row into the scratch row and then flips. Until rewind() runs, the base row is
     the committed state and the scratch row is provisional"""
 
+    # No module reads `position` while a pass runs (stash, unstash and rewind do, between passes;
+    # a pass finds its rows by slot and parity, prepare_for_recurrence): a prompt chunk may be
+    # issued on the first card before the previous chunk's pass, still on the second, has
+    # advanced it (Generator.prefill_pipeline). GDN, KDA and Mamba2 layers alike
+    pass_reads_position = False
+
     def __init__(
         self,
         cache: Cache,

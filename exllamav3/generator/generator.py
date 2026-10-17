@@ -4,7 +4,7 @@ import os
 import torch
 from ..model.model import Model
 from ..model.forward_cursor import ForwardCursor, DirectForward, cuda_stage_bounds
-from ..util.lane import Lane, cuda_devices
+from ..util.lane import Lane, cuda_devices, module_devices
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
@@ -19,7 +19,7 @@ from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
@@ -50,16 +50,24 @@ SIDE_MIN_TOKENS = 33
 class _SidePass:
     """A chunk of a job's prompt being ingested on the prefill thread (Generator._prefill_round):
     the job, its prefill coroutine stopped at the chunk's forward passes, the future of those
-    passes, whether decode steps may be taken beside them and how many have been so far."""
+    passes, whether decode steps may be taken beside them and how many have been so far.
+    In flight on two cards (Generator._pipe_round) also the passes themselves (run; the future
+    is None until they are handed to the threads), whether the chunk has been told to go no
+    further (dropped), whether it started with another chunk under way (piped) and before the
+    chunk of its own job that comes before it was recorded (ahead)."""
 
-    __slots__ = ("job", "step", "future", "beside", "steps")
+    __slots__ = ("job", "step", "future", "beside", "steps", "run", "dropped", "piped", "ahead")
 
-    def __init__(self, job, step, future, beside):
+    def __init__(self, job, step, future, beside, run = None, ahead = False):
         self.job = job
         self.step = step
         self.future = future
         self.beside = beside
         self.steps = 0
+        self.run = run
+        self.dropped = False
+        self.piped = False
+        self.ahead = ahead
 
 
 class Generator:
@@ -94,6 +102,7 @@ class Generator:
         hybrid_draft_tokens: int = 0,
         stagger_decode: bool = False,
         prefill_thread: bool = False,
+        prefill_pipeline: bool = False,
         **kwargs
     ):
         """
@@ -185,6 +194,17 @@ class Generator:
             of the same name); not available with a tensor-parallel load, a draft model other than MTP or
             promote-on-miss (prefill_thread_reason says why). EXL3_PREFILL_THREAD=1 in the environment turns it on
             for callers that do not pass the argument. See _prefill_round().
+
+        :param prefill_pipeline:
+            With the layers of the model on two cards, keep two prompt chunks under way: one on the second card
+            while the next is on the first, each half issued by a thread of its own (it turns prefill_thread on).
+            A prompt of several chunks then goes in faster; a prompt of one chunk gains nothing. A chunk is never
+            started past a position where a recurrent checkpoint is due before the chunk that ends there is
+            recorded, so every checkpoint interval costs the overlap of one chunk. Needs the MTP head and one
+            slot more per lane in the CPU expert worker (EXL3_MOE_CPU_SLOTS=6 leaves each lane two); not
+            available where the prefill thread is not. Can be switched at any time (attribute of the same name).
+            EXL3_PREFILL_PIPELINE=1 in the environment turns it on for callers that do not pass the argument. See
+            _pipe_round().
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -347,7 +367,7 @@ class Generator:
         self.side_max_rows = 8
         self.side_stats = {
             "chunks": 0, "beside": 0, "decode_steps": 0, "errors": 0,
-            "t_chunks": 0.0, "t_waited": 0.0,
+            "t_chunks": 0.0, "t_waited": 0.0, "piped": 0, "ahead": 0,
         }
         self._side = None
         self._side_ok = None
@@ -358,6 +378,25 @@ class Generator:
         # Chunks ingested beside a decode since the last report: [chunks, decode steps beside
         # them, seconds of chunks]; reported in one line once no job is ingesting any more
         self._side_stretch = None
+
+        # Prompt chunks in flight on two cards (_pipe_round): each chunk issued in two halves,
+        # the first by the prefill thread and the second by a thread of its own, so that a card
+        # has one chunk at a time and each of the two lanes its kernels on one card. _pipe is
+        # the chunks under way, oldest first, pipe_depth how many there may be (two: one per
+        # card; the first half is the longer one on this machine, so a third would only wait).
+        # The second thread, its lane and the module at which a chunk changes card are made
+        # at the first use
+        self.prefill_pipeline = prefill_pipeline or os.environ.get("EXL3_PREFILL_PIPELINE", "0") not in ("", "0")
+        if self.prefill_pipeline:
+            self.prefill_thread = True
+        self.pipe_depth = max(1, int(os.environ.get("EXL3_PREFILL_PIPELINE_DEPTH", "2") or 2))
+        self._pipe = []
+        self._pipe_ok = None
+        self._pipe_why = None
+        self._pipe_lanes = None
+        self._pipe_pool = None
+        self._pipe_stop = None
+        self._pipe_head_first = False
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
@@ -621,8 +660,10 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         # A pass issued in part is abandoned with its jobs (their pages and states go below)
         self._stagger_drop()
-        # A chunk under way on the prefill thread is left to finish first
+        # A chunk under way on the prefill thread is left to finish first, and so are the
+        # chunks in flight on two cards (each stops at the half it is in)
         self._side_drop()
+        self._pipe_drop()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
         self.active_jobs.clear()
@@ -698,6 +739,8 @@ class Generator:
         # thread then issues nothing more of it)
         if self._side is not None and self._side.job is job:
             self._side_drop()
+        # In flight on two cards: its chunks stop at the half they are in, which is waited for
+        self._pipe_drop(job)
 
         num_jobs = self.num_remaining_jobs()
 
@@ -782,9 +825,11 @@ class Generator:
         if owner_serial is not None and owner_serial != getattr(self, "cache_owner_serial", owner_serial):
             # Superseded: drop every job without touching the cache (the new owner may already have
             # reused these pages and state slots) and refuse to run. A chunk under way on the
-            # prefill thread is waited for: nothing more of it may be issued
+            # prefill thread is waited for: nothing more of it may be issued (in flight on two
+            # cards, the half each chunk is in)
             self._stagger_drop()
             self._side_drop()
+            self._pipe_drop()
             self.pending_jobs.clear()
             self.active_jobs.clear()
             raise RuntimeError(
@@ -871,10 +916,13 @@ class Generator:
         self._lanes = {}
         self._stagger_spec = None
         # A chunk under way on the prefill thread is waited for (it writes pages and states the
-        # flush below and a replacement generator would read), and the thread goes
+        # flush below and a replacement generator would read), and the thread goes. Chunks in
+        # flight on two cards stop at the half they are in; both threads go
         self._side_drop()
-        if self._side_pool is not None:
-            self._side_pool.shutdown(wait = True)
+        self._pipe_drop()
+        for pool in (self._side_pool, self._pipe_pool):
+            if pool is not None:
+                pool.shutdown(wait = True)
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
             # After abort() (generator error), nothing is written
@@ -1056,8 +1104,9 @@ class Generator:
             if flying and any(j is job for j in flying):
                 continue
             # The state of a job whose prompt chunk is under way is being advanced by the prefill
-            # thread; it was offered its checkpoint after the previous chunk
-            if job is side_job:
+            # thread; it was offered its checkpoint after the previous chunk. In flight on two
+            # cards the same for any chunk of the job under way
+            if job is side_job or any(p.job is job for p in self._pipe):
                 continue
             job.maybe_stash_recurrent(self.recurrent_cache)
 
@@ -1557,9 +1606,16 @@ class Generator:
             workspaces of a prefill pass exist once.
 
         A failed chunk fails its job only, as an inline one (reap_failed_job).
+
+        With prefill_pipeline and the layers on two cards, two chunks are under way instead of
+        one: _pipe_round.
         """
         flying = self._flight.jobs if self._flight is not None else ()
         side = self.prefill_thread and self._side_plan()
+
+        if self._pipe or (side and self.prefill_pipeline and self._side is None and self._pipe_plan()):
+            self._pipe_round(results, flying, bool(side and self.prefill_pipeline))
+            return
 
         if not side and self._side is None:
             for job in list(self.active_jobs):
@@ -1576,10 +1632,7 @@ class Generator:
         # generating, and the step is decode-sized for every module (side_max_rows). The width
         # of a verification pass is decided after this, by the draft step: counted at its
         # widest, the hybrid draft's long window included (max_draft_tokens)
-        rows = 0
-        for job in self.active_jobs:
-            if job.is_prefill_done():
-                rows += len(job.sequences) * (1 + self.max_draft_tokens)
+        rows = self._decode_rows()
         beside = side and 0 < rows <= self.side_max_rows
 
         # The chunk under way: left to run beside this round's decode step, or recorded. A job
@@ -1615,6 +1668,9 @@ class Generator:
         for job in waiting:
             if self._side is not None:
                 break
+            # (the pipeline has just been switched on: it takes over once no chunk is under way)
+            if self.prefill_pipeline and self._pipe_ok is not False:
+                break
             if not self._side_start(job, results):
                 continue
             if beside and self._side.beside:
@@ -1625,6 +1681,26 @@ class Generator:
         if self._side_stretch is not None and self._side is None \
                 and all(job.is_prefill_done() for job in self.active_jobs):
             self._side_stretch_end()
+
+
+    def _decode_rows(self) -> int:
+        """Rows x tokens of the decode step the jobs past their prompt make together, the
+        verification pass counted at its widest (max_draft_tokens: the hybrid draft's window is
+        decided after the prefill round)."""
+        rows = 0
+        for job in self.active_jobs:
+            if job.is_prefill_done():
+                rows += len(job.sequences) * (1 + self.max_draft_tokens)
+        return rows
+
+
+    def _moe_hosts(self) -> list:
+        """The CPU expert workers' hosts of the model and of the draft model (one per component)."""
+        hosts = {}
+        for m in (self.model, self.draft_model):
+            for h in getattr(getattr(m, "config", None), "moe_cpu_hosts", {}).values():
+                hosts[id(h)] = h
+        return list(hosts.values())
 
 
     def _side_plan(self) -> bool:
@@ -1645,11 +1721,7 @@ class Generator:
             if why is None:
                 why = self._side_promote_why()
             if why is None:
-                hosts = {}
-                for m in (self.model, self.draft_model):
-                    for h in getattr(getattr(m, "config", None), "moe_cpu_hosts", {}).values():
-                        hosts[id(h)] = h
-                for h in hosts.values():
+                for h in self._moe_hosts():
                     slots = h.split_lanes()
                     if slots is None:
                         why = "the CPU expert worker has a single slot (EXL3_MOE_CPU_SLOTS)"
@@ -1821,8 +1893,486 @@ class Generator:
         other trace of it; side_stats is for whoever holds the generator)."""
         stretch, self._side_stretch = self._side_stretch, None
         if stretch is not None:
-            print(f" -- Prefill thread: {stretch[0]} chunks in {stretch[2]:.1f} s, "
+            # (in flight on two cards the seconds are the stretch's, not the sum of the chunks')
+            what = "Prefill thread" if len(stretch) == 3 else "Prefill pipeline"
+            print(f" -- {what}: {stretch[0]} chunks in {stretch[2]:.1f} s, "
                   f"{stretch[1]} decode steps beside them", flush = True)
+
+
+    # ---------------------------------------------------------------------------------------
+    #   Prompt chunks in flight on two cards
+    # ---------------------------------------------------------------------------------------
+
+    def _pipe_round(self, results: list, flying, more: bool):
+        """
+        One round of prompt ingestion with two chunks under way (prefill_pipeline).
+
+        The layers of the model are on two cards, and a chunk's pass works on one card at a time:
+        while it is on the second, the first is free for the next chunk. Every layer keeps its
+        own state (K/V pages, recurrent state) and needs that state after the previous chunk and
+        the output of the layer before it for this one, so the next chunk may start on the first
+        card as soon as this one has left it:
+
+            first card    A(0)  A(1)  A(2) ...
+            second card         B(0)  B(1) ...
+
+        A chunk is issued in two halves (Job._prefill_co: halves), the first by the prefill
+        thread and the second by a thread of its own, which also runs the MTP head's update
+        unless the head is on the first card (_pipe_plan). Each thread takes the chunks in the
+        order they were handed over, so A(k+1) follows A(k) and B(k+1) follows B(k) whatever the
+        jobs; the second half waits for its first. What the round of one chunk at a time says
+        (_prefill_round) holds here too, card by card: only forward passes leave this thread, a
+        chunk and a decode step overlap only if they cannot meet inside a module, a job with a
+        chunk under way gets no checkpoint and no decode step, cancel() lets its chunks finish
+        the half they are in. What is new:
+
+          - the chunks under way may be of two jobs, or two chunks of one job. The second is
+            then planned ahead of the first's record (_pipe_ahead), and that is refused where
+            a recurrent checkpoint is due at the position between the two: the state has to be
+            whole there, and the first half of the next chunk would have moved the first
+            card's layers past it. The chunk before a checkpoint is therefore recorded with
+            nothing else of its job under way, and the next one starts in the round after the
+            checkpoint. Chunks are recorded in the order they were started, so a job's
+            sequence position (what the disk tier's write-behind reads) is the start of its
+            oldest chunk under way until that chunk is recorded;
+          - a chunk too short to run beside a decode step (side_min_tokens) waits, while
+            somebody is generating, until the chunks before it are recorded, and is then
+            waited for alone: the jobs that are generating stop for its passes only;
+          - a decode batch too large for the decode paths (side_max_rows) gets one chunk per
+            round, waited for, as without the pipeline;
+          - with nobody generating the round waits for the oldest chunk and records it, having
+            started the next one first: a round is still worth a chunk, and the cards are
+            never left without one.
+
+        more: whether new chunks are started (False when the switch has been turned off: the
+        ones under way are seen through and the next round is a regular one).
+        """
+        pipe = self._pipe
+        served = self._pipe_collect(results)
+
+        waiting = []
+        for job in list(self.active_jobs):
+            if flying and any(j is job for j in flying):
+                continue
+            if not job.is_prefill_done():
+                waiting.append(job)
+                continue
+            # A job past its prompt (the call stamps its first prefill time)
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
+
+        if more:
+            self._pipe_fill(waiting, served, results)
+            # Nobody is generating: the round is worth a chunk
+            if not served and pipe and not self._decode_rows():
+                served += self._pipe_collect(results, wait = True)
+                self._pipe_fill([j for j in waiting if j in self.active_jobs], served, results)
+        else:
+            for p in pipe:
+                if p.future is None:
+                    self._pipe_submit(p)
+            while pipe:
+                self._pipe_collect(results, wait = True)
+
+        # What the decode step that follows must not meet is waited for
+        rows = self._decode_rows()
+        under_way = [p for p in pipe if p.future is not None]
+        if rows and under_way:
+            if rows > self.side_max_rows or not all(p.beside for p in under_way):
+                while pipe and pipe[0].future is not None:
+                    self._pipe_collect(results, wait = True)
+            else:
+                self.side_stats["decode_steps"] += 1
+                stretch = self._side_stretch
+                if stretch is None:
+                    stretch = self._side_stretch = [0, 0, 0.0, time.perf_counter()]
+                stretch[1] += 1
+                for p in under_way:
+                    p.steps += 1
+
+        if self._side_stretch is not None and not pipe \
+                and all(job.is_prefill_done() for job in self.active_jobs):
+            self._side_stretch_end()
+
+
+    def _pipe_plan(self) -> bool:
+        """Whether prompt chunks can be in flight on two cards; sets the second thread up at the
+        first call, which is made with no chunk under way (the CPU expert worker's slots change
+        hands). Only where the prefill thread is available (the caller has asked _side_plan)."""
+        ok = self._pipe_ok
+        if ok is None:
+            why = None
+            slots = None
+            bounds = cuda_stage_bounds(self.model)
+            if not self.mtp_draft:
+                why = "only with the MTP head (a prompt chunk is then one forward pass, which can be issued in two halves)"
+            elif len(bounds) != 1:
+                why = f"the layers of the model are on {len(bounds) + 1} card(s), not on two"
+            else:
+                for h in self._moe_hosts():
+                    slots = h.split_lanes(lanes = 3)
+                    if slots is None or len(slots) < 3:
+                        why = "the CPU expert worker has too few slots for a lane more (EXL3_MOE_CPU_SLOTS)"
+                        break
+            if why is None:
+                stop = bounds[0]
+                modules = [m for m, _, _ in self.model.fwd_modules]
+                first = module_devices(modules[:stop])
+                second = set(module_devices(modules[stop:]))
+                # The MTP head's update of a chunk follows the chunk's second half. With the
+                # head on the first card it takes its turn there, between two first halves, on
+                # that card's thread: left to the second half's thread it ran while the next
+                # chunk was on the first card, and the memory of the two passes added up there
+                # (0.4 GiB on the machine, measured on the v1.5.4 base on 2026-10-11: a
+                # 179k-token prompt no longer fitted). EXL3_PREFILL_PIPELINE_HEAD=second is
+                # that behaviour, for telling the two apart
+                head = set(cuda_devices(self.draft_model))
+                self._pipe_head_first = bool(head) and head <= set(first) \
+                    and os.environ.get("EXL3_PREFILL_PIPELINE_HEAD", "") != "second"
+                if not self._pipe_head_first:
+                    second |= head
+                self._pipe_stop = stop
+                # (the first half's lane is the prefill thread's own, entered by that thread;
+                # what differs is the card each half waits for when it is done)
+                self._pipe_lanes = (Lane(1, first), Lane(2, sorted(second)))
+                self._pipe_pool = ThreadPoolExecutor(
+                    max_workers = 1,
+                    thread_name_prefix = "exl3-prefill2",
+                    initializer = self._pipe_lanes[1].enter,
+                )
+                extra = ""
+                if slots is not None:
+                    extra = f", CPU expert worker slots {slots[0]} for the decode and {slots[1]} + {slots[2]} for the two halves"
+                    if min(slots[1:]) < 2:
+                        extra += " (EXL3_MOE_CPU_SLOTS=6 gives each half two)"
+                if self._pipe_head_first:
+                    extra += "; the MTP head's update takes its turn on the first card"
+                print(f" -- Prefill pipeline: on, a chunk changes card at module {stop} of {len(modules)}{extra}", flush = True)
+            else:
+                print(f" !! Prefill pipeline not available: {why}", flush = True)
+            self._pipe_why = why
+            self._pipe_ok = ok = why is None
+        return ok
+
+
+    @property
+    def prefill_pipeline_state(self) -> str:
+        """
+        Whether prompt chunks are in flight on two cards, for whoever holds the generator:
+
+          - "off": not asked for (or the prefill thread has been switched off since);
+          - "pending": asked for, and the first round has yet to set it up;
+          - "on": two chunks may be under way (_pipe_round);
+          - "unavailable": asked for, but not with this model (prefill_pipeline_reason says
+            why); the prefill thread then ingests one chunk at a time, if it is available
+            itself (the pipeline is not available where the thread is not).
+        """
+        if not self.prefill_pipeline or not self.prefill_thread:
+            return "off"
+        if self._side_ok is False:
+            return "unavailable"
+        if self._pipe_ok is None:
+            return "pending"
+        return "on" if self._pipe_ok else "unavailable"
+
+
+    @property
+    def prefill_pipeline_reason(self) -> str | None:
+        """Why the pipeline is not available, None when it is or is not known yet."""
+        if self.prefill_pipeline and self._side_ok is False:
+            return self._side_why
+        return self._pipe_why
+
+
+    @staticmethod
+    def _state_reads_position(state) -> bool:
+        """Whether a module reads the position of this recurrent state while a pass runs (of
+        either side of a PairedState); True for a state class that does not say
+        (pass_reads_position), and for a job without a recurrent state."""
+        if state is None:
+            return True
+        sides = getattr(state, "components", None)
+        if sides is None:
+            sides = [state]
+        return not sides or any(getattr(s, "pass_reads_position", True) for s in sides)
+
+
+    def _pipe_ahead(self, job, last) -> int | None:
+        """
+        The position from which the job's next chunk may be planned while `last`, its latest
+        chunk, is under way; None when it has to wait for that chunk's record. Planning ahead
+        is for the plain case, where nothing but the previous chunk stands between the job and
+        the next one:
+
+          - one sequence, no embeddings (their spans move the chunks' ends, and a chunk may
+            read tokens again), not a job taken up again after tokens of its own;
+          - a recurrent state whose position no module reads during a pass (the state class
+            says so: pass_reads_position). A model without recurrent states may find pages of
+            the cache at the head of a chunk, which the plan would have to skip;
+          - no checkpoint at the position between the two chunks, whether the record of the
+            first takes it (the prompt's last page) or the generator would after it
+            (Job.is_checkpoint_boundary): see _pipe_round;
+          - a record of `last` that leaves the block table alone: it gives the pages the chunk
+            completes their content hashes, and a page that does not have it yet (allocated
+            under a random one) may be swapped for another job's page of the same hash, the
+            table rebuilt and the page's reference dropped (Job.hash_completed_page), while
+            the next chunk's passes still read the table they were planned with.
+        """
+        run = last.run
+        end = getattr(run, "end", None)
+        if end is None or last.future is None or getattr(run, "checkpoint", True):
+            return None
+        if len(job.sequences) != 1 or job.embeddings or getattr(job, "new_tokens", 0) > 0:
+            return None
+        if self._state_reads_position(job.recurrent_state):
+            return None
+        seq = job.sequences[0]
+        if end >= len(seq.sequence_ids) - 1:
+            return None
+        if job.is_checkpoint_boundary(at = end):
+            return None
+        hashes = getattr(seq, "page_hashes", None) or ()
+        start = max(0, end - getattr(run, "tokens", 0)) // PAGE_SIZE
+        for i in range(start, min(end // PAGE_SIZE, len(hashes))):
+            if seq.allocated_pages[i].phash != hashes[i]:
+                return None
+        return end
+
+
+    def _pipe_fill(self, waiting: list, served: list, results: list):
+        """Start chunks while there is room for one: first the ones that were waiting for the
+        chunks before them, then new ones, whoever had a chunk longest ago first."""
+        pipe = self._pipe
+        rows = self._decode_rows()
+        for i, p in enumerate(pipe):
+            if p.future is not None:
+                continue
+            alone = rows and not p.beside
+            if alone and i:
+                return
+            self._pipe_submit(p)
+            if alone:
+                return
+
+        depth = self.pipe_depth if rows <= self.side_max_rows else 1
+        waiting.sort(key = lambda j: getattr(j, "_side_turn", 0))
+        while len(pipe) < depth:
+            entry = None
+            for job in list(waiting):
+                mine = [p for p in pipe if p.job is job]
+                at = None
+                if mine:
+                    at = self._pipe_ahead(job, mine[-1])
+                    if at is None:
+                        continue
+                elif any(j is job for j in served):
+                    # Its next chunk starts in the next round, after the checkpoint this round
+                    # offers it
+                    continue
+                step = job._prefill_co(results) if at is None else job._prefill_co(results, at)
+                try:
+                    run = next(step)
+                except StopIteration:
+                    # Nothing to compute (pages found in the cache)
+                    waiting.remove(job)
+                    continue
+                except Exception as e:
+                    waiting.remove(job)
+                    self._pipe_fail(job, e, results)
+                    continue
+                if at is not None:
+                    # The record of the chunk under way then leaves the state's position alone:
+                    # this one's passes may have advanced it by then (Job._prefill_co)
+                    mine[-1].run.followed = True
+                self._side_turn += 1
+                job._side_turn = self._side_turn
+                beside = getattr(run, "tokens", 0) >= self.side_min_tokens
+                entry = _SidePass(job, step, None, beside, run, at is not None)
+                break
+            if entry is None:
+                return
+            waiting.sort(key = lambda j: getattr(j, "_side_turn", 0))
+            # Too short to run beside a decode step: once the others are recorded, and alone
+            if pipe and rows and not entry.beside:
+                pipe.append(entry)
+                return
+            pipe.append(entry)
+            self._pipe_submit(entry)
+            if rows and not entry.beside:
+                return
+
+
+    def _pipe_submit(self, entry: _SidePass):
+        """
+        Hand a chunk's pieces to their threads: the first half to the prefill thread, the rest
+        of the pass to the second, and the MTP head's update after it, either on the second
+        thread at once or, with the head on the first card (_pipe_plan), on the prefill thread
+        when the half under way there is done. The chunk's future is that of the last piece.
+        """
+        first, rest, after = entry.run.halves
+        entry.piped = any(p.future is not None for p in self._pipe if p is not entry)
+        head_first = self._pipe_head_first
+        done = entry.future = Future()
+        fa = self._side_pool.submit(self._pipe_first, entry, first)
+        fb = self._pipe_pool.submit(self._pipe_rest, entry, rest, fa, None if head_first else after)
+
+        def chain(f):
+            # (on the second thread, when its piece is done)
+            try:
+                state, dt = f.result()
+                if state is None or not head_first:
+                    done.set_result(dt)
+                else:
+                    self._side_pool.submit(self._pipe_after, entry, after, state, dt, done)
+            except BaseException as e:
+                done.set_exception(e)
+
+        fb.add_done_callback(chain)
+
+
+    def _pipe_first(self, entry: _SidePass, first):
+        """On the prefill thread: the half of a chunk's pass on the first card, waited for.
+        Returns what the second half needs and the seconds it took."""
+        if entry.dropped:
+            return None, 0.0
+        t0 = time.perf_counter()
+        lane = self._pipe_lanes[0]
+        with torch.inference_mode(), lane.passing():
+            try:
+                state = first(self._pipe_stop)
+            except BaseException:
+                # What the failed half had issued still runs: the job is released only after it
+                try:
+                    lane.synchronize()
+                except Exception:
+                    pass
+                raise
+            lane.synchronize()
+        return state, time.perf_counter() - t0
+
+
+    def _pipe_rest(self, entry: _SidePass, rest, first, after):
+        """On the second thread: the rest of a chunk's pass once its first half is done (a
+        failed first half fails the chunk here), then the MTP head's update unless that is
+        left to the first card's thread (after is None); waited for. Returns what the update
+        needs, None for a chunk that was told to stop, and the seconds so far."""
+        state, dt = first.result()
+        if state is None or entry.dropped:
+            return None, dt
+        t0 = time.perf_counter()
+        lane = self._pipe_lanes[1]
+        with torch.inference_mode(), lane.passing():
+            try:
+                state = rest(state)
+                if after is not None:
+                    after(state)
+            except BaseException:
+                try:
+                    lane.synchronize()
+                except Exception:
+                    pass
+                raise
+            lane.synchronize()
+        return state, dt + time.perf_counter() - t0
+
+
+    def _pipe_after(self, entry: _SidePass, after, state, dt: float, done: Future):
+        """On the prefill thread, between two first halves: the MTP head's update of a chunk
+        whose pass is done, waited for. Settles the chunk's future with the seconds of all
+        its pieces."""
+        try:
+            if not entry.dropped:
+                t0 = time.perf_counter()
+                lane = self._pipe_lanes[0]
+                with torch.inference_mode(), lane.passing():
+                    try:
+                        after(state)
+                    except BaseException:
+                        try:
+                            lane.synchronize()
+                        except Exception:
+                            pass
+                        raise
+                    lane.synchronize()
+                dt += time.perf_counter() - t0
+            done.set_result(dt)
+        except BaseException as e:
+            done.set_exception(e)
+
+
+    def _pipe_collect(self, results: list, wait: bool = False) -> list:
+        """
+        Record the chunks that are done, oldest first, and stop at the first one that is not
+        (a chunk is recorded after the ones started before it); wait: for the oldest one first.
+        Returns the jobs a chunk was recorded for. The next chunk of a job of several sequences
+        takes its place at the end.
+        """
+        pipe = self._pipe
+        stats = self.side_stats
+        served = []
+        while pipe and pipe[0].future is not None and (wait or pipe[0].future.done()):
+            wait = False
+            cur = pipe.pop(0)
+            t0 = time.perf_counter()
+            try:
+                dt = cur.future.result()
+                stats["t_waited"] += time.perf_counter() - t0
+                stats["chunks"] += 1
+                stats["t_chunks"] += dt
+                stats["piped"] += cur.piped
+                stats["ahead"] += cur.ahead
+                if cur.steps:
+                    stats["beside"] += 1
+                    stretch = self._side_stretch
+                    if stretch is not None and len(stretch) > 3:
+                        stretch[0] += 1
+                        stretch[2] = time.perf_counter() - stretch[3]
+                served.append(cur.job)
+                run = cur.step.send(results)
+            except StopIteration:
+                continue
+            except Exception as e:
+                stats["errors"] += 1
+                cur.step.close()
+                self._pipe_fail(cur.job, e, results)
+                continue
+            beside = getattr(run, "tokens", 0) >= self.side_min_tokens
+            entry = _SidePass(cur.job, cur.step, None, beside, run)
+            pipe.append(entry)
+            if len(pipe) == 1 or (pipe[-2].future is not None and (beside or not self._decode_rows())):
+                self._pipe_submit(entry)
+        return served
+
+
+    def _pipe_drop(self, job = None):
+        """
+        Stop the chunks under way of a job, or of every job, and forget them (the job is being
+        released: no kernel may be left writing into pages and states about to be handed to
+        someone else). Each is told to go no further than the half it is in, and that half is
+        waited for. Nothing is recorded. No-op with none under way.
+        """
+        mine = [p for p in self._pipe if job is None or p.job is job]
+        if not mine:
+            return
+        for p in mine:
+            p.dropped = True
+        for p in mine:
+            if p.future is not None:
+                try:
+                    p.future.result()
+                except Exception:
+                    pass
+            p.step.close()
+        self._pipe[:] = [p for p in self._pipe if not any(p is q for q in mine)]
+
+
+    def _pipe_fail(self, job, error, results: list):
+        """A chunk of the job failed, at its plan or in its passes: the job is released as for
+        an inline chunk (reap_failed_job), once its other chunks under way have stopped."""
+        self._pipe_drop(job)
+        self.reap_failed_job(job, error, results)
 
 
     # ---------------------------------------------------------------------------------------
