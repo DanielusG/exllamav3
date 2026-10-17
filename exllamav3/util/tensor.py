@@ -1,6 +1,7 @@
 from __future__ import annotations
 import torch
 from .device_copy import to_device
+from .lane import current_lane
 
 class SeqTensor:
 
@@ -228,6 +229,12 @@ class GTensorCache:
 
     def make_key(self, device, shape, dtype, x):
         device = torch.device(device)
+        # A workspace is safe to share between two uses because the first one's kernels are
+        # done with it, in stream order, before the second one's start. That holds for one
+        # thread's passes only: a thread issuing beside another keeps its own set (util/lane.py)
+        lane = current_lane()
+        if lane:
+            return f"{device}/{str(shape)}/{str(dtype)}/{x}/lane{lane}"
         return f"{device}/{str(shape)}/{str(dtype)}/{x}"
 
     def get(self, device, shape, dtype, x = ""):
