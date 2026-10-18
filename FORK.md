@@ -1,24 +1,87 @@
 # Fork notes
 
 Personal fork of ExLlamaV3 for one machine: Qwen3.8-Flash-Next (MoE, CPU expert split) on two
-RTX 5060 Ti in layer split, served by `exllamav3-openai-server`. Branch `flash-next-1.6.2`, based
-on upstream **v1.6.2**. The tuning of the earlier fork branches (`flash-next` and
-`flash-next-placement`, on v1.5.4) is ported onto it one feature at a time. Every feature stays
-behind a switch of its own, off by default: with every switch off this branch behaves as
-upstream v1.6.2.
+RTX 5060 Ti in layer split, served by `exllamav3-openai-server`. Branch `flash-next-1.6.3`, based
+on upstream **v1.6.3**: the commits of `flash-next-1.6.2` (based on v1.6.2) picked in order onto
+v1.6.3, then what 1.6.3 asked of them ("The move to 1.6.3", below). The tuning of the earliest
+fork branches (`flash-next` and `flash-next-placement`, on v1.5.4) was ported onto
+`flash-next-1.6.2` one feature at a time. Every feature stays behind a switch of its own, off by
+default: with every switch off this branch behaves as upstream v1.6.3.
 
 Everything on this branch is Python. The checkout is used without building anything: put it
 ahead of the installed package on `PYTHONPATH` (the server's wrapper does
 `export PYTHONPATH=<this checkout>`). The compiled extension is a top-level module
-(`exllamav3_ext`) and keeps coming from turboderp's published **1.6.2** wheel (CUDA 13.2,
-torch 2.11, Python 3.12) installed in the environment. It has to be that wheel: the 1.6.2
-sources call extension functions the 1.5.4 one does not have (`exl3_moe_split_issue_fused`,
-`batched_scan_replay` among them). Without the `PYTHONPATH` entry the same environment runs
-stock upstream 1.6.2.
+(`exllamav3_ext`) and keeps coming from turboderp's published **1.6.3** wheel,
+`exllamav3-1.6.3+cu132.torch2.11.0-cp312-cp312-linux_x86_64.whl` (CUDA 13.2, torch 2.11,
+Python 3.12; sha256 `624e7a09643ce7f86ef1d2e0994bd0bbb1ac5297a45800a075bf2a447314b96a`),
+installed in the environment: on the workstation in place of the 1.6.2 wheel, in the
+environment `exl3-162`, with `pip install --no-deps` so torch is left as it is. It has to be that
+wheel: the 1.6.2 sources call extension functions the 1.5.4 one does not have
+(`exl3_moe_split_issue_fused`, `batched_scan_replay` among them), the 1.6.3 ones two that the
+1.6.2 one does not have (`routing_ds3_group`, `routing_gemv_f32`, for Ling 3.x's grouped router),
+and 1.6.3's top-P convention is in the fused sampler's kernel (`sampling_fused.cu`) as well as
+in the Python samplers. Without the `PYTHONPATH` entry the same environment runs stock upstream
+1.6.3.
 
-Upstream fixes not on this branch: the fix of the expert frequency profile (upstream PR #524)
-is still pending upstream. It is not carried here; the server keeps upstream's profile
-disabled until a release has it.
+The expert frequency profile: upstream's own fixes are on this base. 1.6.3 has the fix of #515
+(345eca1c, the profile's persistence: "What changed with 1.6.3" under the placement weight) and
+that of #523 ("expert placement loaded from a persisted profile causes degenerate generation"),
+f35b51cc: `_split_saved_lists_ref` goes through `_split_perm`, so the sweep's checkpoint reads,
+the demotion's install keys and the transfer verify follow the load-time permutation of a seeded
+layer. PR #524, which encoded the permutation in the split map instead, was closed unmerged on
+2026-10-17. Nothing of the profile is carried here; whether the server turns upstream's profile
+on again is the server's call (rule 20 of its `AGENTS.md`).
+
+## The move to 1.6.3 (2026-10-18)
+
+The 19 commits of `flash-next-1.6.2` picked in order onto v1.6.3 (`git cherry-pick -x`,
+authorship kept). One conflict: `.github/workflows/build.yml`, changed upstream and deleted here,
+stays deleted (below). Three files merged by themselves, each read after the merge:
+
+- `modules/block_sparse_mlp_cpu.py`: 1.6.3 counts the first registered split module's steps
+  twice, `_swap_tick_count` (since the last sweep, which zeroes it: the sweep's trigger, as
+  before) and `_split_step_count` (since load: the profile save's gate and period). The fork's
+  `save_expert_stats` (the counts kept apart added at the prefill weight) sits under upstream's
+  new gate; `_split_swap_tick` steps both counters and keeps the fork's guard on the inline sweep
+  (not from a lane, not while a lane has a pass under way).
+- `generator/disk_cache.py`: 1.6.3 reads the free space with `shutil.disk_usage` instead of
+  `os.statvfs` (for Windows), the same figures on Linux; the page-cache hygiene is elsewhere in
+  the file.
+- `doc/env_vars.md`: upstream's top-P paragraph and `EXL3_TP_REDUCE_MAX_ISA`, beside the fork's
+  `EXL3_DISK_CACHE_UNCACHE`.
+
+Upstream changed none of the other files the fork changes (`generator.py`, `job.py`,
+`cache/recurrent.py`, `model/moe_cpu_host.py`, `modules/row_table.py`, `util/tensor.py`); in
+`gated_delta_net.py` the fork's class attribute of `GDNState` is beside 1.6.3's direct KDA gates
+for Ling. The sections below say "What changed with 1.6.2" and "this base" for the port from
+1.5.4: 1.6.3 changed none of those paths, so they hold as written; where 1.6.3 changed something,
+a "What changed with 1.6.3" paragraph says so. What 1.6.3 asked of the fork, a commit each:
+
+- the fakes of the split tests set `_split_step_count` too (24 tests failed on it);
+- `Generator` carries on the class, with every switch off, the fork's state that `iterate()`
+  reads (`stagger_decode`, `prefill_thread`, `_stagger_backlog`, `_stagger_run`, `_flight`,
+  `_side`, `_pipe`; the empty queues as tuples): upstream's
+  `tests/generator/test_failure_containment.py` makes a Generator with `__new__` and drives
+  `iterate()` with upstream's attributes only. Stock 1.6.3 passes it, the fork failed on
+  `_stagger_backlog`. `__init__` still sets every one of them on the instance;
+- the exact check names its release in one constant (`BASE_RELEASE`, under the exact check);
+- a test of the profile save that now fires beside a chunk under way (under the placement weight).
+
+What else of 1.6.3 reaches this machine: the top-P convention (the token whose probability
+crosses `top_p` is now kept, and in the fused sampler its ties at the cutoff too, down-weighted
+together; with a top-P stack, which the server's Qwen3.8 sampling sets have, the same seed
+samples other tokens than on 1.6.2), upstream's fixes of the expert profile (above), and the disk
+tier's fingerprint (under the page-cache hygiene). The rest is Ling 3.x (architecture, grouped
+router, direct KDA gates, MTP head), fp8 source weights with partial blocks, the native
+tensor-parallel backend's AVX tier, and Windows.
+
+Tests, on the development machine without a GPU (2026-10-18): the fork's own
+(`python -m pytest --noconftest tests/test_*.py`, `EXL3_TEST_DISK_DIR` on btrfs) 306 passed on
+`flash-next-1.6.2`, 309 here (three tests added); upstream's tests marked `nogpu`, with a
+stand-in for the compiled extension, come out the same test by test here as on stock v1.6.3
+(430 tests: 230 pass, 43 skip, 157 fail on both, those that need the extension's kernels).
+Nothing of 1.6.3 has run on the cards yet, stock or fork: every measure below was made on 1.5.4
+or 1.6.2, and the exact check is the first thing to run.
 
 ## What differs from upstream
 
@@ -290,7 +353,7 @@ What it does not do, and what would:
 - In the server (`--prefill-thread`, rule 24 of its `AGENTS.md`): the worker asks for the
   thread only of a library that has `Generator.prefill_thread_state`, reads that state at
   every iteration and its counters (`side_stats`). Its tests read these points off the fork's
-  sources (`tests/moe_harness/build.sh <this checkout> flash-next-1.6.2 <dir>` in the server's
+  sources (`tests/moe_harness/build.sh <this checkout> flash-next-1.6.3 <dir>` in the server's
   repo).
 
 Tests (no GPU, no extension): `tests/test_prefill_thread.py` (the real round over the toy model
@@ -840,6 +903,34 @@ split layer and prefill-size batch.
 - *Load and unload.* `cpu_post_load` starts a layer with nothing counted apart; `cpu_unload`
   drops it with the rest of the placement state.
 
+**What changed with 1.6.3.** Upstream's fix of #515 (345eca1c) changes when the saved profile is
+written, and f35b51cc (#523) what a seeded layer's sweep reads; the weight is untouched:
+
+- *The save's gate.* `save_expert_stats` now asks for `_split_step_count`, the first registered
+  split module's steps since load, to be at least `_STATS_MIN_STEPS` (64), and `_split_swap_tick`
+  saves every `_STATS_SAVE_INTERVAL` (4096) of them. On 1.6.2 both read `_swap_tick_count`, which
+  every sweep zeroes: with the sweep in charge (one due every 128 steps by default) the periodic
+  save fired only after 4096 steps without a sweep, and the save at unload only when the last
+  sweep was 64 steps back or more (promote-on-miss never sweeps, so there both fired).
+- *Where it now fires from.* `_split_swap_tick` is called by `cpu_split_submit`, on whichever
+  thread issues the pass: the 4096th step can be a prompt chunk's on the prefill thread's lane,
+  or the decode's while a chunk is under way. That is safe for the weight: the save adds the
+  counts kept apart without folding them, so a save in the middle of a window changes nothing
+  the next sweep reads (test). Its cost is the profile's own, not measured: a `tolist()` of every
+  split layer's histograms (a device sync each) and a JSON file every 4096 steps; from a lane the
+  syncs wait for both threads' kernels on the card, as any host wait there does.
+- *A save at exit.* At the first split registration (`cpu_post_load` making a new
+  `moe_cpu_swap_modules`) an `atexit` handler is registered with a weak reference to the
+  `infer_params`, so a process that exits without unloading saves what it learned. It calls
+  `save_expert_stats` by global name; after a regular unload the registry is empty and it saves
+  nothing.
+- *In the server* the profile stays off (rule 20 of its `AGENTS.md`): it replaces
+  `save_expert_stats` and `_expert_stats_load` by name, so none of the three saves writes
+  anything there.
+- *A seeded layer's sweep.* `_split_saved_lists_ref` goes through `_split_perm`, so the sweep
+  re-reads the expert it means into a GPU slot. Without a saved profile `_split_perm` is None and
+  the function is 1.6.2's.
+
 Differences from the v1.5.4 branch: that branch counted prompt chunks apart at any weight and
 folded them in at weight 1, so the sweep ranked the same but `_split_hist` between two sweeps
 held the decode's selections only (on this base the saved profile reads it there); here nothing
@@ -856,18 +947,19 @@ that records what it is handed and counts in its fused issue as the kernel does:
 selections are counted on each path and thread, at the host's threshold; what the sweep ranks by
 at weights 1, 0 and in between; every layer folded once and before any is swept, and nothing
 folded by a sweep held back; at weight 1 the same histograms, maps and swaps, bit for bit, as
-with every selection counted as a decode-size one; promote-on-miss; the saved profile; load and
-unload). Marked `nogpu`; run with `--noconftest` without the compiled extension.
+with every selection counted as a decode-size one; promote-on-miss; the saved profile, also
+when 1.6.3's periodic save comes from a lane or beside a chunk under way; load and unload).
+Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
 ### Page-cache hygiene in the disk tier (`EXL3_DISK_CACHE_UNCACHE=1`)
 
-Off by default; with it off the tier makes upstream's system calls and not one more. For 1.6.2's
+Off by default; with it off the tier makes upstream's system calls and not one more. For 1.6.x's
 persistent disk tier (`generator/disk_cache.py`, `Generator(disk_cache_dir = ...)`). The
 variable goes in the environment of the process, before the generator makes the tier. The server
-(branch `migrate-1.6.2`, `openai/disk_tier.py`, `ask_page_cache_hygiene`) puts
-`EXL3_DISK_CACHE_UNCACHE=1` there itself whenever `--disk-cache-dir` is given and the variable is
-not in the environment already (an operator's value, `0` or empty included, is kept), and shows
-the tier's `uncache` and `uncache_stats` on `/status.disk_cache`. Also in `doc/env_vars.md`.
+(`openai/disk_tier.py`, `ask_page_cache_hygiene`) puts `EXL3_DISK_CACHE_UNCACHE=1` there itself
+whenever `--disk-cache-dir` is given and the variable is not in the environment already (an
+operator's value, `0` or empty included, is kept), and shows the tier's `uncache` and
+`uncache_stats` on `/status.disk_cache`. Also in `doc/env_vars.md`.
 
 **Why.** The tier writes one file per K/V page (about 4.45 MB on Flash-Next, `pages/<hh>/<phash>.kv`)
 and one per recurrent checkpoint (about 57 MiB with fp16 states, `states/<phash>.rs`), about
@@ -964,6 +1056,22 @@ The pages and checkpoints came back bit-exact in both. `sync_s` 0.144 s for the 
 earlier read-only study measured the same write pattern outside the tier (no checksum) at 1.45
 and 3.69 ms per page file.
 
+**What changed with 1.6.3.** In the tier itself only the reading of the free space
+(`shutil.disk_usage`, the same `f_bavail * f_frsize` on Linux); the switch's four points are
+unchanged. But the fingerprint includes the library's version (`cache_fingerprint`:
+`"exllamav3": __version__`), so every change of version starts with an empty disk cache: 1.6.3
+opens a fingerprint directory of its own beside the one 1.6.2 wrote (where 1.6.2 ran with the
+tier) and never reads the old one. The old one still counts against the root's budget (the new
+directory's share is the budget minus its size) until an open of the tier finds the two together
+over the budget: `_reclaim_root`, which runs only when the tier opens, then removes the least
+recently used sibling whole, if its index has not been touched for 10 minutes. On the development
+machine (2026-10-18, upstream's tier over the tests' stand-in, a 50 MB budget, an old directory
+of 40 MB): the first open gave the new directory 10 MB; a burst of writes took it to 18.5 MB (a
+write reserves its room at once, and only files already written can be evicted for it); the next
+open removed the old directory and gave the new one the whole budget. A new directory that never
+goes past its share leaves the old one where it is: removing `<root>/<old fingerprint>` by hand
+at the switch, with the server stopped, gives the budget back at once.
+
 Tests (no GPU, no extension): `tests/test_disk_uncache.py`. Upstream's `DiskPageCache`, writer
 thread, reader pool and index, over a stand-in for the CPU tier with random slots: off by default
 and then no call of the four (only the two renames); with the switch on, for a page and for a
@@ -990,7 +1098,12 @@ of the raw logits, the forced token's log-probability, the most likely tokens an
 draft counters. A test run is **identical** when every compared position is; otherwise it is judged
 against the same reference run repeated (the noise floor) and, where there is one, a control run.
 
-The seven scenarios: (1) every switch off against stock upstream 1.6.2 (the installed wheel alone,
+The release it checks against is one constant, `BASE_RELEASE` (1.6.3): the stock processes must
+find that wheel installed (its version, the local label aside), the server's checkout must pin
+`exllamav3==BASE_RELEASE` in its `pyproject.toml` (by default `~/Desktop/exllamav3-openai-server`,
+the standard checkout), and the report and the checks name it.
+
+The seven scenarios: (1) every switch off against stock upstream (the installed wheel alone,
 in two processes for a floor across processes) and the page files upstream's disk tier writes;
 (2) the staggered decode with 2-5 jobs against each group alone; (3) the prefill thread beside 1-5
 jobs, last chunks of 33-249 tokens; (4) the pipeline: a 33334-token prompt alone and beside a job,
@@ -1003,8 +1116,8 @@ on, a watchdog on every library call (faulthandler: stacks of all threads in the
 `hang-stacks.txt`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
-whose sums depend on the arrival order of atomics; read on 1.6.2's sources) in every process but the
-stress, no sweep of the expert placement during the compared runs (the library's
+whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
+every process but the stress, no sweep of the expert placement during the compared runs (the library's
 `run_pending_swap_sweeps` replaced by a no-op after the load: both of its callers read the module's
 global), promote-on-miss off, six CPU worker slots everywhere (`EXL3_MOE_HOST_CORES=0` with the 12
 worker threads, the guide's "12 as today"), the fork's switches from the environment removed. Graphs stay as production runs them (an uncaptured call issues the same
@@ -1012,13 +1125,21 @@ kernels, `exllamav3_ext/graph.cu`). Nothing is written outside the run directory
 removed at the end unless `--keep`.
 
 How to run it on the workstation (fish; production stopped first, its graceful stop and then
-`systemctl --user stop exllama-server.service`; the environment and the two worktrees of the
-server's `docs/MIGRAZIONE-1.6.2.md`, steps 3.1-3.3), the plan and the checks first, then the night.
+`systemctl --user stop exllama-server.service`), the plan and the checks first, then the night.
+What it expects there: the environment `exl3-162` with the 1.6.3 wheel installed in place of the
+1.6.2 one, this branch checked out in `~/Desktop/exllamav3` and the server's checkout for 1.6.3
+(its pin, `exllamav3==1.6.3`) in `~/Desktop/exllamav3-openai-server`: the standard folders, no
+worktrees; the server's is the default of `--server-path`, the fork's the one the script is in.
+Production's 1.5.4 setup, as the server's `AGENTS.md` (section 8) describes it, loads those same
+folders (`PYTHONPATH=~/Desktop/exllamav3`, branch `flash-next-placement`, over the 1.5.4 wheel of
+`tabbyapi`): with this branch checked out there, a restart of it would load this branch over the
+1.5.4 wheel, so the checkouts go back to their 1.5.4 branches before production is started again
+on 1.5.4.
 The dry run writes nothing and touches no card: with production still up it lists production's
 process on the cards as a problem and the rest as it will be.
 
-    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3-1.6.2/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
-    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3-1.6.2/experiments/exact_check.py --out /home/daniele/exl3-exact-check
+    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
+    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --out /home/daniele/exl3-exact-check
 
 How long: the dry run's estimate is about 2.5 hours (prefill 700 tokens/s, decode 60 tokens/s for
 one job and 60 x sqrt(n) for n, 5 minutes per model load, never measured; ten loads); a scenario
@@ -1031,7 +1152,7 @@ model does not load with the split given is run again with the split the server'
 
 What the check cannot tell: a difference the digest misses (two rows of logits with the same
 weighted sum of their bits: never for one changed value, about 2**-64 otherwise), a race that does
-not fire in one run, whether the exact mode makes 1.6.2 repeatable (the floors of the first report
+not fire in one run, whether the exact mode makes 1.6.3 repeatable (the floors of the first report
 say it), and anything off the paths the scenarios take (images, a decode batch above
 eight rows beside a chunk, tensor parallelism). Tests (no GPU, no extension):
 `tests/test_exact_check.py`, with `--noconftest` (comparisons, floors and controls, plan, estimate,
