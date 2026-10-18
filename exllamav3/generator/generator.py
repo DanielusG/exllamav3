@@ -72,6 +72,21 @@ class _SidePass:
 
 class Generator:
 
+    # The fork's state that iterate() reads, as __init__ leaves it with every switch off, for a
+    # Generator made without __init__: upstream's tests/generator/test_failure_containment.py
+    # makes one with __new__ and gives it only upstream's attributes to drive iterate() over stub
+    # jobs. With these it takes upstream's paths (no group in flight or results kept back, prompt
+    # ingestion inline, no chunk under way). __init__ sets every one of them on the instance, so
+    # a generator made the regular way never reads these. The empty queues are tuples, so nothing
+    # can be added to one shared by every such generator
+    stagger_decode = False
+    prefill_thread = False
+    _stagger_backlog = ()
+    _stagger_run = None
+    _flight = None
+    _side = None
+    _pipe = ()
+
     def __init__(
         self,
         model: Model,

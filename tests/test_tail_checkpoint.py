@@ -1020,5 +1020,20 @@ def test_the_names_the_server_reads():
     assert RecurrentCache(types.SimpleNamespace(loaded_tp = False)).metrics["stash_replaced"] == 0
 
 
+def test_a_generator_made_without_init_reads_what_init_sets_with_every_switch_off(monkeypatch):
+    # Upstream's tests/generator/test_failure_containment.py makes a Generator with __new__ and gives
+    # it upstream's attributes only: the class holds the fork's state iterate() reads, and it must be
+    # what __init__ sets on the instance with every switch off (the queues as tuples)
+    for name in ("EXL3_STAGGER_DECODE", "EXL3_PREFILL_THREAD", "EXL3_PREFILL_PIPELINE"):
+        monkeypatch.delenv(name, raising = False)
+    g = _generator(monkeypatch)
+    names = ("stagger_decode", "prefill_thread", "_stagger_backlog", "_stagger_run", "_flight", "_side", "_pipe")
+    for name in names:
+        default = getattr(GEN.Generator, name)
+        assert name in vars(g), name
+        assert type(default) in (bool, tuple, type(None)), name
+        assert (list(default) if type(default) is tuple else default) == vars(g)[name], name
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
