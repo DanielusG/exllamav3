@@ -94,6 +94,7 @@ def overdue_module(monkeypatch):
     m._split_spares = 0
     m._split_submit_rows = 1
     m._swap_tick_count = 100
+    m._split_step_count = 100
     ip = types.SimpleNamespace(moe_cpu_swap_modules = [m], moe_cpu_swap_pending = False)
     m.config = types.SimpleNamespace(infer_params = ip)
     return m, ip, swept

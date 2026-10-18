@@ -119,6 +119,7 @@ class Layer(MOD.BlockSparseMLP_CPU):
             self._split_hist = torch.zeros(E)
         self._split_selcpu_t = None
         self._swap_tick_count = 0
+        self._split_step_count = 0
         self.swapped = []
         if ip is None:
             ip = types.SimpleNamespace(moe_cpu_swap_modules = [], moe_cpu_swap_pending = False)
@@ -529,7 +530,7 @@ def test_spares_on_a_later_layer_do_not_turn_the_weight_off(monkeypatch):
 
 def saved(tmp_path, monkeypatch, ms):
     monkeypatch.setattr(MOD, "EXPERT_STATS_DIR", str(tmp_path))
-    ms[0]._swap_tick_count = MOD._STATS_MIN_STEPS
+    ms[0]._split_step_count = MOD._STATS_MIN_STEPS
     MOD.save_expert_stats(ms[0].config.infer_params)
     path = MOD._expert_stats_path(ms[0].config, E)
     with open(path) as f:
