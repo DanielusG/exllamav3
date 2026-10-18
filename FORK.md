@@ -14,8 +14,8 @@ ahead of the installed package on `PYTHONPATH` (the server's wrapper does
 (`exllamav3_ext`) and keeps coming from turboderp's published **1.6.3** wheel,
 `exllamav3-1.6.3+cu132.torch2.11.0-cp312-cp312-linux_x86_64.whl` (CUDA 13.2, torch 2.11,
 Python 3.12; sha256 `624e7a09643ce7f86ef1d2e0994bd0bbb1ac5297a45800a075bf2a447314b96a`),
-installed in the environment: on the workstation in place of the 1.6.2 wheel, in the
-environment `exl3-162`, with `pip install --no-deps` so torch is left as it is. It has to be that
+installed in the environment: on the workstation in the standard environment `tabbyapi`, in
+place of its 1.5.4 wheel, with `pip install --no-deps` so torch is left as it is. It has to be that
 wheel: the 1.6.2 sources call extension functions the 1.5.4 one does not have
 (`exl3_moe_split_issue_fused`, `batched_scan_replay` among them), the 1.6.3 ones two that the
 1.6.2 one does not have (`routing_ds3_group`, `routing_gemv_f32`, for Ling 3.x's grouped router),
@@ -1126,20 +1126,17 @@ removed at the end unless `--keep`.
 
 How to run it on the workstation (fish; production stopped first, its graceful stop and then
 `systemctl --user stop exllama-server.service`), the plan and the checks first, then the night.
-What it expects there: the environment `exl3-162` with the 1.6.3 wheel installed in place of the
-1.6.2 one, this branch checked out in `~/Desktop/exllamav3` and the server's checkout for 1.6.3
+What it expects there: the environment `tabbyapi` with the 1.6.3 wheel installed in place of the
+1.5.4 one, this branch checked out in `~/Desktop/exllamav3` and the server's checkout for 1.6.3
 (its pin, `exllamav3==1.6.3`) in `~/Desktop/exllamav3-openai-server`: the standard folders, no
 worktrees; the server's is the default of `--server-path`, the fork's the one the script is in.
-Production's 1.5.4 setup, as the server's `AGENTS.md` (section 8) describes it, loads those same
-folders (`PYTHONPATH=~/Desktop/exllamav3`, branch `flash-next-placement`, over the 1.5.4 wheel of
-`tabbyapi`): with this branch checked out there, a restart of it would load this branch over the
-1.5.4 wheel, so the checkouts go back to their 1.5.4 branches before production is started again
-on 1.5.4.
+The 1.5.4 setup that used the same folders and environment (branch `flash-next-placement` over
+the 1.5.4 wheel of `tabbyapi`) is gone since the move to 1.6.3: the 1.6.3 wheel took its place.
 The dry run writes nothing and touches no card: with production still up it lists production's
 process on the cards as a problem and the rest as it will be.
 
-    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
-    /home/daniele/miniconda3/envs/exl3-162/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --out /home/daniele/exl3-exact-check
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --out /home/daniele/exl3-exact-check
 
 How long: the dry run's estimate is about 2.5 hours (prefill 700 tokens/s, decode 60 tokens/s for
 one job and 60 x sqrt(n) for n, 5 minutes per model load, never measured; ten loads); a scenario
