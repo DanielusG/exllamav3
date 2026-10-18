@@ -561,6 +561,35 @@ def test_with_the_weight_at_one_the_profile_is_upstream_s(tmp_path, monkeypatch)
     assert saved(tmp_path, monkeypatch, [a])["layer.0"] == hist(a)
 
 
+def test_the_periodic_save_beside_a_chunk_under_way_folds_and_sweeps_nothing(tmp_path, monkeypatch):
+    # 1.6.3 saves every _STATS_SAVE_INTERVAL steps since load (_split_step_count, which no sweep
+    # zeroes) from _split_swap_tick, i.e. from cpu_split_submit on whichever thread issues the pass:
+    # the prefill thread's lane, or the decode while a chunk is under way. The save adds the counts
+    # kept apart at the weight without folding them; the overdue sweep stays pending
+    monkeypatch.setenv("EXL3_MOE_HIST_PREFILL_WEIGHT", "0.25")
+    monkeypatch.setattr(MOD, "EXPERT_STATS_DIR", str(tmp_path))
+    m = Layer()
+    m._split_perm = None
+    traffic(m)
+    before = (hist(m), pf(m))
+    want = [c + 0.25 * p for c, p in zip(*before)]
+    path = MOD._expert_stats_path(m.config, E)
+    monkeypatch.setenv("EXL3_MOE_CPU_SWAP_INTERVAL", "4")
+
+    def save_at(tick):
+        m._split_step_count, m._swap_tick_count = MOD._STATS_SAVE_INTERVAL - 1, 100     # sweep overdue
+        if os.path.exists(path):
+            os.remove(path)
+        tick()
+        with open(path) as f:
+            assert json.load(f)["layers"]["layer"] == want and want[6] == 50.0
+        assert (hist(m), pf(m)) == before and m.swapped == [] and m.config.infer_params.moe_cpu_swap_pending
+
+    save_at(lambda: on_lane(m._split_swap_tick))        # a chunk's tick, on the prefill thread
+    with LANE.Lane(1, [0]).passing():
+        save_at(m._split_swap_tick)                     # the decode's tick, the chunk under way
+
+
 def test_the_unload_and_the_load_drop_the_counts_kept_apart(monkeypatch):
     monkeypatch.setenv("EXL3_MOE_HIST_PREFILL_WEIGHT", "0")
     m = Layer()
