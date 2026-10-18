@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Overnight bit-identity check of the flash-next-1.6.2 fork against upstream v1.6.2, on the
-production model, with the server stopped.
+Overnight bit-identity check of the flash-next fork against the upstream release it is based on
+(BASE_RELEASE below), on the production model, with the server stopped.
 
 This file is the orchestrator and needs nothing but the standard library: it plans the runs,
 starts one child process per model load (experiments/exact_check_child.py, which imports torch,
 ExLlamaV3 and the server's model loading), watches them, compares what they saved and writes the
 report. A child runs either the fork (its checkout ahead of the installed package on PYTHONPATH)
-or stock upstream (the installed 1.6.2 wheel alone), so the two can be compared run for run.
+or stock upstream (the installed wheel of that release alone), so the two can be compared run
+for run.
 
 Every compared run forces on each job the tokens a reference run produced, and records for every
 position the bits of the logits (an integer digest over the raw values), the log-probability of
@@ -15,7 +16,7 @@ the forced token and the most likely tokens. "Identical" means identical logits 
 position; anything else is judged against the same run repeated (the noise floor).
 
 Scenarios (--scenarios):
-  1  the fork with every switch off against stock upstream 1.6.2 (three processes: stock, fork,
+  1  the fork with every switch off against stock upstream (three processes: stock, fork,
      stock again for a floor between processes)
   2  staggered decode with 2-5 jobs generating, against each group of jobs alone
   3  prompt ingestion on the prefill thread beside 1-5 jobs generating (last chunks of 33-249
@@ -31,8 +32,8 @@ Scenarios (--scenarios):
   7  stress for hangs with every production switch on, watchdog on every library call
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
-environment that has the 1.6.2 wheel, from any directory (FORK.md, "The overnight exact check",
-has the command lines for the workstation):
+environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
+check", has the command lines for the workstation):
 
     <env python> experiments/exact_check.py --dry-run --out <dir>   # plan, checks, time estimate
     <env python> experiments/exact_check.py --out <dir>             # the night
@@ -65,25 +66,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FORK_DEFAULT = os.path.dirname(HERE)
 CHILD_SCRIPT = os.path.join(HERE, "exact_check_child.py")
 
+# The upstream release the fork's branch is on: the wheel the environment must have (stock runs it
+# alone, the fork over it), the pin the server's checkout must carry, and the labels of the report
+BASE_RELEASE = "1.6.3"
+FORK_BRANCH = f"flash-next-{BASE_RELEASE}"
+
 # --------------------------------------------------------------------------------------------
 #   Defaults: production's configuration (the server's wrapper, AGENTS.md section 8)
 # --------------------------------------------------------------------------------------------
 
 MODEL_DEFAULT = "/home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/"
 PLACEMENT_DEFAULT = "/home/daniele/models/qwen-flash-arena-cache/"
-# The server's worktree on its 1.6.2 branch (migrate-1.6.2), where the server's migration guide
-# (docs/MIGRAZIONE-1.6.2.md, 3.1) puts it; ~/Desktop/exllamav3-openai-server is production's 1.5.4
-# checkout, whose model loading does not fit this library
-SERVER_DEFAULT = "~/Desktop/exllamav3-openai-server-1.6.2"
+# The server's standard checkout, the one production runs. Its model loading has to be the one for
+# this library: preflight() refuses a checkout whose pyproject does not pin exllamav3==BASE_RELEASE
+SERVER_DEFAULT = "~/Desktop/exllamav3-openai-server"
 
-# The paths of the MoE layers that are not bit-reproducible run to run, read on 1.6.2:
+# The paths of the MoE layers that are not bit-reproducible run to run, read on 1.6.2 (the three
+# files are the same in 1.6.3, but for a comment in modules/block_sparse_mlp.py):
 #   - the streamed prefill's fused tier calls exl3_moe without the slot scratch (arrival order of
 #     the atomics; model/moe_cpu_host.py, _submit_prefill_streamed): EXL3_MOE_STREAM_FUSED_T=0
 #     sends those experts to the tiers below;
 #   - the batched reconstruct tier adds with one atomic index_add_ over the slab unless
 #     EXL3_MOE_RECON_DET (modules/moe_batch_recon.py: its default follows EXL3_MOE_FUSED_DET with
 #     a fallback of "0", i.e. atomic when neither is set);
-#   - the GPU fused kernel's accumulation is deterministic by default on 1.6.2 (FUSED_DET, the
+#   - the GPU fused kernel's accumulation is deterministic by default on 1.6.x (FUSED_DET, the
 #     default "1" in modules/block_sparse_mlp.py); pinned here so that nothing can turn it off.
 # Graphs are left as production runs them: an uncaptured call issues the same kernels in the
 # same order as the replay (exllamav3_ext/graph.cu); --env EXL3_GRAPHS=0 takes them out.
@@ -272,7 +278,7 @@ def resolve_placement_file(path: str, model_path: str) -> str:
 
 
 # --------------------------------------------------------------------------------------------
-#   Disk tier files (upstream 1.6.2's DiskPageCache layout), shared with the child
+#   Disk tier files (upstream 1.6.2's DiskPageCache layout, unchanged in 1.6.3), shared with the child
 # --------------------------------------------------------------------------------------------
 
 PAGE_MAGIC = b"EXL3KVP1"
@@ -449,7 +455,7 @@ class Proc:
 
 
 SCENARIO_TITLES = {
-    1: "Fork con ogni interruttore spento contro upstream 1.6.2",
+    1: f"Fork con ogni interruttore spento contro upstream {BASE_RELEASE}",
     2: "Decode sfalsato",
     3: "Ingestione sul thread di prefill accanto al decode",
     4: "Due pezzi di prompt in volo sulle due schede",
@@ -1738,7 +1744,7 @@ def summary_row(s: int, rows: list, notes: list) -> list:
 
 
 SCENARIO_TEXT = {
-    1: "Tre processi con lo stesso carico di lavoro, uno per caricamento del modello: upstream 1.6.2 dalla wheel installata "
+    1: f"Tre processi con lo stesso carico di lavoro, uno per caricamento del modello: upstream {BASE_RELEASE} dalla wheel installata "
        "(`stock-a`), il fork con ogni interruttore spento (`fork`) e di nuovo upstream (`stock-b`). I token imposti sono quelli "
        "che `stock-a` ha prodotto da solo. Il metro di ogni confronto è `stock-a` contro `stock-b`: due processi della stessa "
        "libreria. Per il tier su disco si confrontano anche i file delle pagine scritti, per CRC.",
@@ -1784,7 +1790,7 @@ def render_report(plan: dict, res: Results, meta: dict, finished: bool) -> str:
     notes = capture_checks(plan, res)
     sc = plan["scenarios"]
     out = [
-        "# Controllo di identità bit a bit: fork 1.6.2 contro upstream",
+        f"# Controllo di identità bit a bit: fork {BASE_RELEASE} contro upstream",
         "",
         f"{meta.get('started', '')} - " + (meta.get("ended", "") if finished else "in corso (rapporto parziale)"),
         "",
@@ -2547,10 +2553,9 @@ def preflight(args, plan: dict) -> tuple:
         try:
             with open(os.path.join(server, "pyproject.toml")) as f:
                 py = f.read()
-            if "exllamav3==1.6.2" not in py.replace(" ", ""):
-                problems.append(f"il server in {server} non fissa exllamav3==1.6.2 nel pyproject: non è il ramo "
-                                "migrate-1.6.2 (--server-path; il worktree della guida di migrazione è "
-                                "/home/daniele/Desktop/exllamav3-openai-server-1.6.2)")
+            if f"exllamav3=={BASE_RELEASE}" not in py.replace(" ", ""):
+                problems.append(f"il server in {server} non fissa exllamav3=={BASE_RELEASE} nel pyproject: non è "
+                                f"il server per {BASE_RELEASE} (--server-path, default {SERVER_DEFAULT})")
         except OSError:
             notes.append(f"{server}/pyproject.toml non leggibile")
     fork = os.path.abspath(os.path.expanduser(args.fork_path))
@@ -2568,8 +2573,8 @@ def preflight(args, plan: dict) -> tuple:
         stock = probe_library(args.python, None)
         forked = probe_library(args.python, fork)
         args.installed_version = stock.get("version") or "?"
-        if not str(stock.get("version") or "").startswith("1.6.2"):
-            problems.append(f"in {args.python} exllamav3 è {stock.get('version') or 'assente'}, serve la wheel 1.6.2")
+        if str(stock.get("version") or "").split("+")[0] != BASE_RELEASE:
+            problems.append(f"in {args.python} exllamav3 è {stock.get('version') or 'assente'}, serve la wheel {BASE_RELEASE}")
         if (stock.get("exllamav3") or "").startswith(fork + os.sep):
             problems.append(f"senza PYTHONPATH {args.python} trova exllamav3 nel fork ({stock.get('exllamav3')}): "
                             "il confronto con upstream non avrebbe upstream")
@@ -2579,7 +2584,7 @@ def preflight(args, plan: dict) -> tuple:
         if not ext:
             problems.append(f"exllamav3_ext (l'estensione compilata della wheel) non si trova con {args.python}")
         elif ext.startswith(fork + os.sep):
-            problems.append(f"exllamav3_ext viene dal fork ({ext}), non dalla wheel 1.6.2 dell'ambiente")
+            problems.append(f"exllamav3_ext viene dal fork ({ext}), non dalla wheel {BASE_RELEASE} dell'ambiente")
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
         problems.append(f"{args.python} non risponde: {e}")
     apps = gpu_processes()
@@ -2700,16 +2705,16 @@ def int_list(text: str) -> list:
 
 def parse_cli(argv: list | None = None):
     ap = argparse.ArgumentParser(
-        description = "Controllo notturno di identità bit a bit del fork flash-next-1.6.2 contro upstream 1.6.2, "
+        description = f"Controllo notturno di identità bit a bit del fork {FORK_BRANCH} contro upstream {BASE_RELEASE}, "
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
     ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7", help = "scenari da eseguire, es. 1,2 (default tutti)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
     ap.add_argument("--force", action = "store_true", help = "parte anche con problemi nei controlli preliminari")
-    ap.add_argument("--python", default = sys.executable, help = "Python dell'ambiente con la wheel 1.6.2 (default questo)")
+    ap.add_argument("--python", default = sys.executable, help = f"Python dell'ambiente con la wheel {BASE_RELEASE} (default questo)")
     ap.add_argument("--fork-path", default = FORK_DEFAULT, help = "checkout del fork (default quello di questo file)")
-    ap.add_argument("--server-path", default = SERVER_DEFAULT, help = f"checkout del server per 1.6.2 (default {SERVER_DEFAULT})")
+    ap.add_argument("--server-path", default = SERVER_DEFAULT, help = f"checkout del server per {BASE_RELEASE} (default {SERVER_DEFAULT})")
     ap.add_argument("--model", default = MODEL_DEFAULT, help = "cartella del modello")
     ap.add_argument("--placement", default = PLACEMENT_DEFAULT,
                     help = "file (o cartella) del piazzamento degli esperti del server: viene copiato, mai scritto; '' per nessuno")

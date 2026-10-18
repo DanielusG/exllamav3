@@ -448,7 +448,7 @@ def fake_results(plan, *, differ = (), missing = ()):
         if p["name"] in missing:
             continue
         recs = {}
-        res.meta[p["name"]] = {"op": "start", "fork_features": p["library"] == "fork", "library_path": "/lib", "version": "1.6.2"}
+        res.meta[p["name"]] = {"op": "start", "fork_features": p["library"] == "fork", "library_path": "/lib", "version": EC.BASE_RELEASE}
         recs["load"] = {"op": "load", "id": "load", "ok": True, "seconds": 200.0, "placement": "abc"}
         for st in p["steps"]:
             if st["op"] == "generator":
@@ -608,7 +608,7 @@ FAKE_CHILD = textwrap.dedent("""
                   open(os.path.join(pdir, "status.json"), "w"))
     status("start")
     EC.append_jsonl(path, {"op": "start", "id": "start", "ok": True, "fork_features": spec["library"] == "fork",
-                           "library_path": "/fake", "version": "1.6.2", "env": {k: v for k, v in os.environ.items() if k.startswith("EXL3_")}})
+                           "library_path": "/fake", "version": EC.BASE_RELEASE, "env": {k: v for k, v in os.environ.items() if k.startswith("EXL3_")}})
     argv = spec["server_argv"]
     split = argv[argv.index("--moe-device-split") + 1]
     if mode.startswith("splitfail:") and split in mode[len("splitfail:"):].split("|"):
@@ -1044,7 +1044,7 @@ def test_a_switch_left_on_does_not_pass_for_off():
 
 FAKE_LIB = {
     "exllamav3/__init__.py": "from .generator import Generator, Job\n",
-    "exllamav3/version.py": "__version__ = '1.6.2'\n",
+    "exllamav3/version.py": f"__version__ = '{EC.BASE_RELEASE}'\n",
     "exllamav3/generator/sampler.py": "class GreedySampler:\n    pass\n",
     "exllamav3/modules/__init__.py": "",
     "exllamav3/modules/block_sparse_mlp_cpu.py": textwrap.dedent('''
@@ -1495,6 +1495,36 @@ def test_the_dry_run_writes_nothing_and_a_used_directory_is_refused(tmp_path, ca
     assert any("contiene già un giro" in p for p in problems)
     assert EC.main(["--dry-run", "--out", str(tmp_path / "other"), "--placement", "", "--layer-budget", "uniform"]) in (0, 1)
     assert not (tmp_path / "other").exists() and "Totale stimato" in capsys.readouterr().out
+
+
+def test_the_wheel_and_the_server_s_pin_are_the_release_the_branch_is_on(tmp_path, monkeypatch):
+    # One constant names upstream's release: the installed wheel, the pin of the server's checkout
+    # (by default the standard one) and the report's labels follow it
+    assert (EC.BASE_RELEASE, EC.FORK_BRANCH) == ("1.6.3", "flash-next-1.6.3")
+    assert EC.SERVER_DEFAULT == "~/Desktop/exllamav3-openai-server"
+    server = tmp_path / "server"
+    (server / "openai").mkdir(parents = True)
+    (server / "openai" / "config.py").write_text("")
+    fork = EC.FORK_DEFAULT
+    args = EC.parse_cli(["--out", str(tmp_path / "night"), "--placement", "", "--layer-budget", "uniform",
+                         "--server-path", str(server)])
+    plan = EC.build_plan(args)
+    monkeypatch.setattr(EC, "gpu_processes", lambda: [])
+    monkeypatch.setattr(EC, "validate_server_args", lambda *a: [])
+
+    def problems(pin, version):
+        (server / "pyproject.toml").write_text(f'dependencies = [\n    "exllamav3=={pin}",\n]\n')
+        monkeypatch.setattr(EC, "probe_library", lambda python, path: {
+            "version": version, "exllamav3_ext": "/env/lib/exllamav3_ext.so",
+            "exllamav3": os.path.join(fork if path else "/env/lib", "exllamav3", "__init__.py")})
+        return " | ".join(EC.preflight(args, plan)[0])
+
+    ok = problems("1.6.3", "1.6.3+cu132.torch2.11.0")
+    assert "fissa" not in ok and "wheel" not in ok
+    old = problems("1.6.2", "1.6.2+cu132.torch2.11.0")
+    assert "non fissa exllamav3==1.6.3" in old and "exllamav3 è 1.6.2+cu132.torch2.11.0, serve la wheel 1.6.3" in old
+    assert "serve la wheel 1.6.3" in problems("1.6.3", "1.6.30")
+    assert EC.SCENARIO_TITLES[1].endswith("upstream 1.6.3")
 
 
 def test_a_terminal_that_went_away_does_not_end_the_night(tmp_path):
