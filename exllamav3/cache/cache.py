@@ -148,7 +148,8 @@ class Cache:
             page and QSA layer with 32 tokens, and smaller page images in the CPU and disk tiers (whose
             fingerprint changes with them). Models without recurrent states are refused (their prompt
             cache reuses partial pages, and banned strings rewind them by truncation); a generator
-            whose drafts are longer than the ring serves is refused too (cache/qsa.py, check_raw_tail)
+            whose drafts are longer than the ring serves is refused too, and one whose model is such
+            a model while its MTP head's cache has the ring (cache/qsa.py, check_raw_tail)
         """
         self.model = model
         # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
@@ -162,15 +163,13 @@ class Cache:
         self.layer_type = layer_type or CacheLayer_fp16
         # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
-        # QSA raw-key ring (cache/qsa.py)
-        from .qsa import QSAPlanes, resolve_raw_tail, RAW_TAIL_ENV
+        # QSA raw-key ring (cache/qsa.py). An MTP head's cache follows its target's generator, which
+        # checks its own model (check_raw_tail)
+        from .qsa import QSAPlanes, resolve_raw_tail, raw_tail_refusal, RAW_TAIL_ENV
         raw_tail = resolve_raw_tail(qsa_raw_tail)
-        if raw_tail:
-            why = None
-            if not model.caps.get("recurrent_states"):
-                why = "the model has no recurrent states"
-            elif model.caps.get("atomic_mm_prefill"):
-                why = "the model's prompt passes can run past a chunk's end"
+        has_qsa = any(getattr(a, "qsa_indexer", None) is not None for a in self.model.get_cache_layers())
+        if raw_tail and has_qsa and not model.caps.get("mtp_draft"):
+            why = raw_tail_refusal(model)
             if why:
                 print(f" !! Warning: QSA raw-key ring ({RAW_TAIL_ENV}) refused, {why}; the full raw plane is kept",
                       flush = True)

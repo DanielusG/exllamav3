@@ -1146,6 +1146,9 @@ that holds unless something wrote 32 positions further on in the same page since
   count off a block boundary) and goes on in the middle of a block. `Cache` refuses the ring for
   such a model with a warning and keeps the full plane; also for a model whose prompt passes can
   run past a chunk's end and be taken back (`atomic_mm_prefill`). No QSA model is either today.
+  The MTP head has no recurrent states of its own (`Qwen4ExpMTPModel`'s caps) and its cache
+  follows the target's: an MTP head's cache takes the ring, and the generator refuses to start
+  (`check_raw_tail`, `raw_tail_refusal` of its own model) if its model is one of the two.
 - *Prompt cache, page sharing, tiers.* Only complete pages are reused (by hash in VRAM, from the
   CPU tier, from the disk tier), shared between jobs or stored, and a job starts at a page boundary;
   so do a requeued job, a resume from a tail checkpoint and a replay. A complete page's raw keys

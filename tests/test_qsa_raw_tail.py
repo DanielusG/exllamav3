@@ -284,11 +284,14 @@ class FakeAttn:
 
 
 class FakeModel:
-    def __init__(self, recurrent = True, atomic_mm = False, qsa = True):
+    def __init__(self, recurrent = True, atomic_mm = False, qsa = True, mtp_head = False):
         self.config = None
         self.caps = {"recurrent_states": recurrent}
         if atomic_mm:
             self.caps["atomic_mm_prefill"] = True
+        if mtp_head:
+            # Qwen4ExpMTPModel: no recurrent layers of its own, it drafts for a target that has them
+            self.caps["mtp_draft"] = True
         self.attn = [FakeAttn(3, qsa), FakeAttn(7, qsa), FakeAttn(9, qsa = False)]
         self.cache_weakrefs = {}
         self.recurrent_state_cls = None
@@ -340,17 +343,35 @@ def test_the_cache_refuses_the_ring_for_models_it_cannot_serve(model, why, capsy
     assert "refused" in out and why in out
 
 
-def test_a_model_without_qsa_layers_reports_no_ring():
+def test_a_model_without_qsa_layers_reports_no_ring(capsys):
     assert make_cache(FakeModel(qsa = False), qsa_raw_tail = True).qsa_raw_tail == 0
+    # an external draft model without QSA layers (or recurrent states) takes the argument quietly
+    assert make_cache(FakeModel(qsa = False, recurrent = False), qsa_raw_tail = True).qsa_raw_tail == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_the_mtp_heads_cache_takes_the_ring_and_its_generator_decides():
+    """The MTP head has no recurrent states of its own (Qwen4ExpMTPModel's caps): its cache follows the
+    target's generator, which refuses the ring for a target without them"""
+    head = make_cache(FakeModel(recurrent = False, mtp_head = True), qsa_raw_tail = True)
+    assert head.qsa_raw_tail == RING
+    main = make_cache(FakeModel(), qsa_raw_tail = True)
+    QSA.check_raw_tail([main, head], 2, FakeModel())
+    with pytest.raises(ValueError, match = "no recurrent states"):
+        QSA.check_raw_tail([make_cache(FakeModel(recurrent = False)), head], 2, FakeModel(recurrent = False))
+    with pytest.raises(ValueError, match = "past a chunk's end"):
+        QSA.check_raw_tail([main, head], 2, FakeModel(atomic_mm = True))
+    # without a ring anywhere, any model
+    QSA.check_raw_tail([make_cache(FakeModel(recurrent = False))], 2, FakeModel(recurrent = False))
 
 
 def test_the_generator_refuses_drafts_longer_than_the_ring_serves():
     cache = make_cache(FakeModel(), qsa_raw_tail = True)
-    QSA.check_raw_tail([cache, None], 29)      # 28 draft tokens plus the one they follow
+    QSA.check_raw_tail([cache, None], 29, FakeModel())      # 28 draft tokens plus the one they follow
     with pytest.raises(ValueError, match = "at most 28 draft tokens"):
-        QSA.check_raw_tail([cache, None], 30)
-    QSA.check_raw_tail([make_cache(FakeModel()), None], 1000)
-    QSA.check_raw_tail([make_cache(FakeModel(), qsa_raw_tail = 64)], 61)
+        QSA.check_raw_tail([cache, None], 30, FakeModel())
+    QSA.check_raw_tail([make_cache(FakeModel()), None], 1000, FakeModel())
+    QSA.check_raw_tail([make_cache(FakeModel(), qsa_raw_tail = 64)], 61, FakeModel())
 
 
 def test_the_generator_checks_its_longest_pass():
@@ -361,9 +382,9 @@ def test_the_generator_checks_its_longest_pass():
                 and any(a.arg == "draft_cache" for a in n.args.args))
     calls = [n for n in ast.walk(init) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "check_raw_tail"]
     assert len(calls) == 1
-    caches, rows = calls[0].args
+    caches, rows, model = calls[0].args
     assert [e.id for e in caches.elts] == ["cache", "draft_cache"]
-    assert ast.unparse(rows) == "self.max_draft_tokens + 1"
+    assert ast.unparse(rows) == "self.max_draft_tokens + 1" and model.id == "model"
     assigned = [n.lineno for n in ast.walk(init) if isinstance(n, ast.Assign)
                 and any(ast.unparse(t) == "self.max_draft_tokens" for t in n.targets)]
     assert assigned and assigned[0] < calls[0].lineno

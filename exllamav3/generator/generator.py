@@ -358,7 +358,7 @@ class Generator:
         # in only for verification passes it was sized for
         if getattr(cache, "qsa_raw_tail", 0) or getattr(draft_cache, "qsa_raw_tail", 0):
             from ..cache.qsa import check_raw_tail
-            check_raw_tail([cache, draft_cache], self.max_draft_tokens + 1)
+            check_raw_tail([cache, draft_cache], self.max_draft_tokens + 1, model)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)

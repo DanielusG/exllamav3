@@ -50,17 +50,40 @@ def raw_tail_max_rows(raw_tail: int, compress_ratio: int) -> int:
     return raw_tail - (compress_ratio - 1)
 
 
-def check_raw_tail(caches: list, max_rows: int):
+def raw_tail_refusal(model) -> str | None:
+    """
+    Why a model's generator cannot use the ring, None if it can. A model without recurrent states
+    reuses a partial page from the prompt cache (Job's partial-page reuse, copy_page with a token
+    count off a block boundary) and rewinds banned strings by truncation, to any depth; a model
+    whose prompt passes can run past a chunk's end takes them back (atomic_mm_prefill). Either
+    would read raw keys the ring no longer holds
+    """
+    caps = getattr(model, "caps", None) or {}
+    if not caps.get("recurrent_states"):
+        return "the model has no recurrent states"
+    if caps.get("atomic_mm_prefill"):
+        return "the model's prompt passes can run past a chunk's end"
+    return None
+
+
+def check_raw_tail(caches: list, max_rows: int, model = None):
     """
     Refuse a generator whose longest speculative pass (max_rows rows per sequence: the draft
-    window plus the token it follows) does not fit the QSA raw-key ring of one of its caches
+    window plus the token it follows) does not fit the QSA raw-key ring of one of its caches, or
+    whose model cannot use the ring at all (raw_tail_refusal; the MTP head's cache follows its
+    target, the generator's model)
     """
     for cache in caches:
         if cache is None:
             continue
         for layer in cache.layers.values():
             ring = getattr(layer, "raw_tail", 0)
-            if ring and max_rows > raw_tail_max_rows(ring, layer.compress_ratio):
+            if not ring:
+                continue
+            why = raw_tail_refusal(model) if model is not None else None
+            if why:
+                raise ValueError(f"QSA raw-key ring (qsa_raw_tail, {RAW_TAIL_ENV}) in a cache of this generator: {why}")
+            if max_rows > raw_tail_max_rows(ring, layer.compress_ratio):
                 raise ValueError(
                     f"QSA raw-key ring of {ring} tokens (qsa_raw_tail, {RAW_TAIL_ENV}) is too short for "
                     f"verification passes of {max_rows} rows: at most "
