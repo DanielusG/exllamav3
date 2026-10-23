@@ -354,6 +354,11 @@ class Generator:
         # The widest verification pass any round can take: the regular drafter's window or a hybrid draft
         self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
         self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
+        # A QSA raw-key ring (Cache(qsa_raw_tail), cache/qsa.py) keeps the block the next pass starts
+        # in only for verification passes it was sized for
+        if getattr(cache, "qsa_raw_tail", 0) or getattr(draft_cache, "qsa_raw_tail", 0):
+            from ..cache.qsa import check_raw_tail
+            check_raw_tail([cache, draft_cache], self.max_draft_tokens + 1)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)

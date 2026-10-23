@@ -419,6 +419,8 @@ def vram_accounting(model, cache = None, generator = None, devices = None) -> li
     if cache is not None:
         for l in cache.layers.values():
             mark(l.get_tensors(), "cache")
+            # A QSA raw-key ring (cache/qsa.py) is cache storage outside the page images
+            mark([getattr(l, "raw_k", None)], "cache")
         from ..modules import Module
         for rl in cache.recurrent_layers.values():
             ts = []

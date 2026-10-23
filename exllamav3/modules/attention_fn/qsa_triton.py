@@ -16,6 +16,15 @@ QSA-specific:
     on the fly from inv_freq (no cached sin/cos tables). Partial blocks are written but never
     selected (the scoring bound admits only complete blocks), and the write that completes a
     block sees all its members. Every write is idempotent and capture/warmup-safe.
+  - _qsa_raw_tail_append_kernel, _qsa_pool_update_ring_kernel, _qsa_pool_update_rows_kernel: the
+    same append and pool update over the raw-key ring of a cache layer with raw_tail > 0
+    (cache/qsa.py, the fork's EXL3_QSA_RAW_TAIL): token t of a page at ring slot
+    t % page_size % RING. The append writes the last RING rows only. The ring pool update reads
+    every raw key from the ring (the graph slots, whose appends fit it: same runtime arguments as
+    the full-plane kernels, so the slot launches them unchanged); the rows pool update reads the
+    append's own raw keys from the staged rows and only the ones before it from the ring, and runs
+    before the append (the eager path, any length). Same accumulation order and rounding points as
+    _qsa_pool_update_kernel: the pooled keys are bit for bit those of the full plane.
   - _qsa_sparse_split_kernel: gathered GQA flash-decoding over the selected token indices.
     Structure and partial layout follow _paged_attn_decode_split_kernel (one program per
     (batch, kv_head, h_block, split), same partial_o/partial_ml layout), so the standard
@@ -141,6 +150,178 @@ def _qsa_pool_update_kernel(
     if PASS > 0:
         y_ps = (m_ps * rstd * (tl.load(k_norm_w + offs_p).to(tl.float32) + 1.0)).to(tl.float16)
         tl.store(prow + offs_p, y_ps)
+
+
+@triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+def _qsa_raw_tail_append_kernel(
+    rows_new,            # (bsz, len, D) fp16 raw keys of the append
+    plane_cache,         # (pages, RING, D) fp16 raw-key ring
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    append_len,
+    page_size: tl.constexpr,
+    D: tl.constexpr,
+    RING: tl.constexpr,
+):
+    """_mla_plane_update_kernel's append (same runtime arguments) into the raw-key ring: one
+    program per row, the last RING rows of each sequence written, token t of a page at slot
+    t % page_size % RING. Within a page the rows written are distinct slots."""
+    row = tl.program_id(0)
+    batch = row // append_len
+    pos = row - batch * append_len
+    if pos + RING < append_len:
+        return
+
+    abs_pos = tl.load(cache_seqlens + batch) + pos
+    page = abs_pos // page_size
+    page_off = abs_pos - page * page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    slot = phys * RING + page_off % RING
+
+    offs = tl.arange(0, D)
+    tl.store(plane_cache + slot * D + offs, tl.load(rows_new + row * D + offs))
+
+
+@triton.jit
+def _qsa_pool_tail_block(
+    raw_plane, rows_new, pool_plane, k_norm_w, inv_freq, bt,
+    b, pos0, t_end, pool, append_len,
+    page_size: tl.constexpr,
+    P: tl.constexpr,
+    D: tl.constexpr,
+    ROPE_R: tl.constexpr,
+    attn_factor: tl.constexpr,
+    eps: tl.constexpr,
+    RING: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """The body of _qsa_pool_update_kernel for one block, raw keys addressed in the ring (ROWS:
+    the append's own from rows_new). Statement for statement the same arithmetic, so the same
+    rounding points: fp32 sums in token order, fp32 mean -> fp16, norm -> fp16, rope in fp16."""
+    HALF: tl.constexpr = ROPE_R // 2
+    PASS: tl.constexpr = D - ROPE_R
+    offs_h = tl.arange(0, HALF)
+
+    acc_lo = tl.zeros((HALF,), tl.float32)
+    acc_hi = tl.zeros((HALF,), tl.float32)
+    if PASS > 0:
+        acc_ps = tl.zeros((PASS,), tl.float32)
+        offs_p = ROPE_R + tl.arange(0, PASS)
+    cnt = 0.0
+    for j in range(P):
+        tok = pool * P + j
+        if tok < t_end:
+            phys = tl.load(bt + tok // page_size)
+            row = raw_plane + (phys * RING + tok % page_size % RING) * D
+            if ROWS:
+                if tok >= pos0:
+                    row = rows_new + (b * append_len + tok - pos0) * D
+            acc_lo += tl.load(row + offs_h).to(tl.float32)
+            acc_hi += tl.load(row + HALF + offs_h).to(tl.float32)
+            if PASS > 0:
+                acc_ps += tl.load(row + offs_p).to(tl.float32)
+            cnt += 1.0
+
+    # fp32 mean -> fp16 (the norm reads the rounded values, like the eager path)
+    m_lo = (acc_lo / cnt).to(tl.float16).to(tl.float32)
+    m_hi = (acc_hi / cnt).to(tl.float16).to(tl.float32)
+    ssq = tl.sum(m_lo * m_lo, axis = 0) + tl.sum(m_hi * m_hi, axis = 0)
+    if PASS > 0:
+        m_ps = (acc_ps / cnt).to(tl.float16).to(tl.float32)
+        ssq += tl.sum(m_ps * m_ps, axis = 0)
+    rstd = tl.rsqrt(ssq / D + eps)
+    y_lo = (m_lo * rstd * (tl.load(k_norm_w + offs_h).to(tl.float32) + 1.0)).to(tl.float16)
+    y_hi = (m_hi * rstd * (tl.load(k_norm_w + HALF + offs_h).to(tl.float32) + 1.0)).to(tl.float16)
+
+    # Partial NEOX rope at the block start: pair (d, d + HALF) shares frequency d
+    pos_f = (pool * P).to(tl.float32)
+    fr = tl.load(inv_freq + offs_h) * pos_f
+    cosv = (tl.cos(fr) * attn_factor).to(tl.float16)
+    sinv = (tl.sin(fr) * attn_factor).to(tl.float16)
+    r_lo = y_lo * cosv - y_hi * sinv
+    r_hi = y_hi * cosv + y_lo * sinv
+
+    phys0 = tl.load(bt + (pool * P) // page_size)
+    prow = pool_plane + (phys0 * (page_size // P) + pool % (page_size // P)) * D
+    tl.store(prow + offs_h, r_lo)
+    tl.store(prow + HALF + offs_h, r_hi)
+    if PASS > 0:
+        y_ps = (m_ps * rstd * (tl.load(k_norm_w + offs_p).to(tl.float32) + 1.0)).to(tl.float16)
+        tl.store(prow + offs_p, y_ps)
+
+
+@triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
+def _qsa_pool_update_ring_kernel(
+    raw_plane,           # flat (pages * RING, D) fp16 raw-key ring
+    pool_plane,          # flat (pages * page_size // P, D) fp16 pooled keys
+    k_norm_w,            # (D,) fp16
+    inv_freq,            # (ROPE_R // 2,) fp32
+    block_table,         # (bsz, num_pages_per_row) i32
+    cache_seqlens,       # (bsz,) i32, pre-append counts
+    num_pages_per_row,
+    append_len,
+    page_size: tl.constexpr,
+    P: tl.constexpr,
+    D: tl.constexpr,
+    ROPE_R: tl.constexpr,
+    attn_factor: tl.constexpr,
+    eps: tl.constexpr,
+    MAXPOOLS: tl.constexpr,      # grid height: append_len // P + 1
+    RING: tl.constexpr,
+):
+    """_qsa_pool_update_kernel (same runtime arguments) over the raw-key ring, after
+    _qsa_raw_tail_append_kernel: every raw key read from the ring, so an append and the P - 1
+    tokens before it must fit it (append_len + P - 1 <= RING; the graph slots' appends do)."""
+    b = tl.program_id(0)
+    pi = tl.program_id(1)
+    pos0 = tl.load(cache_seqlens + b)
+    t_end = pos0 + append_len
+    pool = pos0 // P + pi
+    if pool * P >= t_end:
+        return
+    _qsa_pool_tail_block(
+        raw_plane, raw_plane, pool_plane, k_norm_w, inv_freq, block_table + b * num_pages_per_row,
+        b, pos0, t_end, pool, append_len,
+        page_size, P, D, ROPE_R, attn_factor, eps, RING, 0,
+    )
+
+
+@triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
+def _qsa_pool_update_rows_kernel(
+    raw_plane,           # flat (pages * RING, D) fp16 raw-key ring
+    pool_plane,          # flat (pages * page_size // P, D) fp16 pooled keys
+    k_norm_w,            # (D,) fp16
+    inv_freq,            # (ROPE_R // 2,) fp32
+    block_table,         # (bsz, num_pages_per_row) i32
+    cache_seqlens,       # (bsz,) i32, pre-append counts
+    num_pages_per_row,
+    append_len,
+    rows_new,            # (bsz, append_len, D) fp16 raw keys of the append
+    page_size: tl.constexpr,
+    P: tl.constexpr,
+    D: tl.constexpr,
+    ROPE_R: tl.constexpr,
+    attn_factor: tl.constexpr,
+    eps: tl.constexpr,
+    MAXPOOLS: tl.constexpr,
+    RING: tl.constexpr,
+):
+    """_qsa_pool_update_kernel over the raw-key ring for an append of any length: its own raw keys
+    from rows_new, the ones before it (the block it starts in) from the ring. Runs BEFORE
+    _qsa_raw_tail_append_kernel, whose writes may take the ring slots of those."""
+    b = tl.program_id(0)
+    pi = tl.program_id(1)
+    pos0 = tl.load(cache_seqlens + b)
+    t_end = pos0 + append_len
+    pool = pos0 // P + pi
+    if pool * P >= t_end:
+        return
+    _qsa_pool_tail_block(
+        raw_plane, rows_new, pool_plane, k_norm_w, inv_freq, block_table + b * num_pages_per_row,
+        b, pos0, t_end, pool, append_len,
+        page_size, P, D, ROPE_R, attn_factor, eps, RING, 1,
+    )
 
 
 @triton.jit(do_not_specialize = ["k_len", "num_pages_per_seq", "num_splits", "split_len"])
