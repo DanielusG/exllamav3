@@ -1137,6 +1137,14 @@ class SS_AdaptiveP(SS_Base):
         return None
 
 
+# Steps that sample each row of a batch on its own and keep nothing from one call to the next, so
+# that the positions of a speculative window can go through one call (CustomSampler.forward_window)
+WINDOW_STEPS = (
+    SS_Argmax, SS_Sample, SS_Temperature, SS_Normalize, SS_Sort, SS_MinP, SS_TopK, SS_TopP, SS_XTC,
+    SS_BanTokens, SS_LogitBias, SS_RepP, SS_PresFreqP, SS_DRY, SS_Fused,
+)
+
+
 class CustomSampler(Sampler):
     def __init__(
         self,
@@ -1182,6 +1190,17 @@ class CustomSampler(Sampler):
                     for prep_step in prep_steps:
                         self.steps.append(prep_step())
                 self.steps.append(step)
+
+        # Whether forward_window() can sample every position of a speculative window in one call
+        # (Generator.mtp_batched_verify): every step works row by row with nothing carried from
+        # one call to the next (not SS_AdaptiveP, which adapts to what it sampled, nor
+        # SS_Sample_mn, which draws from torch's generator); a step that reads past token IDs
+        # needs them per position, which the penalty kernels take for one row at a time, so it
+        # must sit in the head of a fused stack (run per row, then the fused tail on all rows)
+        self.window_past_ids = any(s.reqs_past_ids() for s in simplified)
+        self.window_head = (head, fused_tail) if fused_tail is not None else None
+        self.window_sampling = all(type(s) in WINDOW_STEPS for s in simplified) and \
+            (not self.window_past_ids or self.window_head is not None)
 
 
     @override
@@ -1268,3 +1287,78 @@ class CustomSampler(Sampler):
         assert return_state or state.state == SS.DONE, "Sampling logic error"
 
         return state if return_state else state.sample.view(out_shape)
+
+
+    @torch.inference_mode
+    def forward_window(
+        self,
+        logits: torch.Tensor,
+        past_ids: list[torch.Tensor] | None,
+        rand_u32: int,
+        tokenizer: Tokenizer | None = None,
+        logit_mask: torch.Tensor | None = None,
+    ):
+        """
+        Sample every position of a speculative window in one call (Generator.mtp_batched_verify).
+        logits: (1, R, vocab), one row per position; logit_mask: one row per position (or one for
+        all); past_ids: one tensor per position (the job's past IDs followed by the drafts before
+        it), or None when no step reads them (window_past_ids). Returns (1, R).
+
+        Each row is sampled as forward() samples it alone with the same rand_u32: the Gumbel noise
+        is keyed on (rand_u32, flat index), so row 0 gets the noise of a call for that row alone
+        and every row's noise is independent of the others'. Steps that read past IDs run per row
+        (the penalty kernels take one row), the fused tail once over all rows. Needs
+        window_sampling.
+        """
+        assert self.window_sampling, "Sampler stack cannot sample a window in one call"
+        if past_ids is None or not self.window_past_ids:
+            return self.forward(logits, None, rand_u32, tokenizer, logit_mask = logit_mask)
+
+        head, tail = self.window_head
+        out_shape = logits.shape[:-1]
+        dim = logits.shape[-1]
+        rows = logits.numel() // dim
+        assert len(past_ids) == rows, "One set of past IDs per position"
+
+        # As forward() with a head: the padded vocabulary and the mask before the head's steps
+        if tokenizer is not None and tokenizer.actual_vocab_size < dim:
+            logits[..., tokenizer.actual_vocab_size:] = -float("inf")
+        x = logits.view(rows, dim)
+        if logit_mask is not None:
+            if logit_mask.dtype == torch.int32:
+                masked = torch.empty_like(x)
+                ext.apply_logit_bitmask(x, masked, logit_mask)
+                x = masked
+            else:
+                pad = dim - logit_mask.shape[-1]
+                if pad > 0:
+                    logit_mask = F.pad(logit_mask, (0, pad), value = float("-inf"))
+                x = x + logit_mask
+
+        tail_logits = torch.empty((rows, dim), dtype = torch.float, device = x.device)
+        for r in range(rows):
+            state = SamplingState(
+                rand_u32 = rand_u32,
+                dim = dim,
+                bsz = 1,
+                in_logits = x[r:r + 1],
+                past_ids = past_ids[r],
+                tokenizer = tokenizer,
+            )
+            for ss in head:
+                ss.run(state)
+            assert state.state == SS.LOGITS, "Sampling logic error"
+            tail_logits[r:r + 1].copy_(state.logits)
+
+        state = SamplingState(
+            rand_u32 = rand_u32,
+            dim = dim,
+            bsz = rows,
+            in_logits = tail_logits,
+            logits = tail_logits,
+            tokenizer = tokenizer,
+            state = SS.LOGITS,
+        )
+        tail.run(state)
+        assert state.state == SS.DONE, "Sampling logic error"
+        return state.sample.view(out_shape)

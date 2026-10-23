@@ -81,6 +81,7 @@ class Generator:
     # can be added to one shared by every such generator
     stagger_decode = False
     prefill_thread = False
+    mtp_batched_verify = False
     _stagger_backlog = ()
     _stagger_run = None
     _flight = None
@@ -119,6 +120,7 @@ class Generator:
         stagger_decode: bool = False,
         prefill_thread: bool = False,
         prefill_pipeline: bool = False,
+        mtp_batched_verify: bool = False,
         **kwargs
     ):
         """
@@ -221,6 +223,19 @@ class Generator:
             available where the prefill thread is not. Can be switched at any time (attribute of the same name).
             EXL3_PREFILL_PIPELINE=1 in the environment turns it on for callers that do not pass the argument. See
             _pipe_round().
+
+        :param mtp_batched_verify:
+            With the MTP head drafting: sample every position of each job's speculative window in one
+            sampler call, compare the samples with the drafts on the device, and read the tokens and the
+            accepted lengths of every such job back at once, instead of a sampler call and a readback per
+            position and job. Greedy sampling gives the same tokens; with random sampling a job draws one
+            random number per window instead of one per position, so the same seed samples other tokens
+            (as reproducibly). A job whose window cannot be sampled ahead (Job.window_sampling_why: token
+            healing or its first token, forced tokens, probabilities asked for, banned strings, stop tokens
+            still blocked by min_new_tokens, a stateful sampler step, a filter without native rollback or
+            with a trigger token) takes the serial path that step. Can be switched at any time (attribute
+            of the same name). EXL3_MTP_BATCHED_VERIFY=1 in the environment turns it on for callers that do
+            not pass the argument. See _verify_windows().
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -377,6 +392,17 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
+
+        # Readbacks of drafted and sampled tokens by the decode steps (each a host wait for the GPU),
+        # counted whatever the switches: decode steps that sampled, readbacks they and their draft
+        # steps made. Not counted: a job's first token (its NaN check and timing are a wait each)
+        self.readback_stats = {"steps": 0, "readbacks": 0}
+
+        # Speculative windows sampled in one call each and read back together (_verify_windows):
+        # windows sampled so, windows left to the serial path while the switch is on (and why)
+        self.mtp_batched_verify = mtp_batched_verify or \
+            os.environ.get("EXL3_MTP_BATCHED_VERIFY", "0") not in ("", "0")
+        self.mtp_verify_stats = {"windows": 0, "serial": 0, "readbacks": 0, "fallbacks": {}}
 
         # Staggered decode (iterate_staggered)
         self._stagger_init(stagger_decode)
@@ -1373,6 +1399,7 @@ class Generator:
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
+            self._note_readbacks(2)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -2983,6 +3010,7 @@ class Generator:
         for job in batch_jobs:
             job.prepare_logit_mask()
             job.prepare_sampling_past_ids()
+        self._note_readbacks(0, step = True)
 
         # TODO: Batch sampling
         # Pass to jobs to sample
@@ -3044,6 +3072,7 @@ class Generator:
                 launched.append((job, token_logits, sampled))
             if launched:
                 torch.cuda.synchronize(batch_logits.device)
+                self._note_readbacks(1)
                 # The sampled tokens are the next forward's inputs
                 self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
@@ -3074,17 +3103,30 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            # With mtp_batched_verify the windows that can be sampled at once are, and read back
+            # together: id(job) -> (sampled tokens, drafts matched from the first). The serial loop
+            # below then takes their tokens from there, the rest as before
+            windows = None
+            if draft_tokens is not None and self.mtp_batched_verify and self.mtp_draft:
+                windows = self._verify_windows(jobs, logit_mapping, batch_logits, draft_tokens)
+
             for idx, (job, a, b) in enumerate(zip(jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+                window = windows.get(id(job)) if windows else None
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if window is None:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
+                        self._note_readbacks(1)
+                    else:
+                        next_token = torch.tensor([[window[0][i]]], dtype = torch.long)
+                        next_k_tokens, next_k_probs, next_prob = None, None, None
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -3139,7 +3181,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        if window is not None:
+                            mismatch = i >= window[1]
+                        else:
+                            mismatch = draft_tokens[j, i].item() != sampled_token.item()
+                        if mismatch or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -3147,6 +3193,11 @@ class Generator:
                         else:
                             job.accepted_draft_tokens += 1
                             accepted_length += 1
+
+                            # A window sampled at once had every position's mask and past IDs made
+                            # ahead; receive_sample has fed the filters the token
+                            if window is not None:
+                                continue
 
                             # Advance filters
                             for f in job.filters:
@@ -3301,6 +3352,98 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def _note_readbacks(self, n: int, step: bool = False):
+        """Count readbacks of drafted or sampled tokens (readback_stats), and a decode step that
+        samples. A Generator made without __init__ has no counters"""
+        stats = getattr(self, "readback_stats", None)
+        if stats is not None:
+            stats["readbacks"] += n
+            if step:
+                stats["steps"] += 1
+
+
+    @staticmethod
+    def _host_wait(device):
+        """
+        Wait on the host for what has been issued so far on the current stream of `device`, the
+        stream the decode step's sampling and its copies go to: not for the whole device, so a
+        copy stream of the CPU expert worker's host or anything else on another stream of the card
+        is not waited for (a chunk on the prefill thread shares the stream, and is waited for up to
+        here, as by any readback). Nothing to wait for off CUDA.
+        """
+        device = torch.device(device)
+        if device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            event.synchronize()
+
+
+    def _verify_windows(self, jobs, logit_mapping, batch_logits, draft_tokens) -> dict | None:
+        """
+        Speculative windows sampled at once (mtp_batched_verify). The serial path samples a job's
+        window a position at a time, each a sampler call and a readback, the next position only
+        once the one before matched its draft. Here every job that can (Job.window_sampling_why)
+        has its window sampled in one call (Job.sample_window: position r as if drafts[:r] were
+        accepted), the samples are compared with the drafts on the device and the number of drafts
+        matched from the first is counted there, and the tokens and counts of every such job come
+        back in one copy and one wait. The serial loop then accepts from them exactly as from its
+        own samples: a position whose draft did not match ends the window, and so do what it checks
+        on the host, a recurrent checkpoint boundary (the tail checkpoint's too), a stop condition, a
+        requeue (positions sampled past where the window ends are never used). Jobs that cannot take
+        the serial path in the same step, after this wait.
+
+        Returns {id(job): (tokens of the window, drafts matched)}, or None when no job's window was
+        sampled so.
+        """
+        stats = self.mtp_verify_stats
+        width = draft_tokens.shape[-1]
+        rows = width + 1
+        if width < 1:
+            return None
+
+        taken = []
+        samples = []
+        j = 0
+        for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b:
+                continue
+            row = j
+            j += 1
+            why_fn = getattr(job, "window_sampling_why", None)
+            why = "job" if why_fn is None else why_fn()
+            if why is None:
+                sampled = job.sample_window(batch_logits[a:b, :, :], draft_tokens[row, :width].tolist())
+                if sampled is None:
+                    why = "filter_error"
+            if why is not None:
+                stats["serial"] += 1
+                stats["fallbacks"][why] = stats["fallbacks"].get(why, 0) + 1
+                continue
+            taken.append((job, row))
+            samples.append(sampled.view(1, rows))
+        if not taken:
+            return None
+
+        # The drafts of the jobs taken, uploaded from pinned staging; samples and matched counts
+        # come back through one pinned buffer, in one copy
+        n = len(taken)
+        device = batch_logits.device
+        drafts = self._staging("verify_drafts", n, width, torch.long)
+        for k, (job, row) in enumerate(taken):
+            drafts[k].copy_(draft_tokens[row, :width])
+        sampled = torch.cat(samples, dim = 0)
+        drafted = drafts.to(device, non_blocking = True)
+        matched = (sampled[:, :width] == drafted).long().cumprod(dim = 1).sum(dim = 1, keepdim = True)
+        out = self._staging("verify_out", n, rows + 1, torch.long)
+        out.copy_(torch.cat((sampled, matched), dim = 1), non_blocking = True)
+        self._host_wait(device)
+        self._note_readbacks(1)
+        stats["windows"] += n
+        stats["readbacks"] += 1
+
+        return {id(job): (r[:rows], r[rows]) for (job, _), r in zip(taken, out.tolist())}
 
 
     def reap_failed_job(self, job, error, results: list):

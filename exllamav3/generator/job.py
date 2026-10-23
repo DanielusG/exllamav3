@@ -292,7 +292,10 @@ class Job:
         self.pinned_logit_mask = None
         self.pinned_logit_bitmask = None
         self.device_logit_mask = None
+        self.host_logit_mask = None
         self.logits_device = None
+        # A speculative window's masks, one row per position, staged here (_window_masks)
+        self.pinned_window_masks = {}
 
         # Embeddings
         self.embeddings = embeddings or []
@@ -329,8 +332,10 @@ class Job:
         self.sam = rq_state.get("sam", None)
         self.sam_match = None
 
-        # MTP state
+        # MTP state. mtp_fold: the next draft the head's update already made for this job
+        # (Generator.mtp_batched_update), for the position it was made at
         self.mtp_last_hidden = None
+        self.mtp_fold = None
 
 
     def get_pinned_logit_mask(self):
@@ -491,6 +496,10 @@ class Job:
                 inv_mask = torch.full_like(logit_mask, float("-inf"))
                 inv_mask[:, allowed_tokens] = 0
                 logit_mask += inv_mask
+
+        # The host side of the mask (the job's pinned buffer), for a speculative window's masks
+        # (_window_masks)
+        self.host_logit_mask = logit_mask
 
         # If any logits need masking, move mask to device.
         if logit_mask is not None:
@@ -795,6 +804,189 @@ class Job:
                 next_k_probs = sorted_probs[:, :, :self.return_top_tokens]
 
         return next_token, next_k_tokens, next_k_probs, next_prob
+
+
+    def window_sampling_why(self) -> str | None:
+        """
+        Why the positions of this job's speculative window cannot be sampled in one call this step
+        (Generator.mtp_batched_verify, sample_window), or None when they can. The serial path
+        samples a position only once the one before it is accepted, and between the two advances
+        what the next position's sampling reads; the window is sampled at once only where that can
+        be done ahead for every position: the filters' masks (fed the drafts and rolled back, which
+        needs a native rollback) and the past IDs of the penalties (the drafts appended).
+        """
+        if len(self.sequences) != 1:
+            return "sequences"
+        # Token healing (-1), and the first token, which receive_logits checks for NaN/Inf
+        if self.new_tokens < 1:
+            return "first_token"
+        if self.forced_ids is not None:
+            return "forced_tokens"
+        if self.return_probs or self.return_top_tokens > 0:
+            return "probs"
+        # A partial match holds tokens back and blocks the tokens it explored at the next position
+        if self.banned_strings_utf32_offsets is not None or self.checkpoint is not None:
+            return "banned_strings"
+        # Stop tokens are blocked up to min_new_tokens, a limit the window could cross
+        if self.new_tokens < self.min_new_tokens:
+            return "min_new_tokens"
+        if not getattr(self.sampler, "window_sampling", False):
+            return "sampler"
+        if not self.filters_suspended:
+            base = getattr(Filter, "rollback_tokens", None)
+            for f in self.filters:
+                # A draft that is a trigger token resets the filter, which rolls back by replaying it all
+                if f.trigger_token is not None:
+                    return "filter"
+                if f.is_active and getattr(type(f), "rollback_tokens", None) in (None, base):
+                    return "filter"
+        return None
+
+
+    def sample_window(self, logits: torch.Tensor, drafts: list[int]) -> torch.Tensor | None:
+        """
+        Sample every position of a speculative window in one sampler call (Generator.
+        mtp_batched_verify; window_sampling_why must have said yes this step, and prepare_logit_mask
+        and prepare_sampling_past_ids must have run for the first position). logits: (1, R, vocab);
+        drafts: the R - 1 drafted tokens. Position r is sampled as receive_logits would sample it
+        once drafts[:r] are accepted: with the mask the filters give after drafts[:r] and the past
+        IDs followed by drafts[:r]. One random draw for the window, where the serial path takes one
+        per position: the Gumbel noise is per row, so position 0 gets what the serial path would
+        give it with that draw and every position's noise is independent of the others'.
+
+        Returns the sampled tokens, (1, R) on the logits' device, or None when the masks could not
+        be computed (a filter raised: every filter is put back as it was, nothing is drawn, and the
+        job takes the serial path this step).
+        """
+        rows = logits.shape[1]
+        try:
+            mask = self._window_masks(drafts, rows)
+        except Exception:
+            return None
+        past_ids = self._window_past_ids(drafts) if getattr(self.sampler, "window_past_ids", False) else None
+        return self.sampler.forward_window(
+            logits,
+            past_ids,
+            self.rng.randint(0, (1<<32)-1),
+            self.generator.tokenizer,
+            logit_mask = mask,
+        )
+
+
+    @staticmethod
+    def _mask_allows(mask: torch.Tensor | None, token: int) -> bool:
+        """Whether a host mask row, (1, words) packed int32 or (1, vocab) additive half, lets a token through"""
+        if mask is None:
+            return True
+        if mask.dtype == torch.int32:
+            word = token >> 5
+            return word < mask.shape[-1] and bool((int(mask[0, word]) >> (token & 31)) & 1)
+        return token < mask.shape[-1] and bool(torch.isfinite(mask[0, token]))
+
+
+    def _compose_masks(self, f_masks: list) -> torch.Tensor | None:
+        """One host mask from the filters' masks, combined as prepare_logit_mask combines them (packed
+        while every mask is, dense otherwise). None for no active filter."""
+        if not f_masks:
+            return None
+        if all(m.dtype == torch.int32 for m in f_masks):
+            words = self.generator.padded_vocab_size // 32
+            out = torch.zeros((1, words), dtype = torch.int32)
+            for i, m in enumerate(f_masks):
+                w = min(m.shape[-1], words)
+                if i == 0:
+                    out[:, :w].copy_(m[:, :w])
+                else:
+                    out[:, :w] &= m[:, :w]
+                    out[:, w:] = 0
+            return out
+        out = None
+        for m in f_masks:
+            if m.dtype == torch.int32:
+                m = self._expand_bitmask(m)
+            out = m.clone() if out is None else out + m
+        return out
+
+
+    def _window_masks(self, drafts: list[int], rows: int) -> torch.Tensor | None:
+        """
+        The logit mask of each position of a speculative window, on the logits' device: (rows, words)
+        packed int32 when every row is packed, else (rows, vocab) additive half; None when nothing is
+        masked. Row 0 is what prepare_logit_mask built for this step (window_sampling_why admits no
+        blocked or allowed tokens, so the filters' masks are all of it). Row r is the filters' mask
+        after drafts[:r]: each filter is fed the drafts (Filter.feed, journaled) and rolled back at
+        the end (Filter.rewind), whatever happens in between. A draft the previous row masks out
+        cannot be accepted, nor can anything after it, and a draft that ends a filter with
+        eos_after_completed ends the job if it is accepted: the rows after either repeat the last
+        one, never read.
+        """
+        first = self.host_logit_mask
+        if first is None:
+            return None
+        host_rows = [first.clone()]
+        filters = [] if self.filters_suspended else self.filters
+        fed = [0] * len(filters)
+        try:
+            for r in range(1, rows):
+                d = int(drafts[r - 1])
+                if not self._mask_allows(host_rows[-1], d):
+                    break
+                eos = False
+                for k, f in enumerate(filters):
+                    eos |= f.feed(d)
+                    fed[k] += 1
+                if eos:
+                    break
+                # The filters reuse their mask buffers, hence the clones
+                f_masks = [f.get_next_logit_mask().clone() for f in filters if f.is_active]
+                host_rows.append(self._compose_masks(f_masks))
+        finally:
+            for f, n in zip(filters, fed):
+                f.rewind(n)
+
+        packed = all(m is None or m.dtype == torch.int32 for m in host_rows)
+        width = self.generator.padded_vocab_size // 32 if packed else self.generator.padded_vocab_size
+        key = (packed, width)
+        buf = self.pinned_window_masks.get(key)
+        if buf is None or buf.shape[0] < rows:
+            buf = torch.empty(
+                (max(rows, self.generator.max_draft_tokens + 1), width),
+                dtype = torch.int32 if packed else torch.half,
+                pin_memory = True,
+            )
+            self.pinned_window_masks[key] = buf
+        for r in range(rows):
+            m = host_rows[min(r, len(host_rows) - 1)]
+            if m is None:
+                # No filter active any more (all completed): nothing masked
+                buf[r].fill_(-1 if packed else 0.0)
+            elif packed:
+                w = min(m.shape[-1], width)
+                buf[r, :w].copy_(m[0, :w])
+                buf[r, w:] = 0
+            else:
+                if m.dtype == torch.int32:
+                    m = self._expand_bitmask(m)
+                w = min(m.shape[-1], width)
+                buf[r, :w].copy_(m[0, :w])
+                buf[r, w:] = float("-inf")
+        return buf[:rows].to(self.logits_device, non_blocking = True)
+
+
+    def _window_past_ids(self, drafts: list[int]) -> list[torch.Tensor]:
+        """Past IDs of each position of a speculative window, on the logits' device: the sequence
+        followed by drafts[:r] for position r. The drafts go after the sequence in the pinned buffer
+        prepare_sampling_past_ids staged it in (beyond its watermark, so the next staging overwrites
+        them) and the whole is uploaded once; each row is a view of it."""
+        n = len(self.sequences[0].sequence_ids)
+        d = len(drafts)
+        if self.pinned_ids is not None and n + d <= self.pinned_ids.shape[-1]:
+            host = self.pinned_ids[:, :n + d]
+            host[0, n:].copy_(torch.tensor(drafts, dtype = torch.long))
+        else:
+            host = torch.cat((self.sequences[0].sequence_ids.torch_slice(0, n), torch.tensor([drafts], dtype = torch.long)), dim = -1)
+        dev = host.to(self.logits_device, non_blocking = True)
+        return [dev[:, :n + r] for r in range(d + 1)]
 
 
     def receive_sample(
