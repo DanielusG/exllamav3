@@ -1275,6 +1275,141 @@ no such draft, with 1-3 draft tokens, staggered, across requeues and checkpoint 
 draft taken at the wrong position; readbacks and head passes counted. Marked `nogpu`; run with
 `--noconftest` without the compiled extension.
 
+### The MTP draft window chosen from a measured cost curve (`Generator(draft_window = "cost")`, `EXL3_DRAFT_WINDOW=cost`)
+
+Off by default (`"fixed"`); with it off the generator behaves as upstream. For the MTP head. In the
+server: `--draft-window cost` (its `AGENTS.md`, the rule after 30). Written on this base
+(2026-10-23), on top of the two switches above; not run on the cards.
+
+**What upstream does.** Every decode step verifies `num_draft_tokens` drafts per job. The
+confidence-target draft (`dynamic_draft_tokens`) stops the head's loop once every row's running
+product of estimated acceptance falls below a fixed target (0.4), whatever a position costs. What
+it costs on this machine (production on 1.6.3, one request, 15-23k context): W=1 30.1 ms a step for
+1.79 tokens, W=3 43.1 ms (37-41 once warm) for 2.52, about 5 ms per drafted position; predictable
+stretches reach 70-84 tok/s at W=3 against about 59 at W=1, the rest lose. The decode paths' fast
+kernels serve up to 8 rows (jobs x (1 + W): MoE fused decode, hyperconnections), so the curve has a
+cliff: W=2 with three jobs, W=1 with five. One window serves a whole batch (or a staggered group).
+
+**What the switch does** (DeepSeek's DSpark policy, with the head's own confidence in place of a
+trained head; `generator/draft_window.py`). Each step takes the window W that maximizes
+
+    (n + sum over the n jobs of a_j1 + a_j1 a_j2 + ... + a_j1 ... a_jW) / T(n, W)
+
+- *Estimates.* a_jk is job j's k-th draft's acceptance given the ones before, from its winning
+  logit through a `DraftConfidenceCalibrator` of the policy's own (the dynamic draft's bins and
+  decay; the target it is made with is not used). The head exports the logit with each position
+  (`export_draft_conf`), and it comes back with the drafts: a non-blocking copy into pinned memory
+  just before the drafts' blocking readback on the same stream (`_dw_stage_conf`). The fold of
+  `mtp_batched_update` exports it too, kept on the job with the draft, and `_mtp_take_folds` reads it
+  back in the drafts' copy. No readback of its own: `readback_stats` counts the same per drafted
+  position as before.
+- *Labels.* Every verified position: with the window sampled at once (`mtp_batched_verify`) the
+  target's sample at position r was made as if `drafts[:r]` were accepted, so every position of the
+  window is a label, past the first mismatch too (with a filter, up to it: past a refused draft the
+  rows repeat the last mask); serially, the accepted ones and the first that was not. A step that
+  verifies nothing labels the first draft with the token the target sampled, so labels never stop
+  (a calibrator that decays without labels goes back to its burn-in, whose estimate is 1.0: tried,
+  it oscillated). Soft labels (the target's probability of each draft, DSpark's calibration) are
+  not used: the fused sampler does not expose the processed distribution, a raw softmax would be
+  wrong for greedy requests and for top-P/top-K stacks, and the hard labels of whole windows give
+  n x W labels a step (the calibrator's burn-in, 64 labels, is a few steps).
+- *The choice, as the head drafts.* The head drafts a position at a time, each with a readback
+  already. After each position the windows drafted so far are scored with their estimates, the
+  longer ones with a prediction (each job's next positions as likely as its last one), and drafting
+  stops once no longer window is predicted to beat the best one drafted (`DraftWindowRound`). A
+  position drafted and then not verified (its estimate turned out low) is a head pass for nothing,
+  and such a step is not timed.
+- *W = 0.* Allowed: past the 8-row cliff (five or six jobs, production runs `max_batch_size` 6)
+  only W = 0 stays under it, and a stretch the head gets wrong pays nothing for its rows. The head's
+  first draft is still made (its pass writes the head's cache at the job's position, and its logit
+  decides between 0 and more; with `mtp_batched_update` it comes from the last fold at no cost); the
+  step then takes upstream's path without drafts (one token per job, one synchronize).
+- *T(n, W).* The median of the last 32 wall times of steps with n jobs and window W, regular and
+  staggered steps apart. A step is timed from the end of the last decode step's sampling to the end
+  of its own (`time.perf_counter()` where the host has just waited for the pass: after
+  `_verify_windows`' wait with the switch, after the serial path's last readback without), so it
+  holds everything a step costs, the last step's head update and what the caller does between two
+  `iterate()` calls included. It is kept only when nothing else ran in it (`_dw_end`): the same jobs
+  (none started, ended, requeued or cancelled), no prompt ingested in the iteration, no tail
+  checkpoint taken, no cap on the window, no position drafted past the window, and in a staggered
+  decode a call that also issued the next group (a staggered call's time goes to the group it
+  sampled, whose window was chosen a call earlier). The first time of each (n, W) is dropped (the
+  first step at a shape captures its graphs); a change of either MTP decode switch forgets the curve.
+  The cliff is read from the times, not written anywhere.
+- *Exploration.* A window with fewer than 4 times for these jobs is taken to time it (the one with
+  the fewest first, only in a step that can be timed); a window the policy does not take is timed
+  again after 512 steps, then after twice as many each time it still is not taken, up to 16 x 512,
+  one such refresh at most every 32 steps: a window past the cliff is taken about six times in 20000
+  steps once known (`tests/test_draft_window.py`). Until a window is known for these jobs the
+  policy takes the longest, as without it; until the calibrator has its labels the estimates are 1.0.
+- *A prompt chunk beside the decode* (`prefill_thread`, `prefill_pipeline`). A chunk may overlap a
+  decode step of at most `side_max_rows` rows (8). `_decode_rows` counts the step at the narrowest
+  window the policy may take, and while a chunk is under way the draft step caps the window so that
+  n x (1 + W) stays within it (`_dw_begin`): with three jobs and W up to 3, chunks now run beside a
+  decode of W <= 1, where at a fixed W=3 (12 rows) every chunk was waited for. With the hybrid draft
+  the count stays at the widest (its window is decided after the prefill round).
+- *With the head's update in one pass.* `_mtp_fold` folded only a window of `num_draft_tokens`
+  without the calibrator. Its content does not depend on who drafted (position K+i pairs the token
+  there with the target's state at K+i-1) and its width is the step's, so a window the policy chose
+  is folded whatever its width; a window of 0 over K+1 (the head's cache at K was written this step,
+  by the draft pass or by the fold whose draft the step took). Each window is then a shape of the
+  fold as well as of the verification pass.
+- *Other features.* The staggered decode chooses a window per group, at its draft step. A hybrid
+  round that replaces the window is not the policy's: not timed, not labelled, not folded. Checkpoint
+  boundaries, the tail checkpoint, stop conditions and requeues cut a window on the host as before;
+  a banned-string rewind gives no labels. The confidence-target draft is not used while the policy
+  is on. The switch can be flipped between steps (attribute of the same name).
+- *Exactness.* Speculative decoding keeps the target's tokens whatever the window. A position is
+  then computed by verification passes of other widths from step to step; on the cards their logits
+  can differ in the last bits (the exposure two fixed windows already have against each other), so
+  greedy text is the same only as far as no near-tie falls there. The exact check does not exercise
+  the policy yet.
+- `draft_window_set` (`EXL3_DRAFT_WINDOW_SET`, e.g. `0,1,3`) limits the windows; default 0 to
+  `num_draft_tokens`. Above it nothing is taken (buffers and the cache's `max_history` are sized by it).
+- `draft_window_stats`: steps, windows taken (`chosen`), explored, capped, overridden, timed, positions
+  drafted, verified and accepted, expected against realised tokens of the steps it chose freely,
+  labels, `curve` (`"r:n:W"` -> samples and median ms) and the calibrator's state.
+
+What it costs when it runs: the head's winning logit (`max` in place of `argmax` over its logits),
+one non-blocking copy of n floats per drafted position, Python per step (the policy's part, 22 us a
+step with three jobs and 20 bins on the development machine), a head pass now and then for a
+position not verified. On the cards each window
+is a shape of its own: with windows 0-3 the verification pass takes 1-4 tokens per job instead of
+the one width of a fixed window, and the fold as many (graph slots of the attention and statics per
+shape and card, the head's on the first card, where VRAM is shortest: not measured; a window of 0
+is a 1-token verification shape production never ran with MTP). The main cache needs
+`max_history = num_draft_tokens` as for a fixed window of that size: on this base the recurrent
+state is two rows per slot whatever `max_history` (1.5.4 kept a whole state per history step: the
+111 MiB a token and slot of the server's rule 5); what grows is each GDN layer's conv ring and
+staged scan inputs, 4 x fdim_qkv + 6 x num_v_heads bytes per layer, slot and history token
+(`GDNLayerState`), on Flash-Next (36 GDN layers, fdim_qkv about 10k, 48 value heads: from its
+57 MiB checkpoint) about 1.4-2 MiB per slot and draft token, 17-24 MiB with six slots from 1 to 3
+draft tokens. Nothing written anywhere.
+
+On the toy (`tests/test_draft_window.py`, acceptance one in three at every position, a clock the
+target's pass moves by a synthetic cost of its shape): one job on a flat curve takes W=3, two jobs
+on a steep one W=0, three jobs on a curve with a cliff past 8 rows W=1 and the windows past the
+cliff only to time them; expected tokens within 10% of realised. The toy's acceptance is not
+production's (about 0.79 at the first position, about 0.58 after it from the 1.6.3 run above), so
+it says nothing of the tok/s on the cards.
+
+Not checked beyond reading: a TP head's confidence (`tp_dispatch_lm_head_argmax(return_max = True)`);
+a head that exports no confidence (the Qwen 3.5/3.8 heads do, through the target's head) gets the
+calibrator's overall rate, which without labels stays 1.0, so the policy then weighs every draft as
+certain; the graph shapes' VRAM, whether the step time's median is stable enough on the cards with the
+prefill thread and the expert sweeps around it.
+
+Tests (no GPU, no extension): `tests/test_draft_window.py`: the policy on its own (the curve's
+medians, clean steps only, the first dropped; flat curve, steep curve with low acceptance, a cliff,
+the head stopping early, jobs counted together, no measure, restricted windows, a cap, the switches;
+20000 simulated steps: every window timed, the cliff rarely after); the generator over the toy with
+a clock its passes move: the same tokens with the policy as without, with 1 and 3 draft tokens, with
+and without either MTP decode switch, staggered, switched on and off while jobs run; the window
+following flat, steep and cliffed curves; the head's confidence deciding step by step; every
+readback counted, one per drafted position and one for the sampling with both switches; the window
+capped beside a prompt chunk on the prefill thread, the chunks running beside where a fixed W=3
+waits for them. Marked `nogpu`; run with `--noconftest` without the compiled extension.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
