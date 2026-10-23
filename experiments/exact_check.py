@@ -30,6 +30,10 @@ Scenarios (--scenarios):
   6  expert placement with the prefill weight unset against stock: same traffic, same sweeps,
      same placement decisions (in the processes of scenario 1)
   7  stress for hangs with every production switch on, watchdog on every library call
+  8  (on request, not in the default list) the QSA raw-key ring (EXL3_QSA_RAW_TAIL): the same forced
+     runs in a process with the full raw plane and one with the ring (a document past the sparse
+     threshold, the same beside three jobs generating, the next turn from VRAM and from the disk
+     tier), and the memory each load leaves on the cards
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -105,7 +109,7 @@ SIDE_MAX_ROWS = 8
 FORK_ENV_SWITCHES = (
     "EXL3_STAGGER_DECODE", "EXL3_PREFILL_THREAD", "EXL3_PREFILL_PIPELINE", "EXL3_TAIL_CHECKPOINT",
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
-    "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE",
+    "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
 )
 
 PROMPTS = [
@@ -463,6 +467,7 @@ SCENARIO_TITLES = {
     5: "Checkpoint che segue la risposta",
     6: "Piazzamento degli esperti col peso del prefill non impostato",
     7: "Stress: blocchi",
+    8: "Chiavi grezze del QSA solo per il blocco in costruzione",
 }
 
 
@@ -907,6 +912,65 @@ def build_plan(args) -> dict:
         p.prompts = {}
         procs.append(p)
         comps.append({"kind": "stress", "scenario": 7, "id": "s7.stress", "run": ref(P, "s7.stress", ""), "close": ref(P, "s7.close", "")})
+
+    # ---------------------------------------------------------------- scenario 8
+    if 8 in sc:
+        # The QSA raw-key ring: the same forced runs with the full raw plane and with the ring, in two
+        # processes (the cache is made at the load, from the environment), the full one first: it makes
+        # the references
+        PF, PR = "s8-fork-full", "s8-fork-ring"
+        r8 = doc("s8r", args.s8_prompt, 1)
+        turn_key = "turn/s8"
+        turn_spec = {"kind": "turn", "base": r8, "answer": ref(PF, "s8.doc.free", "r"), "suffix": TURN_SUFFIX}
+        for name, env in ((PF, {}), (PR, {"EXL3_QSA_RAW_TAIL": "1"})):
+            p = Proc(name, "fork", [8], env = env)
+            p.add(gen_step("g0", 8))
+            p.add(run_step("s8.warm.1", 8, [jobspec("a", q(0), W)], warmup = True))
+            p.add(run_step("s8.warm.r", 8, [jobspec("r", doc("s8w", doc_length(64, 8), 2), 8)], warmup = True))
+            if name == PF:
+                p.add(run_step("s8.doc.free", 8, [jobspec("r", r8, args.s8_tokens)]))
+                for i, x in enumerate("abc"):
+                    p.add(run_step(f"s8.free.{x}", 8, [jobspec(x, q(i), T)]))
+                p.add(run_step("s8.turn.prep0", 8, [jobspec("r", r8, forced = ref(PF, "s8.doc.free", "r"))]))
+                p.add(run_step("s8.turn.free", 8, [jobspec("t", turn_key, 32)], forget = False))
+            doc_job = lambda: jobspec("r", r8, forced = ref(PF, "s8.doc.free", "r"))
+            for k in (1, 2):
+                p.add(run_step(f"s8.doc.ref{k}", 8, [doc_job()]))
+            # Sparse decode in a batch of four (the eager sparse path, or the server's per-sequence replay)
+            for k in (1, 2):
+                p.add(run_step(f"s8.mix.ref{k}", 8, [doc_job()] + [jobspec(x, q(i), forced = ref(PF, f"s8.free.{x}", x))
+                                                                  for i, x in enumerate("abc")]))
+            # The next turn from the complete pages left in VRAM
+            for k in (1, 2):
+                p.add(run_step(f"s8.turn.prep{k}", 8, [doc_job()]))
+                p.add(run_step(f"s8.turn.ref{k}", 8, [jobspec("t", turn_key, forced = ref(PF, "s8.turn.free", "t"))], forget = False))
+            # ... and from the disk tier: a new generator over the same directory, after the close of the
+            # one that wrote it (which flushes)
+            p.add(gen_step("g1", 8, disk = f"s8-{name}"))
+            p.add(run_step("s8.disk.doc", 8, [doc_job()]))
+            p.add(gen_step("g2", 8, disk = f"s8-{name}"))
+            p.add(run_step("s8.disk.turn", 8, [jobspec("t", turn_key, forced = ref(PF, "s8.turn.free", "t"))], forget = False))
+            p.add({"op": "disk_scan", "id": "s8.disk.scan", "scenario": 8, "disk": f"s8-{name}"})
+            p.add(gen_step("g3", 8))
+            p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+            procs.append(p)
+
+        def both(run, job, label, floor_run = None):
+            rid = f"s8.{run}" if floor_run else f"s8.{run}.ref1"
+            fr = floor_run or run
+            comps.append(cmp(8, f"s8.{run}.{job}", label, ref(PR, rid, job), ref(PF, rid, job),
+                             floor = (ref(PF, f"s8.{fr}.ref1", job), ref(PF, f"s8.{fr}.ref2", job))))
+        both("doc", "r", f"`r` (documento di {args.s8_prompt} token) e la sua risposta imposta: anello contro piano intero")
+        for x in "rabc":
+            both("mix", x, f"`{x}` nel batch del documento e di tre domande: anello contro piano intero")
+        both("turn", "t", "turno dopo ripreso dalle pagine in VRAM: anello contro piano intero")
+        both("disk.doc", "r", "`r` col tier su disco acceso: anello contro piano intero", floor_run = "doc")
+        both("disk.turn", "t", "turno dopo ripreso dal tier su disco con un generatore nuovo: anello contro piano intero",
+             floor_run = "turn")
+        comps.append({"kind": "raw_tail", "scenario": 8, "id": "s8.memory", "full": PF, "ring": PR,
+                      "label": "l'anello nei due processi e la memoria libera per scheda"})
+        comps.append({"kind": "same_placement", "scenario": 8, "id": "s8.placement", "procs": [PF, PR]})
+        comps.append({"kind": "library", "scenario": 8, "id": "s8.library", "procs": {PF: "fork", PR: "fork"}})
 
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
 
@@ -1550,9 +1614,42 @@ def evaluate_resume(c: dict, res: Results) -> dict:
     return row
 
 
+def evaluate_raw_tail(c: dict, res: Results) -> dict:
+    """Scenario 8: the ring as each process loaded it (none in `full`, on in `ring`, main cache and MTP
+    head's), and the memory per card each load left free, against what the library says it saves"""
+    row = {"id": c["id"], "scenario": c["scenario"], "label": c["label"], "expect": "identical", "notes": []}
+    loads = {k: (res.records.get(c[k], {}).get("load") or {}) for k in ("full", "ring")}
+    if not all(r.get("ok") for r in loads.values()):
+        row.update(verdict = ERR, why = "manca il caricamento di un processo")
+        return row
+    full, ring = (loads[k].get("qsa_raw_tail") or {} for k in ("full", "ring"))
+    problems = []
+    if full.get("main") or full.get("draft"):
+        problems.append(f"`{c['full']}` aveva l'anello ({full.get('main')}, testa MTP {full.get('draft')})")
+    if not ring.get("main"):
+        problems.append(f"`{c['ring']}` non aveva l'anello (cache {ring.get('main')}: libreria senza, o rifiutato)")
+    elif loads["ring"].get("draft") and not ring.get("draft"):
+        problems.append(f"`{c['ring']}`: la cache della testa MTP non aveva l'anello")
+    rows = []
+    ff, fr = loads["full"].get("free") or {}, loads["ring"].get("free") or {}
+    saved = ring.get("saved") or {}
+    mib = lambda v: "-" if v is None else round(v / (1 << 20))
+    for d in sorted(set(ff) | set(fr), key = int):
+        a, b = ff.get(d), fr.get(d)
+        rows.append([f"cuda:{d}", mib(a), mib(b), "-" if a is None or b is None else mib(b - a),
+                     mib(saved.get(str(d), saved.get(d)))])
+    row["table"] = rows
+    row["ring"] = ring.get("main")
+    if problems:
+        row.update(verdict = FAIL, why = "; ".join(problems))
+    else:
+        row.update(verdict = PASS, why = f"anello di {ring.get('main')} token in {ring.get('layers')} strati")
+    return row
+
+
 EVALUATORS = {
     "probs": evaluate_probs, "crc": evaluate_crc, "placement": evaluate_placement, "tokens": evaluate_tokens,
-    "cancel": evaluate_cancel, "stress": evaluate_stress, "resume": evaluate_resume,
+    "cancel": evaluate_cancel, "stress": evaluate_stress, "resume": evaluate_resume, "raw_tail": evaluate_raw_tail,
 }
 
 
@@ -1581,7 +1678,7 @@ def evaluate_all(plan: dict, res: Results) -> list:
 SWITCHES_OFF = {
     "stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False,
     "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0, "disk_uncache": False,
-    "mtp_batched_verify": False, "mtp_batched_update": False,
+    "mtp_batched_verify": False, "mtp_batched_update": False, "qsa_raw_tail": 0,
 }
 
 
@@ -1784,6 +1881,12 @@ SCENARIO_TEXT = {
        "decode sfalsato, thread di prefill, pezzi in volo, checkpoint di coda, tier su disco con `EXL3_DISK_CACHE_UNCACHE=1`, "
        "MTP 1, peso del prefill 0.004 e sweep del piazzamento come in produzione. Superato: nessuna chiamata della libreria "
        "oltre il cane da guardia, nessuna eccezione, la coda si svuota e `close()` finisce.",
+    8: "Due processi del fork con gli stessi giri imposti: uno con il piano intero delle chiavi grezze dell'indicizzatore QSA "
+       "(`full`), l'altro con l'anello (`EXL3_QSA_RAW_TAIL=1`, `ring`). Un documento oltre la soglia sparsa con la risposta "
+       "imposta, lo stesso accanto a tre job che generano, il turno dopo ripreso dalle pagine in VRAM e, con un generatore "
+       "nuovo, dal tier su disco (pagine senza le chiavi grezze: un'altra cartella di impronta). Atteso identico: le chiavi "
+       "aggregate escono bit per bit le stesse. Il metro è `full` ripetuto. Sotto, la memoria che ciascun caricamento lascia "
+       "libera per scheda, accanto a quella che la libreria dice di risparmiare.",
 }
 
 
@@ -1944,6 +2047,11 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
         elif kind == "resume":
             out += [f"**{r['label']}**", "", table(["turno", "token del prompt", "ripresi", "da rileggere", "da un checkpoint di coda",
                                                    "secondi al primo token"], r.get("table") or []), ""]
+        elif kind == "raw_tail":
+            out += [headline(r), ""]
+            if r.get("table"):
+                out += [table(["scheda", "libera dopo il caricamento, piano intero MiB", "con l'anello MiB", "differenza MiB",
+                               "risparmio secondo la libreria MiB"], r["table"]), ""]
         elif kind == "stress":
             st = r.get("stress") or {}
             out += [headline(r), ""]
@@ -2709,7 +2817,8 @@ def parse_cli(argv: list | None = None):
     ap = argparse.ArgumentParser(
         description = f"Controllo notturno di identità bit a bit del fork {FORK_BRANCH} contro upstream {BASE_RELEASE}, "
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
-    ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7", help = "scenari da eseguire, es. 1,2 (default tutti)")
+    ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7",
+                    help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; l'8, l'anello delle chiavi grezze del QSA, a richiesta)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -2759,6 +2868,8 @@ def parse_cli(argv: list | None = None):
                     help = "ripete il prompt lungo in linea per il metro (default sì)")
     ap.add_argument("--s5-answer", type = int, default = 1100)
     ap.add_argument("--s5-next", type = int, default = 32)
+    ap.add_argument("--s8-prompt", type = int, default = 12386, help = "token del documento dello scenario 8 (oltre la soglia sparsa)")
+    ap.add_argument("--s8-tokens", type = int, default = 512, help = "token imposti al documento dello scenario 8")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)

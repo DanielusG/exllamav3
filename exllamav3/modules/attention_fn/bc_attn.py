@@ -470,6 +470,8 @@ class BCAttn:
             _qsa_stage_kernel,
             _qsa_pool_update_kernel,
             _qsa_sparse_split_kernel,
+            _qsa_raw_tail_append_kernel,
+            _qsa_pool_update_ring_kernel,
         )
         from .triton_paged import _paged_attn_decode_combine_kernel, combine_subtiles
 
@@ -496,21 +498,45 @@ class BCAttn:
             | {n: "constexpr" for n in ("eps", "H_i", "D")},
             dict(eps = float(idx.q_layernorm.rms_norm_eps), H_i = Hi, D = Di), 2, 1)
 
-        k_raw_append = _compile_kernel(dev, _mla_plane_update_kernel,
-            {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
-             "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
-            | {n: "constexpr" for n in ("page_size", "D", "DST_D", "DST_OFF")},
-            dict(page_size = PAGE_SIZE, D = Di, DST_D = 0, DST_OFF = 0), 2, 2)
+        # A cache layer with a raw-key ring (cache/qsa.py, raw_tail) gets the ring's append and pool
+        # update instead: the same runtime arguments, launched by the slot as the full-plane kernels
+        # are. The slot's pool update reads the whole append back from the ring
+        ring = getattr(self.qsa_layer, "raw_tail", 0)
+        if ring:
+            assert q_len + cr - 1 <= ring, \
+                f"BCAttn: appends of {q_len} rows do not fit the QSA raw-key ring of {ring} tokens"
+            k_raw_append = _compile_kernel(dev, _qsa_raw_tail_append_kernel,
+                {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
+                 "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in ("page_size", "D", "RING")},
+                dict(page_size = PAGE_SIZE, D = Di, RING = ring), 2, 2)
 
-        k_pool_update = _compile_kernel(dev, _qsa_pool_update_kernel,
-            {"raw_plane": "*fp16", "pool_plane": "*fp16", "k_norm_w": "*fp16",
-             "inv_freq": "*fp32", "block_table": "*i32", "cache_seqlens": "*i32",
-             "num_pages_per_row": "i32", "append_len": "i32"}
-            | {n: "constexpr" for n in (
-                "page_size", "P", "D", "ROPE_R", "attn_factor", "eps", "MAXPOOLS")},
-            dict(page_size = PAGE_SIZE, P = cr, D = Di, ROPE_R = rotate_dims,
-                 attn_factor = float(rope.attn_factor),
-                 eps = float(idx.k_layernorm.rms_norm_eps), MAXPOOLS = q_len // cr + 1), 2, 1)
+            k_pool_update = _compile_kernel(dev, _qsa_pool_update_ring_kernel,
+                {"raw_plane": "*fp16", "pool_plane": "*fp16", "k_norm_w": "*fp16",
+                 "inv_freq": "*fp32", "block_table": "*i32", "cache_seqlens": "*i32",
+                 "num_pages_per_row": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in (
+                    "page_size", "P", "D", "ROPE_R", "attn_factor", "eps", "MAXPOOLS", "RING")},
+                dict(page_size = PAGE_SIZE, P = cr, D = Di, ROPE_R = rotate_dims,
+                     attn_factor = float(rope.attn_factor),
+                     eps = float(idx.k_layernorm.rms_norm_eps), MAXPOOLS = q_len // cr + 1,
+                     RING = ring), 2, 1)
+        else:
+            k_raw_append = _compile_kernel(dev, _mla_plane_update_kernel,
+                {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
+                 "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in ("page_size", "D", "DST_D", "DST_OFF")},
+                dict(page_size = PAGE_SIZE, D = Di, DST_D = 0, DST_OFF = 0), 2, 2)
+
+            k_pool_update = _compile_kernel(dev, _qsa_pool_update_kernel,
+                {"raw_plane": "*fp16", "pool_plane": "*fp16", "k_norm_w": "*fp16",
+                 "inv_freq": "*fp32", "block_table": "*i32", "cache_seqlens": "*i32",
+                 "num_pages_per_row": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in (
+                    "page_size", "P", "D", "ROPE_R", "attn_factor", "eps", "MAXPOOLS")},
+                dict(page_size = PAGE_SIZE, P = cr, D = Di, ROPE_R = rotate_dims,
+                     attn_factor = float(rope.attn_factor),
+                     eps = float(idx.k_layernorm.rms_norm_eps), MAXPOOLS = q_len // cr + 1), 2, 1)
 
         wts = scores = pool_idx = indices = None
         k_fewq = k_expand = k_sp_split = k_sp_combine = None

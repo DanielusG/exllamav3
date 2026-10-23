@@ -1410,6 +1410,128 @@ readback counted, one per drafted position and one for the sampling with both sw
 capped beside a prompt chunk on the prefill thread, the chunks running beside where a fixed W=3
 waits for them. Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
+### Raw keys of the block being built only (`Cache(qsa_raw_tail = True)`, `EXL3_QSA_RAW_TAIL=1`)
+
+Off by default; with it off the cache layers, the kernels and the decode graph are upstream's. For
+the QSA attention layers of Qwen3.8-Flash-Next (12 of its 48 layers, and the MTP head's). The switch
+is the cache's, read when the `Cache` is made, so before the model loads: `Cache(qsa_raw_tail = True)`
+(or a ring size in tokens), else `EXL3_QSA_RAW_TAIL=1` in the environment. In the server:
+`--qsa-compact-raw-keys` (rule 30 of its `AGENTS.md`), passed to both caches only by a library whose
+`Cache` takes the argument. Also in `doc/env_vars.md`.
+
+**What upstream keeps.** `cache/qsa.py`, `QSAPlanes`: per page and QSA layer a raw indexer key for
+every token (`raw_k`, 256 x 128 fp16, 64 KiB) beside the pooled keys (one per 4-token block,
+16 KiB). The raw plane has one reader, the pooled-key rebuild of the blocks an append touches
+(`_qsa_pool_update_kernel`: in the decode graph's slots, `attention.cpp` with the plane `set_qsa`
+was given, and in `QSAIndexer.update_planes`), and of those blocks only the one the append starts
+in has raw keys from before the append: at most compress_ratio - 1 = 3. The other uses of `raw_k`
+in the library: `bc_attn.py` hands the plane to the slot, `attn.py` zeroes page 0 for the
+autosplit's measuring pass, `build_mask` and the `*_ref` functions are the parity tests' torch
+references (the non-cached path projects its raw keys and pools them without a plane). At
+production's 370k-token cache that is 1445 pages x 64 KiB = 90 MiB per layer, 1.06 GiB for the 12
+layers (5 on the first card, 7 on the second with production's device split) and 90 MiB more for
+the MTP head (first card), plus 64 KiB per QSA layer in every page image the CPU and disk tiers
+store.
+
+**What the switch does.** The raw plane becomes a ring of 32 tokens per page (`RAW_TAIL_DEFAULT`;
+8 KiB per page and layer): token t of a page at slot t % 256 % 32, i.e. the last 32 positions
+written to the page. With 32 it saves 56 KiB per page and layer: at 370k 79 MiB per layer, about
+474 MiB on the first card (5 layers and the MTP head) and 553 MiB on the second (computed from the
+shapes, `QSAPlanes.raw_tail_saved_bytes`; `Cache` prints the total). Three kernels in
+`modules/attention_fn/qsa_triton.py`, sharing the full plane kernel's arithmetic statement for
+statement (`_qsa_pool_tail_block`: fp32 sums in token order, mean -> fp16, norm -> fp16, rope in
+fp16), so the pooled keys, the block selection and the attention output are bit for bit the full
+plane's:
+
+- `_qsa_raw_tail_append_kernel`: the append, the last 32 rows of each sequence written.
+- `_qsa_pool_update_ring_kernel`: the decode graph's pool update, every raw key read from the ring,
+  after the append. It takes the full plane kernels' runtime arguments, in the same order, so the
+  slot launches it unchanged; the slots' appends (up to 16 rows, `MAX_QLEN`) and the 3 tokens
+  before them fit 32 distinct slots (`BCAttn._configure_qsa` asserts it per slot).
+- `_qsa_pool_update_rows_kernel`: `update_planes`' pool update, for appends of any length (prompt
+  chunks, the eager fallbacks): the append's own raw keys from the staged rows, the 3 before it from
+  the ring. It runs before the append, whose writes may take those slots (a chunk's last 32
+  positions can share slots with the block it started in).
+
+**Where the ring holds what is read.** When an append starts at p, the ring must hold the raw keys
+of [p - p % 4, p) as their last writes left them. A page is written in order from its start, so
+that holds unless something wrote 32 positions further on in the same page since. The cases:
+
+- *Speculative passes.* A pass of L rows at p is taken back to p' > p (the token it follows is
+  kept), after positions up to p + L - 1 were written: the next pass reads [p' - 3, p'), so
+  L + 3 <= 32, the same bound as a graph slot's. The generator checks its widest pass
+  (`max_draft_tokens + 1`: the MTP, n-gram or hybrid draft window) against the ring of both caches
+  when it is made (`check_raw_tail`, a ValueError): with 32, at most 28 draft tokens (production:
+  1). The MTP head's cache writes its drafts one row at a time at K..K+W-1 and then the accepted
+  K+1..K+A-1 again from the target's states: the same bound.
+- *Banned-string rewinds.* GDN states have no in-place rollback (`rollback_capacity` 0), so on
+  Flash-Next a rewind restores a page-aligned checkpoint and replays, rewriting every position from
+  there. A model without recurrent states rewinds by truncation, to any depth; and its prompt
+  cache copies a partial page (`Job._prefill_co`'s partial-page reuse, `copy_page` with a token
+  count off a block boundary) and goes on in the middle of a block. `Cache` refuses the ring for
+  such a model with a warning and keeps the full plane; also for a model whose prompt passes can
+  run past a chunk's end and be taken back (`atomic_mm_prefill`). No QSA model is either today.
+  The MTP head has no recurrent states of its own (`Qwen4ExpMTPModel`'s caps) and its cache
+  follows the target's: an MTP head's cache takes the ring, and the generator refuses to start
+  (`check_raw_tail`, `raw_tail_refusal` of its own model) if its model is one of the two.
+- *Prompt cache, page sharing, tiers.* Only complete pages are reused (by hash in VRAM, from the
+  CPU tier, from the disk tier), shared between jobs or stored, and a job starts at a page boundary;
+  so do a requeued job, a resume from a tail checkpoint and a replay. A complete page's raw keys
+  are never read again. `copy_page` copies the whole ring row (its one partial-page caller is the
+  refused case above).
+- *Defrag* rotates `get_tensors()`, which leaves the ring out: it runs with no page referenced, and
+  a partial page's ring is read only by the sequence writing it.
+- *Tensor parallelism.* `tp_export` carries the ring to the rank that holds a QSA layer whole (the
+  ring is the same per-layer storage there). Not run.
+
+**Page images and the disk tier.** The ring is not in `get_tensors()`, so the CPU tier's slots and
+the disk tier's page files lose the raw keys: 64 KiB per QSA layer (832 KiB with the MTP head's
+layer) of every page image. The disk tier's fingerprint covers the image layout
+(`cache_fingerprint`'s `segments` and `image_size`), so the switch on and off are two fingerprint
+directories: a page of one layout is never read under the other; going back opens the old one, and
+the one not in use keeps its share of the root's budget until removed (rule 27 of the server).
+
+- `Cache.qsa_raw_tail` is the ring in effect (0: off, refused, or no QSA layer); a layer's
+  `raw_tail` the same per layer. `util/memory.py`'s report counts the ring as cache.
+- `update_planes_ref` (the torch reference of the parity tests) has the ring's form too.
+- The ring's size can be chosen (`qsa_raw_tail = 64`, `EXL3_QSA_RAW_TAIL=64`) for longer drafts;
+  below 19 tokens (16 + 3) it is refused.
+
+**What has been checked, and where** (2026-10-23, the development machine, no GPU): the kernels in
+Triton's interpreter against the full plane's, the same random appends into both, the pooled planes
+compared bit for bit after every append (prompt chunks of 1 to 4096 tokens starting inside blocks
+and pages, decode passes of up to 16 rows with drafts rejected and accepted, the MTP head's
+pattern, a replay from a page boundary, pages taken over by another sequence and shared by prefix,
+several sequences per call, with and without a pass-through part in the pooled keys' rope), the
+graph slot's launches with the slot's own arguments, the eager path through `update_planes`
+itself; two checks that the comparison sees a difference (the eager kernels in the other order; a
+pass longer than the ring serves). Then `BCAttn._configure_qsa` compiling for sm_120 with the
+triton wheel's ptxas: the ring's kernels in place of the full plane's with the same runtime
+signature, and the floating-point instructions of the ring's pool updates (graph and eager) the
+same as the full plane's, in the same order, modifiers included. Nothing has run on the cards: the
+compiled kernels' results there, the C++ slot launching them, the memory freed per card, and a
+real model's outputs with the switch on and off are the GPU check below.
+
+**The GPU check** (on the workstation, production stopped, this branch checked out in
+`~/Desktop/exllamav3`; fish, one line each). First the kernels on the card against the full
+plane's, no model (with CUDA the test file runs them there; it needs `pytest` in the environment):
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_qsa_raw_tail.py -q
+
+Then the model, scenario 8 of the exact check: the plan and the checks, then the run (about 21
+minutes by the estimate: two loads). `REPORT.md` in the run directory says, per compared run,
+whether the logits are identical bit for bit with the ring and without, and per card the memory
+each load left free, the difference and what the library says the ring saves:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --scenarios 8 --out /home/daniele/exl3-exact-check-qsa
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 8 --out /home/daniele/exl3-exact-check-qsa
+
+Tests: `tests/test_qsa_raw_tail.py` (no GPU, no extension; the kernel tests need triton, and run on
+the card where CUDA is available: on the workstation they are the first GPU check). Marked
+`nogpu`; run with `--noconftest`. On a machine with no CUDA the file switches Triton's interpreter
+on for the session when it is the first to import triton (the switch is read at the import); the
+compile checks run in a process of their own.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
@@ -1438,7 +1560,13 @@ off, the next turn resumed from it in RAM and after a restart from the disk tier
 labelled identical or within the noise; (6) the placement weight unset against stock, the same
 sweeps after the same traffic; (7) ten minutes of concurrent traffic with every production switch
 on, a watchdog on every library call (faulthandler: stacks of all threads in the process's
-`hang-stacks.txt`).
+`hang-stacks.txt`). On request (`--scenarios 8`, not in the default list): (8) the QSA
+raw-key ring, the same forced runs in a process with the full raw plane and one with
+`EXL3_QSA_RAW_TAIL=1` (a document of 12386 tokens past the sparse threshold with a forced answer of
+512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
+from the disk tier), expected identical against the full plane's process repeated, and the memory
+each load left free per card beside what the library says the ring saves (about 21 minutes by the
+estimate, two loads).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in

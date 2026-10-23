@@ -100,6 +100,7 @@ class Cache:
         max_batch_size: int = 16,
         max_history: int = 0,
         recurrent_dtype: torch.dtype = torch.half,
+        qsa_raw_tail: int | bool | None = None,
         **kwargs
     ):
         """
@@ -139,6 +140,16 @@ class Cache:
 
         :param v_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
+
+        :param qsa_raw_tail:
+            QSA attention layers (Qwen3.8-Flash-Next): keep the indexer's raw keys only for the blocks
+            being built, in a ring of this many tokens per page instead of a raw key for every token
+            (True: 32 tokens; None: EXL3_QSA_RAW_TAIL; 0/False: off). Same results, 56 KiB less VRAM per
+            page and QSA layer with 32 tokens, and smaller page images in the CPU and disk tiers (whose
+            fingerprint changes with them). Models without recurrent states are refused (their prompt
+            cache reuses partial pages, and banned strings rewind them by truncation); a generator
+            whose drafts are longer than the ring serves is refused too, and one whose model is such
+            a model while its MTP head's cache has the ring (cache/qsa.py, check_raw_tail)
         """
         self.model = model
         # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
@@ -152,6 +163,18 @@ class Cache:
         self.layer_type = layer_type or CacheLayer_fp16
         # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
+        # QSA raw-key ring (cache/qsa.py). An MTP head's cache follows its target's generator, which
+        # checks its own model (check_raw_tail)
+        from .qsa import QSAPlanes, resolve_raw_tail, raw_tail_refusal, RAW_TAIL_ENV
+        raw_tail = resolve_raw_tail(qsa_raw_tail)
+        has_qsa = any(getattr(a, "qsa_indexer", None) is not None for a in self.model.get_cache_layers())
+        if raw_tail and has_qsa and not model.caps.get("mtp_draft"):
+            why = raw_tail_refusal(model)
+            if why:
+                print(f" !! Warning: QSA raw-key ring ({RAW_TAIL_ENV}) refused, {why}; the full raw plane is kept",
+                      flush = True)
+                raw_tail = 0
+
         # Attach transformer cache layers
         cl = self.model.get_cache_layers()
         self.num_layers = len(cl)
@@ -163,9 +186,19 @@ class Cache:
                 attn.cache_layer_type(self.layer_type, kwargs)
                 if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
             )
+            if raw_tail and issubclass(layer_type, QSAPlanes):
+                layer_kwargs = dict(layer_kwargs, raw_tail = raw_tail)
             for instance in self.model.get_layer_instances(attn.layer_idx):
                 self.layers[instance] = \
                     layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
+
+        # The ring in effect (0: the full raw plane, or no QSA layer)
+        rings = [l for l in self.layers.values() if getattr(l, "raw_tail", 0)]
+        self.qsa_raw_tail = raw_tail if rings else 0
+        if rings:
+            saved = sum(l.raw_tail_saved_bytes() for l in rings)
+            print(f" -- QSA raw keys: a ring of {raw_tail} tokens per page in {len(rings)} layers, "
+                  f"{saved / 1024**2:.0f} MiB less than the full raw plane", flush = True)
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size

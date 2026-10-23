@@ -272,8 +272,9 @@ def all_refs(plan):
     return out
 
 
-def test_the_plan_refers_only_to_runs_that_come_before():
-    plan = EC.build_plan(args_for())
+@pytest.mark.parametrize("scenarios", [None, "8"])
+def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
+    plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
     order = {}
     for p in plan["procs"]:
@@ -355,6 +356,58 @@ def test_scenario_6_shares_the_processes_of_scenario_1_or_has_its_own():
     assert all(any(st["op"] == "sweep" for st in p["steps"]) for p in alone["procs"])
 
 
+def test_scenario_8_runs_the_same_forced_runs_with_and_without_the_ring():
+    assert 8 not in args_for().scenarios
+    plan = EC.build_plan(args_for("--scenarios", "8"))
+    procs = [(p["name"], p["library"], p["env"]) for p in plan["procs"]]
+    assert procs == [("s8-fork-full", "fork", {}), ("s8-fork-ring", "fork", {"EXL3_QSA_RAW_TAIL": "1"})]
+    full, ring = plan["procs"]
+    forced = lambda p: [st["id"] for st in p["steps"] if st["op"] == "run" and not st.get("warmup")
+                        and all("forced" in j for j in st["jobs"])]
+    # (the full plane's process ingests the document once more before the free turn it forces on the others)
+    assert [x for x in forced(full) if x != "s8.turn.prep0"] == forced(ring) and "s8.disk.turn" in forced(ring)
+    # the references are the full plane's
+    for st in ring["steps"]:
+        for j in st.get("jobs", []) if st["op"] == "run" else []:
+            if "forced" in j:
+                assert j["forced"]["proc"] == "s8-fork-full"
+    # the document is past the indexer's sparse threshold (Qwen3.8-Flash-Next: about 2k tokens)
+    lengths = [spec["length"] for spec in ring["prompts"].values() if spec["kind"] == "doc"]
+    assert max(lengths) > 8192
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    assert len(probs) == 8
+    for c in probs:
+        assert c["test"]["proc"] == "s8-fork-ring" and c["ref"]["proc"] == "s8-fork-full" and c["expect"] == "identical"
+        assert {r["proc"] for r in c["floor"]} == {"s8-fork-full"} and c["test"]["run"] == c["ref"]["run"]
+    kinds = {c["kind"] for c in plan["comparisons"]}
+    assert {"raw_tail", "same_placement", "library"} <= kinds
+    # the fork's switch is scrubbed from every child unless a process asks for it
+    assert "EXL3_QSA_RAW_TAIL" in EC.FORK_ENV_SWITCHES
+    assert not EC.switch_is_off("qsa_raw_tail", 32) and EC.switch_is_off("qsa_raw_tail", 0)
+
+
+def test_scenario_8_reports_the_ring_and_the_memory_per_card():
+    plan = EC.build_plan(args_for("--scenarios", "8"))
+    res = fake_results(plan)
+    mib = 1 << 20
+    res.records["s8-fork-full"]["load"].update(
+        free = {"0": 1000 * mib, "1": 800 * mib}, draft = True,
+        qsa_raw_tail = {"main": 0, "draft": 0, "layers": 0, "saved": {}})
+    res.records["s8-fork-ring"]["load"].update(
+        free = {"0": 1474 * mib, "1": 1353 * mib}, draft = True,
+        qsa_raw_tail = {"main": 32, "draft": 32, "layers": 13, "saved": {"0": 474 * mib, "1": 553 * mib}})
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert summary_cells(report)[0][1] == EC.IDENT
+    assert "anello di 32 token in 13 strati" in report
+    assert "| cuda:0 | 1000 | 1474 | 474 | 474 |" in report and "| cuda:1 | 800 | 1353 | 553 | 553 |" in report
+    # the ring missing where it was asked for (a library without it, or refused), or there where it was not
+    res.records["s8-fork-ring"]["load"]["qsa_raw_tail"] = {"main": None, "draft": None, "layers": 0, "saved": {}}
+    report = EC.render_report(plan, res, {"started": "s"}, True)
+    assert summary_cells(report)[0][1] == EC.FAIL and "non aveva l'anello" in report
+    res.records["s8-fork-ring"]["load"]["qsa_raw_tail"] = {"main": 32, "draft": 0, "layers": 12, "saved": {}}
+    assert "testa MTP non aveva l'anello" in EC.render_report(plan, res, {"started": "s"}, True)
+
+
 def test_the_exact_environment_of_the_children():
     args = args_for("--env", "EXL3_HOST_MEM_RESERVE_MB=1024")
     base = {"PATH": "/bin", "EXL3_STAGGER_DECODE": "1", "EXL3_MOE_CPU_SPLIT_STATS": "/x", "PYTHONPATH": "/somewhere"}
@@ -410,8 +463,8 @@ def test_the_estimate_and_the_dry_run():
     assert all(budgets[s] >= max(1800.0, 2.9 * est["scenarios"][s]) for s in budgets)
     assert EC.scenario_budgets(est, args_for("--scenario-timeout", "10"))[2] == 600.0
     text = EC.dry_run_text(plan, args, est, budgets, ["modello non trovato: /x"], ["una nota"])
-    for s, title in EC.SCENARIO_TITLES.items():
-        assert f"Scenario {s} - {title}" in text
+    for s in plan["scenarios"]:
+        assert f"Scenario {s} - {EC.SCENARIO_TITLES[s]}" in text
     assert "Totale stimato" in text and "PROBLEMA: modello non trovato" in text and "Nota: una nota" in text
     assert "prefill 700 token/s" in text and "5 min per caricamento" in text
 
@@ -505,8 +558,8 @@ def test_the_report_of_a_night_where_everything_is_the_same():
     assert [r[1] for r in rows] == [EC.IDENT] * 6 + [EC.PASS], rows
     assert rows[0][3] != "-" and rows[0][4] == "identico"
     assert "**Attenzione**" not in report
-    for s, title in EC.SCENARIO_TITLES.items():
-        assert f"## {s}. {title}" in report
+    for s in plan["scenarios"]:
+        assert f"## {s}. {EC.SCENARIO_TITLES[s]}" in report
 
 
 def test_the_report_says_where_it_differs():
