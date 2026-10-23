@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..loader.safetensors import DiskTensorHandle
 from ..ext import exllamav3_ext as ext
+from ..util.lane import current_lane
 
 """
 Row-addressable table behind an embedding module (token embeddings, hashed n-gram embeddings),
@@ -45,10 +46,10 @@ class _PinSet:
     def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
         if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
                 or self.packed.dtype != row_dtype:
-            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
+            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
             self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
             self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
-            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
+            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
 
 
 class RowTable:
@@ -67,8 +68,13 @@ class RowTable:
         self.row_words = None       # elements per stored row
         self.row_dtype = None
         self._locked = []           # mlock()ed (address, size) ranges of the stores
-        self._pins = []             # pinned staging sets (see _PinSet)
-        self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
+        # Per lane (util/lane.py: threads that issue passes at the same time): the pinned
+        # staging sets (see _PinSet) and the queued prefetches, oldest first: {"ids", "pin",
+        # "future"}. A set is safe to rewrite once the last lookup's uploads from it are done,
+        # which the lookup's own thread knows (its event, or the sync point of its decode
+        # loop) and another thread does not
+        self._lane_pins = {}
+        self._lane_pending = {}
         self._executor = None
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
@@ -130,6 +136,11 @@ class RowTable:
                     stc.release_file(f)
             self._set_stores(handles)
         elif len(keys) == 1:
+            # no file entry: the tensor is already in host memory (conversion)
+            meta = stc.find_stc(keys[0]).get_tensor_meta(keys[0])
+            if what and meta is not None:
+                from ..util.memory import check_host_memory
+                check_host_memory(meta[keys[0]]["n_bytes"], what)
             self._set_stores([stc.get_tensor(keys[0], "cpu", allow_bf16 = allow_bf16, no_defer = True)])
         else:
             # Sharded table: one contiguous slab, each shard copied into its slice as it loads
@@ -149,6 +160,22 @@ class RowTable:
         if lock:
             self._locked = lock_host_tensors(self.stores, f"Locking {self.key} in RAM")
 
+    @property
+    def _pins(self) -> list:
+        return self._lane_pins.setdefault(current_lane(), [])
+
+    @_pins.setter
+    def _pins(self, pins: list):
+        self._lane_pins[current_lane()] = pins
+
+    @property
+    def _pending(self) -> list:
+        return self._lane_pending.setdefault(current_lane(), [])
+
+    @_pending.setter
+    def _pending(self, pending: list):
+        self._lane_pending[current_lane()] = pending
+
     def close(self):
         self.drain_prefetch()       # queued workers still read the table; first
         if self._locked:
@@ -156,7 +183,7 @@ class RowTable:
             unlock_host_ranges(self._locked)
             self._locked = []
         self.stores = None
-        self._pins = []
+        self._lane_pins = {}
 
     def export(self, stc) -> dict:
         """
@@ -217,24 +244,31 @@ class RowTable:
                              os.POSIX_FADV_WILLNEED)
 
     def drain_prefetch(self):
-        for e in list(self._pending):
-            self._retire(e)
+        for pending in list(self._lane_pending.values()):
+            for e in list(pending):
+                self._retire(e)
         if self._executor is not None:
             self._executor.shutdown(wait = True)
             self._executor = None
 
     def _forget(self, entry: dict):
-        # by identity: list.remove would compare the entries' id tensors
-        self._pending = [e for e in self._pending if e is not entry]
+        # by identity: list.remove would compare the entries' id tensors (whichever lane
+        # queued it: drain_prefetch retires them all). In place: a lane's own thread may be
+        # appending to its list at the same time, and a list put in its stead would lose that
+        for pending in list(self._lane_pending.values()):
+            for i, e in enumerate(pending):
+                if e is entry:
+                    del pending[i]
+                    break
 
     def _retire(self, entry: dict):
         # Drop a queued prefetch that no lookup will take. Its worker may still be writing the
         # staging set, so wait it out (a cold gather, at most) unless it hasn't started
-        self._forget(entry)
-        self.prefetch_stats["retired"] += 1
         f = entry["future"]
         if not f.cancel():
-            f.result()
+            f.exception()       # an error of its own belongs to no lookup
+        self._forget(entry)
+        self.prefetch_stats["retired"] += 1
         entry["pin"].held = False
 
     def _acquire_pin(self, n: int) -> _PinSet:
@@ -320,10 +354,10 @@ class RowTable:
         ids = ids.to("cpu", torch.int64).contiguous().clone()
         if self._match(ids) is not None:
             return
-        pin = self._acquire_pin(n)
         if self.on_disk:
             for h in self.stores:
                 h._ensure_open()    # lazy open isn't thread-safe; do it here, not on the worker
+        pin = self._acquire_pin(n)
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_prefetch")
         self._pending.append({
@@ -362,19 +396,22 @@ class RowTable:
             pin = self._acquire_pin(n)
         try:
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve)
+            out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
+            if not in_order:
+                out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
+            elif not out.is_cuda:
+                out = out.clone()       # the decoded rows may still be the staging buffer itself
+            if out.is_cuda and not synced:
+                if pin.event is None:
+                    pin.event = torch.cuda.Event()
+                pin.event.record(torch.cuda.current_stream(out.device))
         except BaseException:
-            # a failed gather must not keep its staging set
-            pin.held = False
+            # a failed gather, upload or decode must not keep its staging set; an interrupted wait
+            # leaves the set with its prefetch, whose worker may still be writing it
+            if entry is not None and not entry["future"].done():
+                self._pending.append(entry)
+            else:
+                pin.held = False
             raise
-
-        out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
-        if not in_order:
-            out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
-        elif not out.is_cuda:
-            out = out.clone()       # the decoded rows may still be the staging buffer itself
-        if out.is_cuda and not synced:
-            if pin.event is None:
-                pin.event = torch.cuda.Event()
-            pin.event.record(torch.cuda.current_stream(out.device))
         pin.held = False
         return out

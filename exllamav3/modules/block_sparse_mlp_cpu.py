@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
+from ..util.lane import current_lane, lanes_busy
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -48,6 +49,105 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 """
 
 
+# Directory of the saved expert frequency profiles; None = <user cache dir>/exllamav3/expert_stats
+# (the test suite points it at a scratch directory so runs neither read nor leave profiles)
+EXPERT_STATS_DIR = None
+
+
+def _expert_stats_path(config, num_experts):
+    """Per-model file for the routed-expert frequencies the dynamic placement collects, keyed on
+    the model directory and the expert count (a stale or foreign profile only costs what the
+    default identity placement costs anyway)"""
+    import hashlib
+    key = hashlib.sha1(f"{os.path.abspath(config.directory)}|{num_experts}".encode()).hexdigest()[:16]
+    root = EXPERT_STATS_DIR
+    if root is None:
+        cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        root = os.path.join(cache, "exllamav3", "expert_stats")
+    return os.path.join(root, key + ".json")
+
+
+def _expert_stats_load(config, num_experts):
+    import json
+    try:
+        with open(_expert_stats_path(config, num_experts)) as f:
+            d = json.load(f)
+        return d.get("layers", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def save_expert_stats(infer_params):
+    """Write every split module's decayed selection counts (in checkpoint expert order, undoing
+    the load-time permutation) so the next load of this model starts from the hot/cold ranking
+    instead of the arbitrary head/tail split. A session too short to have routed a meaningful
+    sample keeps the file's previous entries (it must not overwrite a settled profile); the
+    counts themselves are decayed, so the threshold is in decode steps, not hits.
+    The counts saved are the ones the sweep ranks by: with a prefill weight
+    (hist_prefill_weight) the prefill-size selections counted apart since the last sweep are
+    added at that weight, without folding them in (the sweep does that, once)"""
+    import json, tempfile
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None)
+    if not reg or reg[0]._split_step_count < _STATS_MIN_STEPS:
+        return
+    config, E = reg[0].config, reg[0].num_experts
+    layers = _expert_stats_load(config, E)
+    w_pf = None
+    for m in reg:
+        if m._split_hist is None or getattr(m, "tid2eid_key", None):
+            continue
+        hist = m._split_hist.tolist()
+        pf = getattr(m, "_split_hist_pf", None)
+        if pf is not None:
+            if w_pf is None:
+                w_pf = hist_prefill_weight()
+            hist = [c + w_pf * p for c, p in zip(hist, pf.tolist())]
+        if m.num_experts != E or sum(hist) <= 0.0:
+            continue
+        perm = m._split_perm or list(range(E))
+        counts = [0.0] * E
+        for r, c in enumerate(hist):
+            counts[perm[r]] = c
+        layers[m.key] = counts
+    if not layers:
+        return
+    path = _expert_stats_path(config, E)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok = True)
+        fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f" !! expert stats not saved ({path}): {e}")
+
+
+def hist_prefill_weight() -> float:
+    """
+    What one expert selection of a prefill-size batch (at least the CPU expert host's
+    stream_min_rows rows: a prompt chunk) counts in the dynamic placement, against 1 for a
+    selection of a decode-size batch (EXL3_MOE_HIST_PREFILL_WEIGHT, read at every sweep and at
+    every prefill-size batch; default 1: every selection counts the same, as upstream).
+
+    The two do not cost the same. A decode step waits for the CPU worker in every layer that
+    picked at least one CPU-resident expert, so a missed selection there is paid in full, token
+    after token; a prompt chunk sends its hot CPU-resident experts to the card and the worker
+    computes only the tail. Measured on Flash-Next at 2.05 bpw, 2x RTX 5060 Ti, 8 worker
+    threads, on the v1.5.4 base (2026-10-11): with the placement learnt from generated tokens
+    only, the share of a generating job's selections served from VRAM goes from 0.84 to 0.95
+    and its speed from 60.6 to 69.7 tok/s, while a prompt's share falls from 0.95 to 0.62 and
+    its ingestion goes from 7.64 to 7.87 s. Prompt tokens outnumber generated ones by orders of
+    magnitude, so with equal weights they decide the placement alone.
+
+    With the weight at 1 nothing is counted apart (no second histogram, no fold). The sweep is
+    where it applies: under promote-on-miss, which does not sweep, the library ignores it.
+    """
+    try:
+        return max(0.0, float(os.environ.get("EXL3_MOE_HIST_PREFILL_WEIGHT", "1")))
+    except ValueError:
+        return 1.0
+
+
 @torch.inference_mode()
 def run_pending_swap_sweeps(infer_params):
     """Run any pending dynamic-placement sweep (see BlockSparseMLP._split_swap_tick). Called
@@ -75,6 +175,16 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
+    # The prefill-size counts kept apart (hist_prefill_weight not 1) go into every layer's
+    # histogram now, with their weight, before any layer is swept: whoever reads the histograms
+    # around a sweep (the sweep itself, a server's telemetry wrapped around _split_sweep_layer,
+    # also for the layers the swap budget does not reach) then sees one consistent set. Nothing
+    # is kept apart at weight 1, and nothing is read or folded then
+    apart = [m for m in reg if getattr(m, "_split_hist_pf", None) is not None]
+    if apart:
+        w_pf = hist_prefill_weight()
+        for m in apart:
+            m._split_hist_fold(w_pf)
     budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 64))
     total = 0
     for m in reg:
@@ -85,6 +195,234 @@ def run_pending_swap_sweeps(infer_params):
         total += n
     if total and os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
+
+
+_STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
+_STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
+_PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
+_PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
+_PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
+
+
+class _PromoteState:
+    """Promote-on-miss bookkeeping over every split module with spares, as [modules, experts] host
+    tensors so one step is a few vector ops: the hit-count snapshots (pinned, one device-to-host copy
+    per module per step, one event per device), the previous snapshot, the placement map mirror and
+    the in-flight mask. Per module, the free slot lists and the transfers in flight stay Python lists"""
+
+    def __init__(self, modules):
+        self.modules = [m for m in modules if m._split_spares and m._split_pending is not None]
+        n = len(self.modules)
+        e = max(m.num_experts for m in self.modules)
+        import numpy as np
+        # The step's arithmetic is numpy over small arrays: a torch CPU op opens an OpenMP region, and
+        # with the host confined to its reserved cores beside the worker's pinned threads
+        # (EXL3_MOE_HOST_CORES) that region costs tens of milliseconds
+        self.first = np.array([m.cpu_split_first for m in self.modules], dtype = np.int64).reshape(n, 1)
+        self.mp = np.full((n, e), 1 << 30, dtype = np.int64)
+        for i, m in enumerate(self.modules):
+            self.mp[i, :m.num_experts] = m._split_mp
+        self.snap = torch.zeros((n, e), dtype = torch.float).pin_memory()
+        self.snap_np = self.snap.numpy()
+        self.prev = np.zeros((n, e), dtype = np.float32)
+        self.busy = np.zeros((n, e), dtype = bool)
+        self.devices = sorted({torch.device(m.device).index or 0 for m in self.modules})
+        self.snap_ev = {}
+        self.stats = dict(routed = 0, missed = 0, steps = 0, ms = 0.0)
+        for m in self.modules:
+            m._split_snap = None          # the per-module snapshot is superseded by the shared one
+
+
+def _split_promote_step(ip, modules, rows):
+    """One decode step of promote-on-miss for every split module (called from the first module's
+    submit, before any layer's selection translate of this step).
+
+    (1) Transfers that landed take effect in the map, on the compute stream ahead of this step's
+    translate kernels; the slot they vacated is free from this step on, since nothing maps to it any
+    more. (2) The previous step's hit counts (snapshotted to pinned memory) name the routed experts;
+    those the worker computed are the misses. (3) The misses, ranked by count over all layers, take
+    free GPU slots of their layer when their count clears the layer's least-used unrouted resident's
+    by _PROMOTE_RATIO, up to _PROMOTE_BUDGET per step: the block is copied from the arena on the
+    promotion stream, ordered after everything the compute stream had enqueued (the slot's last
+    reader was a previous step). (4) The worker slots promotions freed take the least-used unrouted
+    residents, copied out on the promotion stream; the map flips once the copy has landed. Every
+    transfer leaves the expert live where it was until its copy is complete, so a route always finds
+    valid weights. Nothing is issued on a prefill-size step (its stager reads worker slots)."""
+    import time
+    t0 = time.perf_counter()
+    ps = getattr(ip, "moe_cpu_promote_state", None)
+    if ps is None or ps.modules[0] is not modules[0]:
+        ps = ip.moe_cpu_promote_state = _PromoteState(modules)
+    verify = os.environ.get("EXL3_MOE_CPU_PROMOTE_VERIFY")
+    debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
+    # (1) landed transfers
+    for i, m in enumerate(ps.modules):
+        if not m._split_pending:
+            continue
+        keep, idx, val = [], [], []
+        for t in m._split_pending:
+            if not t["ev"].query():
+                keep.append(t)
+                continue
+            r = t["r"]
+            if t["kind"] == "p":
+                m._split_mp[r] = t["gpu"]
+                m._split_free_cpu.append(t["cpu"])
+                m._split_promo_n += 1
+            else:
+                m._split_mp[r] = m.cpu_split_first + t["cpu"]
+                m._split_free_gpu.append(t["gpu"])
+                m._split_demo_n += 1
+            idx.append(r)
+            val.append(m._split_mp[r])
+            ps.busy[i, r] = False
+            if verify:
+                _split_promote_verify(m, t)
+        m._split_pending = keep
+        if idx:
+            ps.mp[i, idx] = val
+            dev = torch.device(m.device)
+            with torch.cuda.device(dev):
+                m._split_map[torch.tensor(idx, device = dev)] = torch.tensor(val, device = dev)
+    # (2) last step's routes: the snapshots land, the next ones go out
+    have = bool(ps.snap_ev)
+    for ev in ps.snap_ev.values():
+        ev.synchronize()
+    if have:
+        cur = ps.snap_np.copy()
+        routed = cur > ps.prev
+        ps.prev = cur
+    for i, m in enumerate(ps.modules):
+        dev = torch.device(m.device)
+        with torch.cuda.device(dev):
+            ps.snap[i, :m.num_experts].copy_(m._split_hist, non_blocking = True)
+    for d in ps.devices:
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(d))
+        ps.snap_ev[d] = ev
+    hists = [m._split_hist for m in ps.modules]
+    torch._foreach_mul_(hists, _PROMOTE_DECAY)
+    if have and rows < ps.modules[0].cpu_host.stream_min_rows:
+        import numpy as np
+        resident = ps.mp < ps.first
+        quiet = resident & ~routed & ~ps.busy                 # demotion candidates
+        inf = np.full(ps.prev.shape, np.inf, dtype = np.float32)
+        victim = np.maximum(np.where(quiet, ps.prev, inf).min(axis = 1), 1.0)   # [n]
+        misses = routed & ~resident & ~ps.busy
+        if debug:
+            ps.stats["routed"] += int(routed.sum())
+            ps.stats["missed"] += int((routed & ~resident).sum())
+        # (3) promotions: the misses that clear the ratio, best counts first, one per layer per step
+        ok = misses & (ps.prev >= _PROMOTE_RATIO * victim.reshape(-1, 1))
+        if ok.any():
+            score = np.where(ok, ps.prev, -1.0).reshape(-1)
+            order = np.argsort(-score)[:_PROMOTE_BUDGET * 4]
+            seen = set()
+            for flat in order.tolist():
+                if score[flat] < 0 or len(seen) >= _PROMOTE_BUDGET:
+                    break
+                i, r = divmod(flat, ps.mp.shape[1])
+                m = ps.modules[i]
+                if i in seen or not m._split_free_gpu:
+                    continue
+                host, first = m.cpu_host, m.cpu_split_first
+                c = m._split_mp[r] - first
+                if not host.promote_ready(m.cpu_layer_idx, c):
+                    continue
+                g = m._split_free_gpu.pop()
+                dev = torch.device(m.device)
+                with torch.cuda.device(dev):
+                    host.promo_stream(dev).wait_stream(torch.cuda.current_stream(dev))
+                    ev = host.promote_expert(m.cpu_layer_idx, c, _split_slot_linears(m, g))
+                m._split_pending.append(dict(kind = "p", r = r, gpu = g, cpu = c, ev = ev))
+                ps.busy[i, r] = True
+                seen.add(i)
+        # (4) demotions into the worker slots promotions freed: the least-used unrouted residents
+        for i, m in enumerate(ps.modules):
+            k = len(m._split_free_cpu)
+            if not k:
+                continue
+            cand = np.where(quiet[i], ps.prev[i], inf[i])
+            rs = np.argsort(cand)[:k]
+            host, first = m.cpu_host, m.cpu_split_first
+            dev = torch.device(m.device)
+            for r in rs.tolist():
+                if cand[r] == np.inf or not m._split_free_cpu:
+                    break
+                c = m._split_free_cpu.pop()
+                if not host.promote_ready(m.cpu_layer_idx, c):
+                    m._split_free_cpu.append(c)
+                    break
+                g = m._split_mp[r]
+                with torch.cuda.device(dev):
+                    host.promo_stream(dev).wait_stream(torch.cuda.current_stream(dev))
+                    ev = host.demote_expert(m.cpu_layer_idx, c, _split_slot_linears(m, g))
+                m._split_pending.append(dict(kind = "d", r = r, gpu = g, cpu = c, ev = ev))
+                ps.busy[i, r] = True
+    if debug:
+        st = ps.stats
+        st["steps"] += 1
+        st["ms"] += time.perf_counter() - t0
+        if modules[0]._split_step_count % 128 == 0:
+            p = sum(m._split_promo_n for m in ps.modules)
+            d = sum(m._split_demo_n for m in ps.modules)
+            pend = sum(len(m._split_pending) for m in ps.modules)
+            print(f" -- promote-on-miss: step {modules[0]._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
+                  f"last {st['steps']} steps: {st['routed'] / st['steps']:.1f} routed/step, "
+                  f"{st['missed'] / st['steps']:.1f} on the CPU ({100 * (1 - st['missed'] / max(st['routed'], 1)):.1f}% hit), "
+                  f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step", flush = True)
+            st.update(routed = 0, missed = 0, steps = 0, ms = 0.0)
+
+
+def _split_slot_linears(m, g):
+    """(gate or None, up, down) Linear modules of GPU slot g"""
+    return ((m.gates[g].inner if m.gated else None), m.ups[g].inner, m.downs[g].inner)
+
+
+def _split_promote_verify(m, t):
+    """EXL3_MOE_CPU_PROMOTE_VERIFY: a landed transfer's destination against the checkpoint: a
+    promotion's GPU slot tensors, a demotion's arena bytes (packed) and aux copies"""
+    from ..model.moe_cpu_host import _copy_repacked
+    stc = m.config.stc
+    full_g, full_u, full_d = m._split_saved_lists_ref()
+    r = t["r"]
+    host = m.cpu_host
+    torch.cuda.synchronize()
+    projs = ([("g", full_g, m.gates)] if m.gated else []) + [("u", full_u, m.ups), ("d", full_d, m.downs)]
+    if t["kind"] == "p":
+        for _, full, lin in projs:
+            dst = lin[t["gpu"]].inner
+            key = full[r].key
+            for tname, live in (("trellis", dst.trellis), ("suh", dst.suh), ("svh", dst.svh)):
+                fresh = stc.get_tensor(key + "." + tname, live.device, float2half = tname != "trellis")
+                assert torch.equal(fresh, live), f"promote verify failed: {key}.{tname}"
+        return
+    spec = host.specs[m.cpu_layer_idx]
+    layout, _ = host._stream_layout(spec)
+    eb = spec["expert_bytes"]
+    ci, off = host.layer_blocks[m.cpu_layer_idx][t["cpu"]]
+    arena = host.arena_views[ci][off // 2 : (off + eb) // 2]
+    aux = host.aux[m.cpu_layer_idx]
+    locs = host.layer_auxloc[m.cpu_layer_idx][t["cpu"]]
+    for li, name, lin, o, nb in host._promo_parts(m.cpu_layer_idx, _split_slot_linears(m, t["gpu"])):
+        key = dict(projs)[name][0][r].key if False else [f for n_, f, _ in projs if n_ == name][0][r].key
+        fresh = stc.get_tensor(key + ".trellis", "cpu").view(torch.int16)
+        packed = torch.empty_like(fresh)
+        group, planar = layout[("g", "u", "d").index(name)]
+        _copy_repacked(packed, fresh, group, planar)
+        got = arena[o // 2 : (o + nb) // 2].view(fresh.shape)
+        assert torch.equal(got, packed), f"demote verify failed: {key}.trellis (arena)"
+        for j, an in enumerate(("suh", "svh", "bias")):
+            lst = aux.get(f"{an}_{name}")
+            if lst is None or lst[t["cpu"]] is None:
+                continue
+            fr = stc.get_tensor(key + "." + an, "cpu", optional = an == "bias", float2half = True)
+            if fr is None:
+                continue
+            assert torch.equal(lst[t["cpu"]].cpu(), fr), f"demote verify failed: {key}.{an} (aux)"
+            lc, lo, ln = locs[li][j]
+            assert torch.equal(host.arena_views[lc][lo // 2 : (lo + ln) // 2], fr.view(torch.int16).view(-1)), \
+                f"demote verify failed: {key}.{an} (arena)"
 
 
 def trellis_rate(tile_width: int):
@@ -100,7 +438,15 @@ def trellis_rate(tile_width: int):
 
 class BlockSparseMLP_CPU:
 
+    # Dynamic placement: selections of prefill-size batches since the last sweep, kept apart
+    # from _split_hist (made on first use, _split_hist_apart) while the prefill weight is not 1,
+    # until the sweep folds them in with their weight (hist_prefill_weight, _split_hist_fold)
+    _split_hist_pf = None
+
     def _cpu_init_state(self):
+        self._split_spares = 0
+        self._split_pending = None
+        self._split_submit_rows = 0
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
@@ -189,15 +535,43 @@ class BlockSparseMLP_CPU:
         # registered module owns the step counter
         if self.cpu_split_first is not None and getattr(self, "_split_dynamic", False):
             dev = torch.device(self.device)
-            self._split_map = torch.arange(self.num_experts, dtype = torch.long, device = dev)
+            first, spares = self.cpu_split_first, self._split_spares
+            # Physical ids: [0, first) the GPU slots, first + i the worker's expert i. The spares'
+            # experts start in their worker slots, their GPU slots free
+            mp = [r if r < first - spares else first + (r - (first - spares)) for r in range(self.num_experts)]
+            self._split_map = torch.tensor(mp, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
+            self._split_hist_pf = None
             self._split_selcpu_t = None
-            self._swap_tick_count = 0
+            self._swap_tick_count = 0      # steps since the last placement sweep (the sweep zeroes it)
+            self._split_step_count = 0     # steps since load: the profile save gates on this one
+            if spares:
+                self._split_mp = mp
+                self._split_free_gpu = list(range(first - spares, first))
+                self._split_free_cpu = []
+                self._split_pending = []        # in-flight transfers: dict(kind, r, gpu, cpu, ev)
+                self._split_busy = set()        # router ids with a transfer in flight
+                self._split_promo_n = 0
+                self._split_demo_n = 0
             ip2 = self.config.infer_params
             reg = getattr(ip2, "moe_cpu_swap_modules", None)
             if reg is None:
                 reg = []
                 ip2.moe_cpu_swap_modules = reg
+                # A server killed with Ctrl-C never reaches unload: save what the session
+                # learned at interpreter exit as well (a no-op after a normal unload, which
+                # empties the registry; best effort, the CUDA tensors may already be gone)
+                import atexit, weakref
+                ref = weakref.ref(ip2)
+                def _save_at_exit():
+                    ip = ref()
+                    if ip is None:
+                        return
+                    try:
+                        save_expert_stats(ip)
+                    except Exception:
+                        pass
+                atexit.register(_save_at_exit)
             reg.append(self)
 
     def cpu_unload(self):
@@ -212,9 +586,14 @@ class BlockSparseMLP_CPU:
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
+                    if reg[0] is self:
+                        save_expert_stats(self.config.infer_params)
                     reg.remove(self)
                 self._split_map = None
                 self._split_hist = None
+                self._split_hist_pf = None
+                self._split_pending = None
+                self.config.infer_params.moe_cpu_promote_state = None
         if self.cpu_offload:
             host = getattr(self, "cpu_host", None)
             if host is not None:
@@ -226,6 +605,7 @@ class BlockSparseMLP_CPU:
             if isinstance(asn, dict) and asn.get(comp, 0) > 0:
                 asn[comp] -= 1
         self.cpu_offload = False
+        self.cpu_host = None
 
     def cpu_split_submit(self, y, bsz, selected_experts, routing_weights):
         """Hand the tail experts' share of the routed sum to the worker. Returns
@@ -233,9 +613,16 @@ class BlockSparseMLP_CPU:
         the flag waits land AFTER the caller's GPU expert work (cpu_split_combine collects);
         big prefill batches take the single-phase streamed path, which overlaps internally.
         Expert ids ship in the worker's local range with -1 sentinels for GPU-resident
-        picks."""
+        picks. The selections of a prefill-size batch, from whichever thread, are the ones a
+        prefill weight applies to (_split_hist_apart): the decode-size paths count into
+        _split_hist, the fused issue in its kernel."""
         if self._split_map is not None:
+            self._split_submit_rows = bsz
             self._split_swap_tick()
+            if self._split_spares and bsz >= self.cpu_host.stream_min_rows and self._split_pending:
+                # The streamed prefill's stager reads worker slots a demotion may still be writing:
+                # let the transfers land first (a prefill step is long anyway)
+                self.cpu_host.promo_stream(self.device).synchronize()
         if bsz < self.cpu_host.stream_min_rows:
             # Fused fast path: one kernel does the map translate + staging writes straight
             # into the pinned slot, skipping the whole activation payload (and, downstream,
@@ -254,27 +641,58 @@ class BlockSparseMLP_CPU:
             sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
-        sel_cpu = self._split_translate(selected_experts)
+        sel_cpu = self._split_translate(selected_experts, prefill = True)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 
-    def _split_translate(self, selected_experts):
+    def _split_translate(self, selected_experts, prefill = False):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
         in-place physical-slot translate -- the bsz-1 routing statics are read by captured
         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
-        GPU-resident picks); the static split is a tail offset."""
+        GPU-resident picks); the static split is a tail offset. The hits of a prefill-size
+        batch go where _split_hist_apart says."""
         if self._split_map is None:
             return (selected_experts - self.cpu_split_first).clamp_min(-1)
+        hist = self._split_hist_apart() if prefill else None
+        if hist is None:
+            hist = self._split_hist
         n = selected_experts.numel()
         buf = self._split_selcpu_t
-        if buf is None or buf.numel() < n:
+        if current_lane():
+            # A thread issuing beside the decode (util/lane.py) translates into a buffer of its
+            # own: the decode's copy path would write the module's between this call's kernels
+            buf = torch.empty(n, dtype = torch.long, device = selected_experts.device)
+        elif buf is None or buf.numel() < n:
             buf = self._split_selcpu_t = torch.empty(
                 max(n, 64), dtype = torch.long, device = selected_experts.device)
         sel_cpu = buf[:n].view(selected_experts.shape)
         ext.moe_split_map(
-            selected_experts.view(-1), self._split_map, self._split_hist,
+            selected_experts.view(-1), self._split_map, hist,
             buf[:n], self.cpu_split_first)
         return sel_cpu
+
+    def _split_hist_apart(self):
+        """
+        The histogram a prefill-size batch's selections are counted in when they are kept apart
+        from _split_hist: _split_hist_pf, made on first use (a layer's batches of that size come
+        from one thread at a time: the generator's, the prefill thread's, or the pipeline lane of
+        the layer's card). None, and they go to _split_hist as upstream's, while the prefill
+        weight is 1 (hist_prefill_weight, read here at every such batch so the weight in force
+        decides, whenever it was set) or under promote-on-miss: the first registered split
+        module has spare GPU slots, and _split_swap_tick steps promotions instead of sweeping.
+        Promote decays and snapshots _split_hist at every step and reads the routes of a step
+        from it; nothing would fold a second histogram in.
+        """
+        if hist_prefill_weight() == 1.0:
+            return None
+        reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
+        if reg and getattr(reg[0], "_split_spares", 0):
+            return None
+        pf = self._split_hist_pf
+        if pf is None:
+            with torch.inference_mode():
+                pf = self._split_hist_pf = torch.zeros_like(self._split_hist)
+        return pf
 
     def cpu_offload_issue(self, shape, y, selected_experts, routing_weights, params):
         """Whole-layer offload: the routed sum (of the given shape) comes entirely from the
@@ -327,9 +745,9 @@ class BlockSparseMLP_CPU:
         # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
         # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
-        if (
-            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
+        if int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and (
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            or os.path.exists(_expert_stats_path(self.config, self.num_experts))
         ):
             return False
         return super().can_defer_load()
@@ -502,6 +920,7 @@ class BlockSparseMLP_CPU:
         # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
         self._split_perm = None
+        self._split_seeded = False
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
@@ -511,26 +930,42 @@ class BlockSparseMLP_CPU:
         # via the install message (the child re-reads it from its own checkpoint handle)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
             and not self.tid2eid_key
-        stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-        if stats_path and self._split_dynamic:
-            # Static placement from a stats file only applies with dynamic swapping disabled
-            print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
-            stats_path = None
-        if stats_path and self.tid2eid_key:
-            print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
-            stats_path = None
-        if stats_path:
-            import json
-            counts = json.load(open(stats_path)).get(self.key)
-            if counts is not None and len(counts) == self.num_experts:
-                perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
-                self._split_perm = perm
-                if self.gated:
-                    self.gates = [self.gates[e] for e in perm]
-                self.ups = [self.ups[e] for e in perm]
-                self.downs = [self.downs[e] for e in perm]
+        # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 4, 0 off): with
+        # the pinned arena the parent moves experts between the GPU slots and the worker's arena
+        # by DMA, so a routed expert the CPU had to compute can take a spare GPU slot for the
+        # next tokens and the least-used resident goes the other way. The worker is registered
+        # from `spares` experts below the GPU slice, whose GPU slots start out as the free
+        # spares (their experts live in the worker's extra slots). At least one GPU slot stays a
+        # regular resident: a promotion must beat the least-used resident's count, so a layer
+        # whose slots all start empty would have nothing to beat and never promote
+        spares = 0
+        if self._split_dynamic and getattr(self.config.infer_params, "moe_cpu_pinned_arena", False):
+            spares = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE", 4)))
+        spares = min(spares, max(0, first - 1))
+        self._split_spares = spares
+        wfirst = first - spares
+        # Hot/cold placement: an explicit stats file (EXL3_MOE_CPU_SPLIT_STATS) or, failing
+        # that, the profile a previous run of this model saved (save_expert_stats). The expert
+        # lists are permuted hottest first, so the GPU slice holds the frequent experts from
+        # the first token and the worker the rare ones; the dynamic map then starts from there
+        counts = None
+        if not self.tid2eid_key:
+            stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            if stats_path:
+                import json
+                counts = json.load(open(stats_path)).get(self.key)
+                if counts is None:
+                    print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
             else:
-                print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
+                counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
+        if counts is not None and len(counts) == self.num_experts:
+            perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
+            self._split_perm = perm
+            if self.gated:
+                self.gates = [self.gates[e] for e in perm]
+            self.ups = [self.ups[e] for e in perm]
+            self.downs = [self.downs[e] for e in perm]
+            self._split_seeded = True
 
         self.device = torch.device(device)
 
@@ -557,7 +992,7 @@ class BlockSparseMLP_CPU:
 
         def fetch_aux(ls, suffix, optional = False):
             out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
-                                  float2half = True) for l in ls[first:]]
+                                  float2half = True) for l in ls[wfirst:]]
             return out if not optional or out[0] is not None else None
         aux = dict(
             suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
@@ -572,9 +1007,9 @@ class BlockSparseMLP_CPU:
 
         self.cpu_layer_idx = host.register_layer(
             self.key,
-            [l.key for l in self.gates[first:]] if self.gated else [],
-            [l.key for l in self.ups[first:]],
-            [l.key for l in self.downs[first:]],
+            [l.key for l in self.gates[wfirst:]] if self.gated else [],
+            [l.key for l in self.ups[wfirst:]],
+            [l.key for l in self.downs[wfirst:]],
             {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
@@ -583,6 +1018,7 @@ class BlockSparseMLP_CPU:
             interm_fp32 = self.interm_dtype == torch.float,
         )
 
+        self._split_wfirst = wfirst
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never
         # loaded); unload() restores them so a reload can redo the split cleanly
         tail = set((self.gates[first:] if self.gated else []) + self.ups[first:] + self.downs[first:])
@@ -597,9 +1033,11 @@ class BlockSparseMLP_CPU:
         self.routing_first = 0
         self.routing_last = first
         self.cpu_split_first = first
-        mode = "dynamic" if self._split_dynamic else "static"
+        mode = ("promote-on-miss" if spares else "dynamic") if self._split_dynamic else "static"
         print(f" -- CPU split experts (worker, {mode}): {self.key} "
-              f"[{first}..{self.num_experts}) of {self.num_experts}")
+              f"[{first}..{self.num_experts}) of {self.num_experts}"
+              + (f", {spares} spare slots" if spares else "")
+              + (", placement from saved profile" if getattr(self, "_split_seeded", False) else ""))
         return True
 
 
@@ -614,6 +1052,13 @@ class BlockSparseMLP_CPU:
         if reg[0] is not self:
             return
         self._swap_tick_count += 1
+        self._split_step_count += 1
+        if self._split_step_count % _STATS_SAVE_INTERVAL == 0:
+            save_expert_stats(ip)
+        if self._split_spares:
+            # Promote-on-miss replaces the sweep: one pass over every split module per step
+            _split_promote_step(ip, reg, self._split_submit_rows)
+            return
         interval = int(os.environ.get("EXL3_MOE_CPU_SWAP_INTERVAL", 128))
         if self._swap_tick_count < interval:
             return
@@ -625,10 +1070,33 @@ class BlockSparseMLP_CPU:
         ip.moe_cpu_swap_pending = True
         if self._swap_tick_count < 4 * interval:
             return
+        # Not while two threads issue passes (util/lane.py): the sweep quiesces the cards and
+        # rewrites expert slots in place, and the other thread would go on issuing
+        if current_lane() or lanes_busy():
+            return
         run_pending_swap_sweeps(ip)
 
     def _split_sweep_layer_reset(self):
         self._swap_tick_count = 0
+
+    def _split_hist_fold(self, weight: float):
+        """Add the prefill-size batches' selections counted apart since the last sweep to the
+        histogram the sweep ranks the experts by, `weight` each (0: they do not count), and
+        start over. run_pending_swap_sweeps calls it for every layer before it sweeps any."""
+        pf = self._split_hist_pf
+        if pf is None or self._split_hist is None:
+            return
+        if weight > 0:
+            self._split_hist.add_(pf, alpha = weight)
+        pf.zero_()
+
+    def split_hits(self):
+        """(_split_hist, the selections of prefill-size batches counted apart since the last
+        sweep), two (E,) tensors in router order: the second is zeros when nothing is counted
+        apart. Every selection is one in either, whatever its weight in the placement; the first
+        also holds what earlier sweeps folded in, at their weight, and decayed."""
+        pf = self._split_hist_pf
+        return self._split_hist, (pf if pf is not None else torch.zeros_like(self._split_hist))
 
     def _split_sweep_layer(self, budget):
         """One placement sweep for this layer: repeatedly swap the hottest CPU-resident
@@ -742,5 +1210,15 @@ class BlockSparseMLP_CPU:
         return True
 
     def _split_saved_lists_ref(self):
+        """The full expert Linear lists (GPU slice and worker tail together) in ROUTER order. The
+        saved lists are in checkpoint order; with a hot/cold placement permutation in effect, router
+        id r is checkpoint expert _split_perm[r] (the router tensors were permuted the same way at
+        load), so the sweep's checkpoint reads, the demotion's install keys and the transfer verify
+        must all go through the permutation."""
         g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
+        perm = self._split_perm
+        if perm is not None:
+            g = [g[e] for e in perm] if self.gated else g
+            u = [u[e] for e in perm]
+            d = [d[e] for e in perm]
         return g, u, d
