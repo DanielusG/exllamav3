@@ -1183,6 +1183,98 @@ extension against its own `forward()` one row at a time (greedy, masked, with pr
 row's draw, the stacks that qualify. Marked `nogpu`; run with `--noconftest` without the compiled
 extension.
 
+### The MTP head's update and next draft in one pass (`Generator(mtp_batched_update = True)`, `EXL3_MTP_BATCHED_UPDATE=1`)
+
+Off by default; with it off the generator behaves as upstream. For the MTP head. In the server:
+`--mtp-batched-update` (rule 30 of its `AGENTS.md`). Written on this base (2026-10-23); not run on
+the cards.
+
+**What upstream does.** The head drafts position K+1 from the token at K and the target's hidden
+state at K-1, writing its own cache at K (`iterate_draftmodel_mtp_gen`). After the verification,
+every job that accepted A-1 > 0 drafts gets a head pass of its own over K+1..K+A-1, the accepted
+drafts paired with the target's hidden states at K..K+A-2 (`draft_model.prefill`, one job after
+another); the job keeps the target's state at K+A-1 (`mtp_last_hidden`), and the next iteration
+starts with a draft pass over every job at K+A. Each draft token is read back twice, into the drafts
+and into the inputs of the next draft token, both blocking copies. With one draft token and n jobs:
+up to n + 1 head passes and two readbacks a step.
+
+**What the switch does.** After the verification (`Generator._mtp_update`):
+
+- A job that goes on generating is folded (`_mtp_fold`): one pass of the head over every such job,
+  positions K+1..K+W+1 (W the window), the token at K+i paired with the target's state at K+i-1: the
+  accepted drafts for i < A, the token sampled after them for i = A, the rejected drafts and a filler
+  past it. The head's output at K+A is what the next draft pass would compute: the first draft is
+  taken from there (`sample_from_state` on those rows only) and kept on the job with the position it
+  was made at (`Job.mtp_fold`), with the head's state there for the draft tokens after the first.
+  Nothing is read back. The next draft step (`_mtp_take_folds`), when every job of the step has a
+  fold made at the position it stands at, reads them back in one copy, into the drafts and from
+  there into the next draft token's inputs, and runs the head from the second draft token on (with
+  one draft token, not at all). Otherwise the head drafts for every job, as without the switch, and
+  every fold is dropped: a fold is for one draft step. The head's cache then holds at K..K+A what the
+  head pass per job and the next draft pass would have written (the draft pass at K+A writes it again
+  with the same inputs).
+- Jobs that accepted drafts and are not folded get one batched pass over K+1..K+S, S the most drafts
+  a row accepted (`_mtp_update_pass`): a job that ended or was requeued (the pages of a job that ends
+  may stop at K+W), and every job in a step whose window is not the head's own (a hybrid round, the
+  confidence-calibrated draft, which drafts token by token and exports confidences). A job a
+  banned-string rewind abandoned gets neither, as without the switch (its carry is gone; drafting
+  pauses until the next target pass). `mtp_last_hidden` is set as before for every job, so the
+  regular draft pass can always run.
+- With the switch the regular draft loop also takes the next draft token's inputs from the copy it
+  just read back (host to host), not from a second readback.
+
+**Why writing past a job's accepted tokens is harmless.** The head's cache has the target's page
+layout (one page table, `draft_cache.max_num_tokens == cache.max_num_tokens`), and attention reads
+stop at each row's position (`cache_seqlens` plus the pass's own tokens). A job's position only moves
+forward from K+A, and every position it moves through is written again before a pass reads it: the
+next pass that reaches a position writes it first, as the verification pass writes over the target
+cache's rejected drafts. The pages are the job's: up to K+W the verification pass wrote them; K+W+1
+only for a job that goes on, whose next verification writes up to K+A+W, and `_fold_fits` checks the
+page table and the block table all the same (a position on a page outside them would be written
+through a zeroed block-table entry, page 0). Rewinds: a banned-string rewind is never folded; a
+requeue is never folded and comes back as a new prompt whose ingestion updates the head over it. With
+the staggered decode a group is folded when it is sampled, through its lane's staging buffers, its
+jobs' pages its own; the pass is issued where the per-job passes were, between two halves of the
+other group, which has its own copy of the embedding's pinned output (the cursor's); the fold is read
+back at the group's next draft step, as the draft pass was. A fold of r jobs is r x (1 + W) rows, the
+verification pass's count, which the prefill thread already counts against `side_max_rows`
+(`_decode_rows`), so a chunk's head update and a fold meet inside the head's modules no more than a
+draft pass and a chunk did.
+
+**Exactness.** Speculative decoding keeps the target's tokens whatever the drafts. The head's cache
+gets the same inputs as without the switch, in passes of other shapes (r x (1 + W) rows instead of
+1 x (A - 1) and r x 1): on the cards its values can differ in the last bits, so its drafts, the
+acceptance, and with them which target pass computes a position can differ. With greedy sampling
+the tokens are then the same only as far as the target's logits at a position do not depend on the
+pass that computes them (the exact check says; the serial path of upstream has the same exposure to
+a draft that changes).
+
+What it costs when it runs: the fold's rows past each job's accepted tokens (with one draft token,
+one or two positions per job, in a pass that replaces two), the head's attention and MoE at a new
+shape r x (1 + W) (the graph-captured decode paths capture a graph per shape: more graph slots on the
+head's card, the first card, where VRAM is shortest), the rows of the batched update past a row's
+own accepted drafts. Nothing written anywhere.
+
+Counted on the toy model (one in three drafts accepted): one head pass a step instead of 1.3-3.3 for
+1-4 jobs with one draft token (2 instead of 2.3-3.3 with two); readbacks a step 2.3-6.3 with this
+switch alone and 2 with both switches (3 with two draft tokens), for 1-4 jobs, regular or staggered.
+Not measured on the cards.
+
+Not checked beyond reading: a tensor-parallel target (the fold calls the head and its
+`sample_from_state` as the draft step does), MiMo's depth-specialized heads (the fold is a depth-0
+step, `draft_step = 0`, as the update and the first draft step are), the graph captures above.
+
+Tests (no GPU, no extension): `tests/test_mtp_decode.py`. A toy MTP head with a paged cache of its
+own, in the target's page layout: a pass writes each position's token and hidden state, then
+computes each output from the 16 slots before it; a slot must hold the job's token at that position
+and the hidden state the target exported at the one before (or be a later draft step's own write,
+read within its round), else the head drafts a token no target samples. With and without the switch
+(and with the window verified at once): the same tokens and the same drafts accepted as without it,
+no such draft, with 1-3 draft tokens, staggered, across requeues and checkpoint cuts, jobs joining
+(the head drafts for all), folds refused by the page check; the check catches a missing update and a
+draft taken at the wrong position; readbacks and head passes counted. Marked `nogpu`; run with
+`--noconftest` without the compiled extension.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
