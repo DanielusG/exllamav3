@@ -26,6 +26,7 @@ from .visualizer import CacheVisualizer
 import time
 import threading
 from ..tokenizer import MMEmbedding
+from ..tokenizer.mm_embedding import set_content_digests
 from ..util import profile_opt
 
 class _Flight:
@@ -119,6 +120,7 @@ class Generator:
         stagger_decode: bool = False,
         prefill_thread: bool = False,
         prefill_pipeline: bool = False,
+        mm_content_hash: bool = False,
         **kwargs
     ):
         """
@@ -297,6 +299,19 @@ class Generator:
             number of tokens) in the environment turns it on for callers that do not pass the
             argument. Default False
 
+        :param mm_content_hash:
+            Hash a page that holds multimodal placeholder ids over its images' content instead of over
+            the ids, which are handed out per process and can stand for another image in another one.
+            Such pages, and the pages and recurrent checkpoints chained after them, then go to the disk
+            tier like text pages and are found again after a restart. Turning it on also gives every
+            embedding made from then on a digest of its content, computed once when it is made (about
+            what a pass of blake2b over its tensors costs); an embedding made before, or with digests
+            off, has none, and a page that holds its ids is hashed and kept as upstream does. Read when
+            a job is queued (or requeued): a change of mm_content_hash at run time applies to the jobs
+            queued after it, and what was hashed the other way is not found again (a cache miss, never
+            a page reused for other content). EXL3_MM_CONTENT_HASH=1 in the environment turns it on for
+            callers that do not pass the argument, digests included. Default False
+
         :param kwargs:
         """
 
@@ -308,6 +323,14 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+
+        # Fork: content-addressed multimodal pages (FORK.md). Job.prepare_for_queue reads it and fixes it per
+        # sequence (Sequence.prepare); the digests the hashes are made from come with the embeddings, so they are
+        # turned on for the process from here (tokenizer.mm_embedding.set_content_digests)
+        self.mm_content_hash = bool(mm_content_hash) or os.environ.get("EXL3_MM_CONTENT_HASH", "0") not in ("", "0")
+        if self.mm_content_hash:
+            set_content_digests(True)
+
         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
         cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
         self.cache_owner_serial = cache.owner_serial

@@ -85,6 +85,7 @@ def _load_stubbed():
     stub("model.model", Model = _Any)
     stub("cache.cache", Cache = _Any)
     stub("tokenizer.tokenizer", Tokenizer = _Any)
+    stub("tokenizer.mm_embedding", set_content_digests = lambda on: None)
     stub("util.memory", malloc_trim = lambda: None)
     stub("generator.pagetable", PageTable = _Any, is_content_hash = lambda h: h[:8] != bytes(8))
     stub("generator.cpu_cache", CPUPageCache = _Any)
