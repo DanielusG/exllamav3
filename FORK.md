@@ -1085,6 +1085,104 @@ directory on a real disk (a subdirectory is made there and removed). Upstream's 
 `tests/cache/test_disk_cache.py` needs CUDA (`CPUPageCache` asserts CUDA cache tensors).
 Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
+### An MTP window verified with one readback (`Generator(mtp_batched_verify = True)`, `EXL3_MTP_BATCHED_VERIFY=1`)
+
+Off by default; with it off the generator behaves as upstream. For the MTP head (whatever window
+the step verifies while the head drafts, a hybrid round's included). In the server:
+`--mtp-batched-verify` (rule 30 of its `AGENTS.md`). Written on this base (2026-10-23); not run on
+the cards.
+
+**What upstream does.** With drafts the decode step samples a job's window a position at a time:
+a sampler call, then `Job.receive_sample`'s `.cpu()`, a readback that waits for the whole pass and
+the sampling behind it, and the next position only once the one before matched its draft; job
+after job. The path with one readback for the batch (`sample_pinned`, one synchronize) is only for
+steps without drafts. With one draft token, n jobs and the head's acceptance a: n (1 + a) readbacks
+a step for the sampling, plus the draft step's two blocking copies. Measured on the v1.5.4 base
+(staggered decode, above): a call's sampling is 2-2.7 ms per job, and the cards idle in the draft and
+sampling phases, 6-7.5 ms of a 23 ms call with 4 jobs.
+
+**What the switch does.** `Generator._verify_windows`, before the serial loop: every job that can
+(`Job.window_sampling_why` returns None) has its window sampled in one call (`Job.sample_window` →
+`CustomSampler.forward_window`), position r as `receive_logits` would sample it once `drafts[:r]`
+were accepted; the samples are compared with the drafts on the device and the drafts matched from
+the first are counted there (`cumprod`); samples and counts of every such job come back through one
+pinned buffer, in one copy and one wait (`_host_wait`: an event on the current stream of the logits'
+card, where the sampling and the copy are, not a synchronize of the whole card). The serial loop then
+takes those jobs' tokens from there and accepts by the count instead of comparing on the host; what
+it checks on the host still ends a window where it did: a recurrent checkpoint boundary (the tail
+checkpoint's included), a stop token, string or limit, a filter's end, a requeue, the loop detector.
+Positions sampled past where a window ends are never used.
+
+- *Masks.* Position 0's is the one `prepare_logit_mask` builds as before (the host side is now kept,
+  `Job.host_logit_mask`). For position r every filter is fed `drafts[:r]` (`Filter.feed`, journaled)
+  and asked for its mask, then all are rolled back (`Filter.rewind`) whatever happens in between
+  (`Job._window_masks`): only filters with a native rollback (`rollback_tokens` overridden:
+  `LLGuidanceFilter`) and no trigger token take this path, the others would replay their whole
+  journal. A draft the previous position's mask refuses cannot be accepted, nor can anything after
+  it; a draft that ends a filter with `eos_after_completed` ends the job if accepted: the rows after
+  either repeat the last one, never read. A filter that completes leaves the rows after it
+  unconstrained by it, as in the serial path. A filter that raises is put back and the job takes the
+  serial path that step (`filter_error`), with nothing drawn. The masks of positions that end up
+  rejected are computed for nothing: with one draft token, one mask more per step for a job with a
+  filter (the serial path computes them only for accepted positions).
+- *Past IDs.* The penalty kernels (`apply_rep_pens`, `apply_pres_freq_pens`) take one row, so a
+  stack whose steps read past IDs (`window_past_ids`) must have them in the head of a fused stack
+  (`window_head`): the head runs per row on the sequence followed by the drafts before it (one
+  upload: the drafts go after the sequence in the job's pinned buffer, past its watermark), the fused
+  tail once over all rows. The server's non-thinking set (presence 1.5) is such a stack; with
+  presence 0 the step is a no-op and no past IDs are read (although `reqs_past_ids` is set).
+- *The random stream.* One draw from the job's generator per window, where the serial path takes
+  one per position. The fused sampler keys its Philox noise on (draw, flat index), so row 0 gets the
+  noise the serial path would give that position with that draw, and every row's noise is
+  independent of the others': each position is sampled from exactly its distribution, and a seed
+  gives the same tokens run after run (for the same drafts, as the serial path), but other tokens
+  than the serial path with the same seed. Greedy sampling gives the serial path's tokens: each row
+  of the fused kernel is computed alone, its vocabulary blocks counted from the vocabulary size, not
+  the batch.
+- *Serial path*, per job and step (`mtp_verify_stats["fallbacks"]`, by reason): `first_token` (token
+  healing, and the first token, whose NaN check is a readback anyway), `forced_tokens`
+  (`constrain_output_now`), `probs` (`return_probs`, `return_top_tokens`), `banned_strings` (a
+  partial match holds tokens back and blocks what it explored at the next position), `min_new_tokens`
+  (stop tokens blocked, a limit the window could cross), `sampler` (a step that keeps state from one
+  call to the next, adaptive-P; one that draws from torch's generator, `SS_Sample_mn`; penalties not
+  in a fused head, e.g. with `EXL3_FUSED_SAMPLER=0`; a sampler that is not a `CustomSampler`),
+  `filter`, `filter_error`, `job` (a job without `window_sampling_why`).
+- *With the other features.* The staggered decode samples a group the same way, through its lane's
+  staging buffers. A prompt chunk on the prefill thread or in the pipeline shares the pass's stream,
+  so the wait waits for what the chunk issued before it, as any readback does (the event waits for
+  nothing on the other streams of the card, a synchronize would). The tail checkpoint cuts the
+  window on the host as before.
+- `readback_stats` counts, whatever the switches, the decode steps that sampled and the readbacks of
+  drafted and sampled tokens they and the MTP draft steps made (not a job's first token: its NaN
+  check and its timing are a wait each). `mtp_verify_stats`: windows sampled at once, windows left to
+  the serial path while the switch is on, the readbacks, the fallbacks.
+
+What it costs when it runs: one draw per window instead of per position (the stream above), the rows
+sampled past the first mismatch (a few kernels; with one draft token at most one row per job), the
+masks above, one upload of the drafts and one of the past IDs per step. Nothing written anywhere.
+
+Counted on the toy model (one in three drafts accepted, readbacks per step once every job has its
+first token): with one draft token 3.3, 4.7, 6.0, 7.3 readbacks a step for 1-4 jobs serially, 3 with
+the switch (the draft step's two blocking copies and one for the sampling); with two draft tokens
+5.5-9.8 serially, 5 with the switch. Production's acceptance is higher (about 0.79 with one draft
+token), so its serial count is higher. Not measured on the cards: what a readback costs there, and
+whether the cards' idle time in the sampling phase goes.
+
+Not checked beyond reading: an `LLGuidanceFilter` (the tests use a filter with the same interface),
+a hybrid round's window, a TP model, the compiled `fused_sampler` with per-row masks over a window
+(its per-row form is upstream's, used for one row and for batches without drafts).
+
+Tests (no GPU, no extension): `tests/test_mtp_decode.py`: the generator over the toy model of the
+staggered tests (the same tokens and the same drafts accepted as the serial path, with 1-3 draft
+tokens, staggered, with checkpoint cuts and requeues, jobs declining or failing beside the others);
+readbacks counted on tensors that stand for device memory (every host read of one, every explicit
+wait, every synchronize), against `readback_stats`; the real `Job`'s masks against the serial
+path's, position by position, packed and dense, a refused draft, a filter that completes, ends the
+job or raises, the past IDs, the reasons; the real sampler's `forward_window` over a stand-in for the
+extension against its own `forward()` one row at a time (greedy, masked, with presence), the first
+row's draw, the stacks that qualify. Marked `nogpu`; run with `--noconftest` without the compiled
+extension.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
