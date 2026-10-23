@@ -254,6 +254,19 @@ order. flash-attn is an optional dependency; when it is not installed, this swit
 FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
 attention sinks); this switch exists for A/B comparison.
 
+### `EXL3_QSA_RAW_TAIL` (default: `0`)
+
+QSA attention layers (Qwen3.8-Flash-Next, `cache/qsa.py`): keep the indexer's raw keys only for the
+blocks being built. Upstream keeps a raw key for every token of every page (64 KiB per page and QSA
+layer), but only the pooled-key rebuild of the block an append starts in reads them, and only the
+last 3 before the append. With `1` the raw plane is a ring of 32 tokens per page (an integer from 19
+to 256: a ring of that many tokens), 56 KiB less VRAM per page and layer with 32, and page images
+in the CPU and disk tiers without the raw keys (the disk tier's fingerprint changes with them: a
+directory of its own). The pooled keys, the selection and the attention output are bit for bit the
+same. Read when the `Cache` is made; `Cache(qsa_raw_tail = ...)` takes precedence. Refused, with a
+warning, for models without recurrent states; a generator whose drafts are longer than the ring
+serves (28 draft tokens with 32) refuses to start. FORK.md has the rules.
+
 ## EXL3 GEMM / GEMV
 
 ### `EXL3_GEMV` (default: `1`)
