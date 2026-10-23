@@ -82,6 +82,7 @@ class Generator:
     stagger_decode = False
     prefill_thread = False
     mtp_batched_verify = False
+    mtp_batched_update = False
     _stagger_backlog = ()
     _stagger_run = None
     _flight = None
@@ -121,6 +122,7 @@ class Generator:
         prefill_thread: bool = False,
         prefill_pipeline: bool = False,
         mtp_batched_verify: bool = False,
+        mtp_batched_update: bool = False,
         **kwargs
     ):
         """
@@ -236,6 +238,21 @@ class Generator:
             with a trigger token) takes the serial path that step. Can be switched at any time (attribute
             of the same name). EXL3_MTP_BATCHED_VERIFY=1 in the environment turns it on for callers that do
             not pass the argument. See _verify_windows().
+
+        :param mtp_batched_update:
+            With the MTP head drafting: after the verification, bring the head's cache up to the accepted
+            tokens and draft the next token in one batched pass of the head over every job that goes on
+            generating (_mtp_fold), instead of one pass of the head per job that accepted a draft and a
+            draft pass of the head at the start of the next iteration. Positions past a job's accepted
+            tokens are written too, with nothing that will be read: every one of them is written again
+            before any pass reads it. The next draft step then reads the drafts back without running the
+            head for the first draft token; it runs the head as before when a job of the step has none
+            (a job just past its prompt, a job that ended or was requeued, a banned-string rewind, the
+            confidence-calibrated draft). Speculative decoding stays exact; the head's cache gets the same
+            inputs in passes of other shapes, so drafts, and with them which positions each target pass
+            computes, can differ. Can be switched at any time (attribute of the same name).
+            EXL3_MTP_BATCHED_UPDATE=1 in the environment turns it on for callers that do not pass the
+            argument.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -403,6 +420,14 @@ class Generator:
         self.mtp_batched_verify = mtp_batched_verify or \
             os.environ.get("EXL3_MTP_BATCHED_VERIFY", "0") not in ("", "0")
         self.mtp_verify_stats = {"windows": 0, "serial": 0, "readbacks": 0, "fallbacks": {}}
+
+        # The head's cache brought up to the accepted tokens, and the next draft made, in one pass
+        # (_mtp_fold): head passes it issued, rows it brought up to date in them (each job's), rows
+        # that also drafted their next token, draft steps that took those drafts without running the
+        # head, draft steps that ran it with some job's draft left unused
+        self.mtp_batched_update = mtp_batched_update or \
+            os.environ.get("EXL3_MTP_BATCHED_UPDATE", "0") not in ("", "0")
+        self.mtp_update_stats = {"passes": 0, "rows": 0, "folds": 0, "fold_drafts": 0, "fold_misses": 0}
 
         # Staggered decode (iterate_staggered)
         self._stagger_init(stagger_decode)
@@ -1382,7 +1407,15 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
-        for idx in range(window):
+
+        # With mtp_batched_update the head's update of the last step made each job's first draft
+        # already (_mtp_fold), at the position it stands at: read back, the head runs from the second
+        # draft token on. One job without one and the head drafts for all, as always
+        start = 0
+        if self.mtp_batched_update:
+            start, temp_hidden = self._mtp_take_folds(jobs, batch_size, batch_ids, cache_seqlens, temp_hidden)
+
+        for idx in range(start, window):
             params = {
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
@@ -1398,8 +1431,13 @@ class Generator:
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
-            self._note_readbacks(2)
+            if self.mtp_batched_update:
+                # The next draft step's inputs from the copy just read back, not a second readback
+                batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
+                self._note_readbacks(1)
+            else:
+                batch_ids.copy_(new_ids)
+                self._note_readbacks(2)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -3299,7 +3337,12 @@ class Generator:
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
-        if self.mtp_draft:
+        if self.mtp_draft and self.mtp_batched_update:
+            self._mtp_update(
+                jobs, logit_mapping, batch_ids, block_index, p_cache_seqlens, p_export_states[-1],
+                accepted_lengths, rewound_jobs, completed_jobs + requeuing_jobs, draft_tokens,
+            )
+        elif self.mtp_draft:
             target_hidden = p_export_states[-1]
             accepted_idx = 0
             for job, a_idx, b_idx in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
@@ -3352,6 +3395,171 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def _mtp_update(self, jobs, logit_mapping, batch_ids, block_index, cache_seqlens, target_hidden,
+                    accepted_lengths, rewound_jobs, done_jobs, draft_tokens):
+        """
+        The MTP head's update after a verification (mtp_batched_update), in place of a head pass per
+        job that accepted a draft (positions K+1..K+A-1, the accepted drafts with the target's hidden
+        states) and the next iteration's draft pass (position K+A, the token sampled after them, with
+        the target's state at K+A-1).
+
+        A job that goes on generating is folded (_mtp_fold): one pass of the head over all of them
+        writes positions K+1..K+W+1 (W the window) and drafts from position K+A. The rest of the
+        jobs that accepted a draft (a job that ended or was requeued, whose pages may end at K+W, or
+        a window that is not the head's own: a hybrid round, the calibrated draft, which drafts step
+        by step) get one batched pass over K+1..K+A-1 (_mtp_update_pass). A job a banned-string
+        rewind abandoned gets neither (its carry is gone; drafting pauses until the next target pass,
+        as without the switch).
+
+        Why writing past a job's accepted tokens is harmless: the head's cache has the target's page
+        layout, attention reads stop at each row's position, and a job's position only moves forward
+        from K+A through positions written again before they are read (the next pass that reaches a
+        position writes it first, as the target's verification pass does over rejected drafts). The
+        positions are on pages the job owns: up to K+W the verification pass wrote them; past it a
+        folded job still generates, so its next verification will write up to K+A+W (_fold_fits
+        checks the page table all the same).
+        """
+        width = batch_ids.shape[-1]
+        fold = draft_tokens is not None and draft_tokens.shape[-1] == self.num_draft_tokens and \
+            self.draft_calibrator is None
+        done = {id(job) for job in done_jobs}
+        folds, updates = [], []
+        row = 0
+        for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b:
+                continue
+            n = accepted_lengths[row]
+            row += 1
+            if id(job) in rewound_jobs:
+                continue
+            # As without the switch: what the regular draft pass starts from, should this job need one
+            job.mtp_last_hidden = target_hidden[a:b, n - 1:n, :].clone()
+            kv = int(cache_seqlens[a])
+            if fold and id(job) not in done and job.sequences[0].kv_position == kv + n and \
+                    self._fold_fits(job, kv + width):
+                folds.append((job, a, n))
+            elif n > 1:
+                updates.append((job, a, n))
+        if updates:
+            self._mtp_update_pass(updates, batch_ids, block_index, cache_seqlens, target_hidden)
+        if folds:
+            self._mtp_fold(folds, batch_ids, cache_seqlens, target_hidden)
+
+
+    @staticmethod
+    def _fold_fits(job, last: int) -> bool:
+        """Whether position `last` of a job is on a page it owns, in its block table"""
+        seq = job.sequences[0]
+        page = last // PAGE_SIZE
+        return page < len(seq.allocated_pages) and page < seq.block_index_tensor.shape[-1]
+
+
+    def _mtp_update_pass(self, rows, batch_ids, block_index, cache_seqlens, target_hidden):
+        """One pass of the head over positions K+1..K+S of each row (S the most drafts a row
+        accepted), the drafts with the target's hidden states: what a head pass per job writes, and
+        past a row's own accepted drafts positions the verification pass wrote too (see _mtp_update)."""
+        span = max(n for _, _, n in rows) - 1
+        k = len(rows)
+        ids = self._staging("mtp_update_ids", k, span, torch.long)
+        seqlens = self._staging("mtp_update_seqlens", k)
+        table = self._staging("mtp_update_table", k, block_index.shape[-1])
+        hidden = []
+        for r, (job, a, n) in enumerate(rows):
+            ids[r].copy_(batch_ids[a, 1:1 + span])
+            seqlens[r] = cache_seqlens[a] + 1
+            table[r].copy_(block_index[a])
+            hidden.append(target_hidden[a:a + 1, :span, :])
+        self.draft_model.prefill(ids, {
+            "attn_mode": "flash_attn",
+            "block_table": table,
+            "cache": self.draft_cache,
+            "cache_seqlens": seqlens,
+            "target_hidden": torch.cat(hidden, dim = 0),
+        })
+        self.mtp_update_stats["passes"] += 1
+        self.mtp_update_stats["rows"] += k
+
+
+    def _mtp_fold(self, rows, batch_ids, cache_seqlens, target_hidden):
+        """
+        One pass of the head over positions K+1..K+W+1 of each job that goes on generating, and its
+        next draft (mtp_batched_update, see _mtp_update). Position K+i pairs the token at K+i with
+        the target's hidden state at K+i-1: the accepted drafts for i < A, the token sampled after
+        them for i = A, the rejected drafts (and a filler) past it. The head's output at K+A is
+        what the next draft pass would compute, so the job's first draft is taken from there and
+        kept on the job (mtp_fold) for the next draft step, with the head's state at that position
+        for the draft tokens after it. Nothing is read back here: the next draft step does it.
+        """
+        width = batch_ids.shape[-1]
+        k = len(rows)
+        pages = max((int(cache_seqlens[a]) + width) // PAGE_SIZE + 1 for _, a, _ in rows)
+        pages = (pages + 15) // 16 * 16
+        ids = self._staging("mtp_fold_ids", k, width, torch.long)
+        seqlens = self._staging("mtp_fold_seqlens", k)
+        table = self._staging("mtp_fold_table", k, pages)
+        table.zero_()
+        hidden = []
+        for r, (job, a, n) in enumerate(rows):
+            seq = job.sequences[0]
+            ids[r, :width - 1].copy_(batch_ids[a, 1:])
+            ids[r, width - 1] = batch_ids[a, width - 1]
+            last = len(seq.sequence_ids)
+            ids[r, n - 1] = int(seq.sequence_ids.torch_slice(last - 1, last).item())
+            seqlens[r] = cache_seqlens[a] + 1
+            src = seq.block_index_tensor[:, :pages]
+            table[r, :src.shape[-1]].copy_(src[0])
+            hidden.append(target_hidden[a:a + 1, :width, :])
+        params = {
+            "target_hidden": torch.cat(hidden, dim = 0),
+            "attn_mode": "flash_attn",
+            "block_table": table,
+            "cache": self.draft_cache,
+            "cache_seqlens": seqlens,
+            "draft_step": 0,
+        }
+        state = self.draft_model.forward(ids, params)
+        picked = torch.cat([state[r:r + 1, n - 1:n, :] for r, (_, _, n) in enumerate(rows)], dim = 0)
+        lm_head = self.model.modules[self.model.logit_layer_idx]
+        picked = lm_head.prepare_for_device(picked, params)
+        drafted = self.draft_model.sample_from_state(picked, params)
+        deeper = self.num_draft_tokens > 1
+        for r, (job, a, n) in enumerate(rows):
+            job.mtp_fold = (int(cache_seqlens[a]) + n, drafted[r:r + 1], picked[r:r + 1] if deeper else None)
+        stats = self.mtp_update_stats
+        stats["passes"] += 1
+        stats["rows"] += k
+        stats["folds"] += k
+
+
+    def _mtp_take_folds(self, jobs, batch_size, batch_ids, cache_seqlens, temp_hidden):
+        """
+        The draft step's first draft token from the last step's fold (mtp_batched_update): when
+        every job of the step has one made at the position it stands at, the drafts are read back
+        (one copy) into the draft and into the inputs of the head's next draft token, the positions
+        move on one, and the head's states at those positions are what it drafts on from. Returns
+        (the first draft token still to make, the hidden states to make it from). Every job's fold
+        is used or dropped here: a fold is for one draft step.
+        """
+        ready = [job for job in jobs if job.is_prefill_done()]
+        folds = [getattr(job, "mtp_fold", None) for job in ready]
+        for job in ready:
+            job.mtp_fold = None
+        if self.draft_calibrator is not None or not folds or not all(
+            f is not None and f[0] == job.sequences[0].kv_position for f, job in zip(folds, ready)
+        ):
+            if any(f is not None for f in folds):
+                self.mtp_update_stats["fold_misses"] += 1
+            return 0, temp_hidden
+        self.draft_ids_pinned[:batch_size, 0:1].copy_(torch.cat([f[1] for f in folds], dim = 0))
+        self._note_readbacks(1)
+        batch_ids.copy_(self.draft_ids_pinned[:batch_size, 0:1])
+        cache_seqlens += 1
+        if self.num_draft_tokens > 1:
+            temp_hidden = torch.cat([f[2] for f in folds], dim = 0)
+        self.mtp_update_stats["fold_drafts"] += 1
+        return 1, temp_hidden
 
 
     def _note_readbacks(self, n: int, step: bool = False):

@@ -829,3 +829,314 @@ def test_which_stacks_sample_a_window_at_once():
         assert P.ComboSampler(temperature = 0.7, top_k = 20).window_sampling
     finally:
         C.fused_sampler_enable = old
+
+
+# --------------------------------------------------------------------------------------------
+#   The MTP head's update in one pass (Generator.mtp_batched_update) over a paged head cache
+# --------------------------------------------------------------------------------------------
+
+POISON = 10 ** 6
+POISON_TOKEN = VOCAB + 7    # a draft no toy target ever samples
+
+
+def host(t):
+    return t.as_subclass(torch.Tensor) if isinstance(t, Dev) else t
+
+
+class CacheHead(TOY.ToyHead):
+    """The toy's head, recording the hidden state the target exports at each position of the pages
+    it writes (as the target's K/V cache holds what the last pass at a position wrote)"""
+
+    def forward(self, x, params):
+        logits = super().forward(x, params)
+        table = params["block_table"]
+        seqlens = params["cache_seqlens"]
+        rows, width = params["input_ids"].shape
+        for r in range(rows):
+            for i in range(width):
+                p = int(seqlens[r]) + i
+                self.model.hidden_at[(int(table[r, p // TOY.PAGE]), p % TOY.PAGE)] = float(x[r, i])
+        if self.model.devices:
+            params["export_states"] = [dev(s) for s in params["export_states"]]
+            return dev(logits)
+        return logits
+
+
+class CacheDraft(TOY.ToyDraft):
+    """
+    MTP-like head with a paged cache of its own, in the target's page layout. A pass writes, for
+    each of its positions p, the token at p and the target hidden state it is given (that of p - 1)
+    into the slot of p, then computes each position's output from the slots before it: when every
+    slot it reads (the 16 positions before) holds the job's token at that position and the hidden
+    state the target exported at the position before, the toy drafts the token after its
+    input, as ToyDraft; else the draft is POISON_TOKEN. A slot written by a draft step past the first
+    (draft_step >= 1, the head's own state for hidden) may be read only by such steps, within the
+    draft round that wrote it. Slots of prompt positions (no hidden state recorded before them)
+    are not checked.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.slots = {}
+        self.forwards = 0
+        self.poisoned = 0
+        self.drafts = 0
+
+    def _slot(self, table, r, p):
+        return int(table[r, p // TOY.PAGE]), p % TOY.PAGE
+
+    def _write(self, ids, params, spec):
+        table = params["block_table"]
+        seqlens = params["cache_seqlens"]
+        hidden = host(params["target_hidden"])
+        rows, width = ids.shape
+        for r in range(rows):
+            for i in range(width):
+                p = int(seqlens[r]) + i
+                self.slots[self._slot(table, r, p)] = ("spec" if spec else "true", int(ids[r, i]), float(hidden[r, i].reshape(-1)[0]))
+
+    def _reads_ok(self, table, r, p, spec):
+        for q in range(max(1, p - 16), p):
+            prev = self._slot(table, r, q - 1)
+            if prev not in self.model.hidden_at:
+                continue        # q - 1 in the prompt
+            key = self._slot(table, r, q)
+            slot = self.slots.get(key)
+            if slot is None:
+                return False
+            if slot[0] == "spec":
+                if not spec:
+                    return False
+                continue
+            job, logical = self.model.pages[key[0]]
+            ids = job.sequences[0].sequence_ids.ids
+            q_ = logical * TOY.PAGE + key[1]
+            if q_ >= len(ids) or slot[1] != ids[q_] or slot[2] != self.model.hidden_at[prev]:
+                return False
+        return True
+
+    def forward(self, batch_ids, params):
+        assert params["target_hidden"].shape[:2] == batch_ids.shape
+        self.forwards += 1
+        spec = params.get("draft_step", 0) >= 1
+        self._write(batch_ids, params, spec)
+        table = params["block_table"]
+        seqlens = params["cache_seqlens"]
+        rows, width = batch_ids.shape
+        out = torch.zeros((rows, width, 1))
+        for r in range(rows):
+            for i in range(width):
+                ok = self._reads_ok(table, r, int(seqlens[r]) + i, spec)
+                out[r, i, 0] = float(batch_ids[r, i]) if ok else POISON
+        return dev(out) if self.model.devices else out
+
+    def sample_from_state(self, state, params):
+        state = host(state)
+        poisoned = state.view(-1) >= POISON
+        self.drafts += state.view(-1).shape[0]
+        self.poisoned += int(poisoned.sum())
+        ids = torch.where(poisoned.view(-1, 1), torch.full((state.view(-1).shape[0], 1), POISON_TOKEN),
+                          (state.long().view(-1, 1) + 1) % VOCAB)
+        return dev(ids) if self.model.devices else ids
+
+    def prefill(self, ids, params):
+        self.prefills += 1
+        self._write(ids, params, False)
+
+
+class FoldJob(WinJob):
+    """WinJob whose pages the head cache can find, with the MTP carry a real prompt ingestion
+    leaves (the target's hidden state before the position generation starts from)"""
+
+    def _reset(self, ids):
+        super()._reset(ids)
+        seq = self.sequences[0]
+        for i in range(len(seq.allocated_pages)):
+            self.model.pages[self.first_page + i] = (self, i)
+
+    def prefill(self, results):
+        super().prefill(results)
+        if self.is_prefill_done() and self.mtp_last_hidden is None:
+            seq = self.sequences[0]
+            q = seq.kv_position - 1
+            h = self.model.hidden_at.get((int(seq.block_index_tensor[0, q // TOY.PAGE]), q % TOY.PAGE), 0.0)
+            self.mtp_last_hidden = torch.full((1, 1, 1), h)
+
+
+def run_fold(names, update, verify = False, devices = False, setup = None, **kw):
+    """run() over the paged head cache, with mtp_batched_update set"""
+
+    def setup_(g):
+        g.model.pages = {}
+        g.model.hidden_at = {}
+        g.model.devices = devices
+        head = CacheHead(g.model, g.model.modules[-1].idx, g.model.modules[-1].device)
+        g.model.modules[-1] = head
+        g.model.fwd_modules = [(m, 0, i) for i, m in enumerate(g.model.modules)]
+        g.draft_model = CacheDraft(g.model)
+        g.mtp_batched_update = update
+        g.mtp_update_stats = {"passes": 0, "rows": 0, "folds": 0, "fold_drafts": 0, "fold_misses": 0}
+        if setup is not None:
+            setup(g)
+
+    kw.setdefault("lengths", LENGTHS)
+    kw.setdefault("job_cls", FoldJob)
+    return run(names, verify = verify, setup = setup_, **kw)
+
+
+def head_of(g):
+    return g.draft_model
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("num_draft_tokens", [1, 2, 3])
+@pytest.mark.parametrize("names", ["a", "ab", "abcd"])
+def test_folded_updates_give_the_serial_tokens(names, num_draft_tokens, verify):
+    ref, g0, ref_jobs = run_fold(names, update = False, num_draft_tokens = num_draft_tokens)
+    out, g, jobs = run_fold(names, update = True, verify = verify, num_draft_tokens = num_draft_tokens)
+    assert out == ref
+    # The head's cache held what it had to at every read, in both runs, so the same drafts
+    assert head_of(g0).poisoned == 0 and head_of(g).poisoned == 0
+    assert drafts_of(jobs) == drafts_of(ref_jobs)
+    stats = g.mtp_update_stats
+    assert stats["folds"] > 20 and stats["fold_drafts"] > 20
+    # One head pass a step instead of a draft pass plus an update per job that accepted
+    steps = g.readback_stats["steps"]
+    assert head_of(g).forwards + head_of(g).prefills < head_of(g0).forwards + head_of(g0).prefills
+    assert head_of(g).prefills <= stats["passes"] - stats["fold_drafts"] + 5
+    if num_draft_tokens == 1:
+        assert head_of(g).forwards <= steps + stats["fold_misses"] + 5
+
+
+def test_the_check_on_the_head_cache_sees_a_missing_update(monkeypatch):
+    """The check on the test itself: with no update of the accepted positions the head reads slots
+    that hold rejected positions' tokens, or nothing"""
+    _, g0, _ = run_fold("ab", update = False)
+    assert head_of(g0).poisoned == 0
+    monkeypatch.setattr(GEN.Generator, "_mtp_update_pass", lambda self, *a: None)
+    monkeypatch.setattr(GEN.Generator, "_mtp_fold", lambda self, *a: None)
+    _, g, _ = run_fold("ab", update = True)
+    assert head_of(g).poisoned > 5
+
+
+def test_the_check_on_the_head_cache_sees_a_draft_taken_at_the_wrong_position(monkeypatch):
+    real = GEN.Generator._mtp_fold
+
+    def off_by_one(self, rows, *a):
+        return real(self, [(job, a_, min(n + 1, self.num_draft_tokens + 1)) for job, a_, n in rows], *a)
+
+    monkeypatch.setattr(GEN.Generator, "_mtp_fold", off_by_one)
+    ref, _, _ = run_fold("ab", update = False)
+    out, g, _ = run_fold("ab", update = True)
+    # Exact all the same: drafts only decide what is verified
+    assert out == ref
+    assert head_of(g).poisoned > 5 or g.mtp_update_stats["fold_drafts"] == 0
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("names", ["abc", "abcd"])
+def test_folded_updates_in_a_staggered_decode(names, verify):
+    plain, _, _ = run_fold(names, update = False)
+    ref, g0, ref_jobs = run_fold(names, update = False, stagger = True)
+    out, g, jobs = run_fold(names, update = True, verify = verify, stagger = True)
+    assert out == ref == plain
+    assert head_of(g0).poisoned == 0 and head_of(g).poisoned == 0
+    assert drafts_of(jobs) == drafts_of(ref_jobs)
+    assert g.stagger_stats["steps"] > 20 and g.mtp_update_stats["fold_drafts"] > 20
+
+
+@pytest.mark.parametrize("num_draft_tokens", [1, 2])
+def test_folded_updates_across_requeues_and_checkpoint_cuts(num_draft_tokens):
+    def script(g, jobs, n, add):
+        for j in jobs.values():
+            j.ckpt_every = 7
+
+    kw = dict(num_draft_tokens = num_draft_tokens, rq_at = 11, script = script)
+    ref, g0, ref_jobs = run_fold("abc", update = False, **kw)
+    out, g, jobs = run_fold("abc", update = True, verify = True, **kw)
+    assert out == ref
+    assert head_of(g0).poisoned == 0 and head_of(g).poisoned == 0
+    assert drafts_of(jobs) == drafts_of(ref_jobs)
+    assert all(j.requeues > 2 for j in jobs.values())
+    # A job that requeues is brought up to date by the batched update, not folded
+    stats = g.mtp_update_stats
+    assert stats["rows"] > stats["folds"] > 20
+
+
+def test_a_job_that_joins_without_a_fold_makes_the_head_draft_for_all():
+    def script(g, jobs, n, add):
+        if n == 15:
+            add("c")
+        if n == 30:
+            add("d")
+
+    ref, g0, _ = run_fold("ab", update = False, script = script)
+    out, g, _ = run_fold("ab", update = True, script = script)
+    assert out == ref
+    assert head_of(g).poisoned == 0
+    assert g.mtp_update_stats["fold_misses"] >= 2
+
+
+def test_a_fold_off_the_job_s_pages_is_not_made(monkeypatch):
+    monkeypatch.setattr(GEN.Generator, "_fold_fits", staticmethod(lambda job, last: False))
+    ref, _, _ = run_fold("ab", update = False)
+    out, g, _ = run_fold("ab", update = True)
+    assert out == ref and head_of(g).poisoned == 0
+    assert g.mtp_update_stats["folds"] == 0 and g.mtp_update_stats["rows"] > 10
+
+
+@pytest.mark.parametrize("names", ["a", "abc"])
+def test_readbacks_per_step_with_the_update_folded(names):
+    """With both switches, two readbacks a step whatever the number of jobs: the drafts the fold
+    made, and the step's sampling"""
+    def fold_setup(g):
+        g.model.pages = {}
+        g.model.hidden_at = {}
+        g.model.devices = True
+        head = CacheHead(g.model, g.model.modules[-1].idx, g.model.modules[-1].device)
+        g.model.modules[-1] = head
+        g.model.fwd_modules = [(m, 0, i) for i, m in enumerate(g.model.modules)]
+        g.draft_model = CacheDraft(g.model)
+        g.mtp_batched_update = True
+        g.mtp_update_stats = {"passes": 0, "rows": 0, "folds": 0, "fold_drafts": 0, "fold_misses": 0}
+
+    real = TOY.ToyJob
+    for verify, expect in ((True, 2), (False, None)):
+        TOY.ToyJob = FoldJob
+        try:
+            got, own = _readbacks_with(names, verify, fold_setup)
+        finally:
+            TOY.ToyJob = real
+        assert got == pytest.approx(own)
+        if expect is not None:
+            assert got == pytest.approx(expect)
+        else:
+            # Serial sampling: 1 for the drafts, then one per position
+            assert 1 + len(names) <= got <= 1 + 2 * len(names)
+
+
+def _readbacks_with(names, verify, extra_setup):
+    """readbacks_per_step's measure with a setup of our own and devices off in run()"""
+    counted = {}
+
+    def setup(g):
+        extra_setup(g)
+        real_wait = g._host_wait
+
+        def wait(device):
+            Readbacks.n += 1
+            return real_wait(device)
+
+        g._host_wait = wait
+
+    def script(g, jobs, n, add):
+        if len(jobs) == len(names) and all(1 <= j.new_tokens < 150 for j in jobs.values()):
+            counted.setdefault("t0", (Readbacks.n, dict(g.readback_stats)))
+            counted["t1"] = (Readbacks.n, dict(g.readback_stats))
+
+    Readbacks.n = 0
+    run(names, verify = verify, lengths = {n: 200 for n in names}, script = script, setup = setup, job_cls = FoldJob)
+    (r0, s0), (r1, s1) = counted["t0"], counted["t1"]
+    steps = s1["steps"] - s0["steps"]
+    return (r1 - r0) / steps, (s1["readbacks"] - s0["readbacks"]) / steps
