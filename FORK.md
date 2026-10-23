@@ -1085,6 +1085,157 @@ directory on a real disk (a subdirectory is made there and removed). Upstream's 
 `tests/cache/test_disk_cache.py` needs CUDA (`CPUPageCache` asserts CUDA cache tensors).
 Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
+### Content-addressed multimodal pages (`Generator(mm_content_hash = True)`, `EXL3_MM_CONTENT_HASH=1`)
+
+Off by default; with it off every page hash, persistable flag, disk record and call is upstream's
+(test, and a comparison with master's own files below). For the persistent disk tier and models
+with image input. In the server it would be one more constructor argument, asked for as
+`--recurrent-tail-checkpoint` is (`generator_takes("mm_content_hash")`): the generator is made at
+startup, before any image is embedded, and turning the switch on turns on the embeddings' digests
+for the process.
+
+**The problem.** Placeholder ids of image embeddings come from a process-wide counter
+(`tokenizer/mm_embedding.py`, `MMTokenAllocator`, from 1000000000 up), and a page's hash is
+blake2b over its token ids chained with the previous page's hash. A later process can give the same
+ids to another image, so upstream keeps every page from the first placeholder on out of the disk
+tier (`Sequence.mm_first_page`, `CachePage.persistable`, `DiskPageCache.write_page` counts them in
+`skipped_mm`), and a recurrent checkpoint is written only once its anchor page is on disk (a
+candidate until then, dropped when it leaves RAM). An image conversation then lives in VRAM, the
+RAM tier and the RAM checkpoint cache only (production: 1 GiB, 17 checkpoints, LRU), and once its
+checkpoints are gone the K/V pages left in VRAM are of no use to a recurrent model, which resumes
+only at a checkpoint: the whole prompt again. In production, 18-23 Oct, after 30-70 minutes of other
+traffic: 7 of 13 resumes of image sessions idle for 10 minutes or more re-read at least 16k tokens
+from scratch (99-148k tokens, 132-233 s each), against 0 of 116 text sessions.
+
+**What the switch does.**
+
+- `tokenizer/mm_embedding.py`: an `MMEmbedding` made with digests on gets `content_digest`,
+  computed once in `__init__` (`embedding_digest`: blake2b-128, personalization `exl3-mm-emb`,
+  over the embedding and deepstack tensors' dtype, shape and bytes, the MRoPE grid and merge size
+  and the three alignment fields, each length-prefixed), and its id range is handed out and
+  registered with the digest in one step under a lock (`MMDigestRegistry.allocate`, the
+  process-wide `global_registry`). The registry is append-only (an id keeps its digest for the life
+  of the process: pages holding it outlive the embedding), its ranges increasing and disjoint, so a
+  lookup is a bisection and takes no lock (a range is appended before its start). `set_content_digests`
+  (the generator calls it) or `EXL3_MM_CONTENT_HASH` decide; an embedding keeps what it was made
+  with; one made by the tensor-parallel import has none.
+- `generator/pagetable.py`: `content_hash_checksum`, the one helper every hashing site uses with
+  the switch on (`Sequence.prepare`, `Job.hash_completed_page`, `PageTable.checksum` for
+  `CachePage.update_hash()` and `validate_pagetable`; `tests/test_mm_content_hash.py` reads off
+  the sources that nothing else reaches upstream's hash). A page without placeholders hashes as
+  `tensor_hash_checksum`, the same function on the same bytes. A page whose placeholders all have a
+  digest hashes, under a personalization of its own (`exl3-mm-page`), over a self-delimiting
+  input: (previous hash present, id count, run count), the previous hash, the ids with each
+  placeholder as -1 minus its row in its embedding (a text id is >= 0), then one (count, 16-byte
+  digest) pair per run of placeholders with one digest. The input reads back into the text ids,
+  every placeholder's position, row and digest, and the previous hash, so two different images, or
+  one image at other rows or other positions, never give the same input; two embeddings of one
+  content (an image embedded again in the same process, or in another) give the same one.
+- Persistability: a placeholder without a digest falls back to upstream for its page (upstream's
+  hash) and for the chain after it (`Sequence.prepare` moves `mm_first_page` to the first
+  undigested placeholder's page; before it, every page is persistable). A sequence fixes the way
+  it hashes in `prepare` (`Sequence.content_hash`), from the generator's switch when the job is
+  queued or requeued; a prompt without placeholders takes upstream's function directly.
+- The stored ids. A page file and a RAM-tier entry hold the ids of the process that stored the
+  page, which with the switch on can stand for another image in this one. A page restored from a
+  tier (`PageTable.allocate_pages`, `own_ids`) therefore takes the claiming sequence's own ids,
+  which hash to the page's hash here, instead of the stored ones; with the switch off the stored
+  ones, as upstream. `validate_pagetable` compares a job's ids with its pages' by content
+  (`same_content`): a page claimed by hash can hold another embedding's ids of the same content.
+
+What else reads ids, checked: the forward passes read the pass's own ids against the job's own
+embeddings (`modules/embedding.py`: row = id - `first_index`, the row the canonical form names;
+`modules/ple.py` maps placeholders to `mm_token_id` before they enter its history, which is in the
+recurrent state, so a checkpoint holds no placeholder id; `block_sparse_mlp_routing.py`,
+`architecture/gemma4.py`, `deepseek_v4.py`, `util/rope.py` and `Job.mm_exact_spans` the same), and
+restored K/V is never recomputed. Defrag moves pages by their links and never hashes or reads
+`page.sequence` (the rehash at `PageTable` "Check individual hashes" is `validate_pagetable`'s,
+a debugging aid the library does not call). The partial-page match of models without recurrent
+state (`Job._prefill_co`, `count_match_tensor`) compares raw ids, now always this process's: an
+embedding of the same content with other ids gives a shorter match, never a wrong one. Requeue
+rebuilds the sequences and hashes them again in the generator's mode. `CPUPageCache.store` and
+the disk tier's page record take `page.sequence` as they are: unchanged.
+
+**The disk format and the fingerprint are unchanged**, so the first boot with the switch opens
+the same fingerprint directory and keeps what is there. The stored tokens are only ever copied
+back into a page, which the restore now does with the claimer's ids, and their checksum is over
+the stored bytes. A process with the switch off (stock 1.6.3 included, which shares the
+fingerprint) never computes a content hash: it never finds a content-hashed page, nor a text page
+chained after one (the chain differs), and its own image pages are kept off the disk as before.
+What the fingerprint covers (`cache_fingerprint`): the library's `__version__` (the fork says
+1.6.3 too), `DISK_CACHE_FORMAT_VERSION`, the page size, the page image layout, and per cache the
+model's `config.json` dict and every `*.safetensors` file's name, size, header and seven 64 KiB
+samples, the cache layers and their bit widths, the recurrent layers and their state dtype. Not
+torch, the compiled extension, the GPU, the image preprocessing (`preprocessor_config.json`,
+Pillow) or numerics switches. A vision tower's weights are in the model's safetensors (the server's
+BF16 tower swap changes the fingerprint); the embedding digest does not rely on that.
+
+**Why a digest of the embedding, not of the image.** It is what a forward reads, whatever the
+architecture: equal digests feed the model equal values, and a change anywhere upstream of the
+embedding (tower weights, preprocessing, a library or Pillow version, kernels) changes the digest.
+The other way errs on the safe side: a vision tower that does not compute the same bytes twice for
+one image gives two digests, a cache miss as today, never a page reused for other values. A digest
+of the pixels and of the preprocessing outcome is cheaper but would have to be proven to
+determine the embedding (tower weights, numerics, every preprocessing input), per architecture,
+and a non-deterministic tower would then reuse K/V computed from other embedding values. Within
+one process the server keeps an image's embedding in an LRU keyed by the image bytes, so the same
+object (and digest) comes back; recomputed after the LRU let it go, or after a restart, the digest
+matches only if the tower is deterministic, not checked on the cards.
+
+**Cost, measured on the development machine** (Ryzen AI 9 365 in powersave, Python 3.14, CPU torch;
+not the workstation, whose Python 3.12 has another blake2b implementation; 2026-10-23):
+
+- per image, once, on the thread that makes the embedding (the server's vision thread; hashlib
+  releases the interpreter for the whole pass): `MMEmbedding` of 9000 rows of 2048 fp16 values
+  (36.9 MB) 128.9 ms against 0.3 ms without, 4096 values (73.7 MB) 257.8 ms, i.e. blake2b at 0.29
+  GB/s (OpenSSL's blake2b is 0.67 GB/s and sha256 0.97 GB/s on the same core: a faster hash is the
+  lever if this matters). A deepstack tensor is hashed too, after a device-to-host copy;
+- per page with placeholders 40 us against 10 us; `Sequence.prepare` of a 150k-token prompt with a
+  9k-token image (36 such pages) 11.0 ms against 7.6-7.9 ms; a prompt without placeholders the same
+  as upstream; a page completed during generation 13 us against 10 us;
+- memory: about 100 bytes per embedding ever made, for the life of the process;
+- disk: an image conversation's pages and checkpoints are now written like a text one's, about
+  4.45 MB per page and 57 MiB per checkpoint kept (every 4096 tokens, `disk_cache_checkpoint_interval`);
+  that week had 13 resumes of image sessions after 10 minutes idle or more, next to 116 of text
+  ones. What it buys there: a resume of 99-148k tokens from disk (390-580 page files, about 1.7-2.6
+  GB, plus a checkpoint) instead of 132-233 s of prefill, also after a restart; not measured.
+
+**Not carried over: the server's tracker.** `exllamav3-openai-server`'s cache tracker extends a
+finished job's chain with `tensor_hash_checksum` from the library (`openai/cache_tracker.py`,
+`chain_hashes`). With the switch on that differs for a page completed during generation that holds
+placeholders (the prompt's last, partial page when an image ends there, the usual layout for an
+image followed by a short question): the session's chain then differs from the page table's from
+that page on, with wrong labels on `/status` and in the cache log, and a branch the pruner cannot
+find (left to the LRU, as without the pruner). Taking
+`content_hash_checksum` when the generator's `mm_content_hash` is on (it equals upstream's hash
+for every text page) is the server's change.
+
+Verified (no GPU, no extension): `tests/test_mm_content_hash.py`, 16 tests, over the real page
+table, `Job`'s hashing and `prepare_for_queue`, the CPU tier set up over host memory, upstream's
+`DiskPageCache` (writer thread, readers, index) and the checkpoint cache, with a second process
+stood for by a fresh allocator and registry: the same image in two processes hashes the same,
+different images on the same ids and one image at other rows or positions differently; an image
+whose last rows are on the prompt's partial page, an answer generated past it (the completed
+page's hash), all of it persisted, then found by the second process with other ids (`has`,
+`allocate_pages` resuming past the image, pages restored with the second process's ids, the
+checkpoint read back), defrag after that and `validate_pagetable`; one process re-embedding the
+image; an embedding without a digest; the digest's coverage; the registry; the switch; with it off,
+upstream's hashes against an independent copy, `skipped_mm`, the dropped candidate and the stored
+ids restored. The eight tests of the new behaviour fail with the switch off. Also, once, outside
+the suite: 200 random prompts of text and images, with the switch off, give the same page hashes,
+`mm_first_page`, persistable flags and completed-page hash on this branch as with master's own
+`pagetable.py` and `job.py`. Fork suite 309 -> 325 passed; upstream's `tests/generator` with a
+stand-in for the extension the same test by test (34 passed, 20 failed, 187 skipped); the server's
+suite on this branch (harness from `mm-content-hash`) 818 passed / 4 skipped with the stubbed
+extension and 820 / 2 with the real worker sources, as on `flash-next-1.6.3`.
+
+Not run on the cards. The checks to make first there: the same image embedded in two processes
+gives the same `content_digest` (the tower's determinism, which decides whether image
+conversations survive a restart and an LRU eviction of their embedding); with the switch on,
+`skipped_mm` stays at 0 and an image conversation's `state_writes` move; an image session resumed
+after its RAM checkpoints are gone, and after a restart, reads its pages from disk (`alloc_disk_pages`)
+instead of ingesting the prompt again; the digest's time on the workstation's Python.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
