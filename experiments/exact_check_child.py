@@ -945,7 +945,8 @@ class Child:
                          "tail": getattr(gen, "tail_checkpoint_interval", 0), "chunk": gen.max_chunk_size,
                          "stagger_min_jobs": getattr(gen, "stagger_min_jobs", None)}
         state = {}
-        for name in ("stagger_decode", "prefill_thread", "prefill_pipeline", "tail_checkpoint_interval"):
+        for name in ("stagger_decode", "prefill_thread", "prefill_pipeline", "tail_checkpoint_interval",
+                     "mtp_batched_verify", "mtp_batched_update"):
             if hasattr(gen, name):
                 state[name] = getattr(gen, name)
         if hasattr(self.bsm, "hist_prefill_weight"):

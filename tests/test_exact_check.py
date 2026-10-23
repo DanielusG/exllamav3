@@ -1036,6 +1036,8 @@ def test_a_switch_left_on_does_not_pass_for_off():
     assert EC.switch_is_off("hist_prefill_weight", 1.0) and not EC.switch_is_off("hist_prefill_weight", 0.004)
     assert EC.switch_is_off("tail_checkpoint_interval", 0) and not EC.switch_is_off("tail_checkpoint_interval", 256)
     assert not EC.switch_is_off("tail_checkpoint_interval", True) and EC.switch_is_off("disk_uncache", None)
+    for name in ("mtp_batched_verify", "mtp_batched_update"):
+        assert EC.switch_is_off(name, False) and not EC.switch_is_off(name, True)
 
 
 # --------------------------------------------------------------------------------------------

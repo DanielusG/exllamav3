@@ -105,6 +105,7 @@ SIDE_MAX_ROWS = 8
 FORK_ENV_SWITCHES = (
     "EXL3_STAGGER_DECODE", "EXL3_PREFILL_THREAD", "EXL3_PREFILL_PIPELINE", "EXL3_TAIL_CHECKPOINT",
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
+    "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE",
 )
 
 PROMPTS = [
@@ -1580,6 +1581,7 @@ def evaluate_all(plan: dict, res: Results) -> list:
 SWITCHES_OFF = {
     "stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False,
     "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0, "disk_uncache": False,
+    "mtp_batched_verify": False, "mtp_batched_update": False,
 }
 
 
