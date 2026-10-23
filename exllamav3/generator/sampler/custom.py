@@ -1311,12 +1311,20 @@ class CustomSampler(Sampler):
         window_sampling.
         """
         assert self.window_sampling, "Sampler stack cannot sample a window in one call"
+        # A dense mask per row must be as wide as the logits for the fused path (one row for all
+        # may be of any width): cropped past the vocabulary, padded with -inf below it, which is
+        # what the scan bound does for a single row
+        dim = logits.shape[-1]
+        if logit_mask is not None and logit_mask.dtype != torch.int32 and logit_mask.shape[-1] != dim:
+            if logit_mask.shape[-1] > dim:
+                logit_mask = logit_mask[:, :dim].contiguous()
+            else:
+                logit_mask = F.pad(logit_mask, (0, dim - logit_mask.shape[-1]), value = float("-inf"))
         if past_ids is None or not self.window_past_ids:
             return self.forward(logits, None, rand_u32, tokenizer, logit_mask = logit_mask)
 
         head, tail = self.window_head
         out_shape = logits.shape[:-1]
-        dim = logits.shape[-1]
         rows = logits.numel() // dim
         assert len(past_ids) == rows, "One set of past IDs per position"
 

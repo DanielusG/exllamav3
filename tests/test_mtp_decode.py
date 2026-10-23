@@ -792,6 +792,19 @@ def test_forward_window_greedy_is_each_row_alone(pres_p, masked):
     assert got == _per_row(sampler, logits, use_past, 99, mask)
 
 
+@pytest.mark.parametrize("width", [V + 32, V - 32])
+def test_forward_window_takes_a_dense_mask_of_another_width(width):
+    """A mask wider than the logits is cropped, a narrower one padded with -inf: what a single
+    row's mask of that width gives"""
+    torch.manual_seed(2)
+    sampler = PRESETS.ComboSampler(temperature = 0.0)
+    logits = torch.randn((1, 3, V)).half()
+    mask = torch.zeros((3, width), dtype = torch.half)
+    mask[:, :10] = float("-inf")
+    got = sampler.forward_window(logits.clone(), None, 3, _tok(), logit_mask = mask).view(-1).tolist()
+    assert got == _per_row(sampler, logits, None, 3, mask)
+
+
 @pytest.mark.parametrize("pres_p", [0.0, 1.5])
 def test_forward_window_sampling_first_row_is_the_serial_draw(pres_p):
     torch.manual_seed(1)
