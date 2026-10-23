@@ -89,7 +89,6 @@ def _load_stubbed():
     stub("generator.pagetable", PageTable = _Any, is_content_hash = lambda h: h[:8] != bytes(8))
     stub("generator.cpu_cache", CPUPageCache = _Any)
     stub("generator.disk_cache", DiskPageCache = _Any)
-    stub("generator.draft_confidence", DraftConfidenceCalibrator = _Any)
     stub("generator.job", Job = _Any)
     stub("generator.filter", Filter = _Any)
     stub("generator.sampler", Sampler = _Any)
@@ -98,6 +97,8 @@ def _load_stubbed():
     rc_mod = real("cache.recurrent")
     fc_mod = real("model.forward_cursor")
     real("util.lane")
+    real("generator.draft_confidence")
+    real("generator.draft_window")
     gen_mod = real("generator.generator")
     return gen_mod, fc_mod, ru_mod, rc_mod
 
