@@ -856,8 +856,25 @@ class Child:
         rec = {"op": "load", "id": "load", "ok": True, "seconds": time.time() - t0, "placement": self.placement(),
                "split_modules": len(self._split_modules()), "free": self._free(), "vocab": self.vocab,
                "max_batch_size": container.max_batch_size, "draft": container.draft_model is not None,
-               "sweeps": self.spec.get("sweeps", "frozen")}
+               "sweeps": self.spec.get("sweeps", "frozen"), "qsa_raw_tail": self.qsa_raw_tail()}
         self.write(rec)
+
+    def qsa_raw_tail(self) -> dict:
+        """The QSA raw-key ring of the caches as loaded (Cache.qsa_raw_tail, cache/qsa.py; None on a
+        library without it) and the VRAM it saves per card, bytes"""
+        c = self.container
+        out = {"main": getattr(c.cache, "qsa_raw_tail", None), "draft": getattr(c.draft_cache, "qsa_raw_tail", None),
+               "layers": 0, "saved": {}}
+        for cache in (c.cache, c.draft_cache):
+            for layer in (getattr(cache, "layers", None) or {}).values():
+                saved = getattr(layer, "raw_tail_saved_bytes", None)
+                raw = getattr(layer, "raw_k", None)
+                if saved is None or raw is None or not saved():
+                    continue
+                d = raw.device.index
+                out["saved"][d] = out["saved"].get(d, 0) + int(saved())
+                out["layers"] += 1
+        return out
 
     def _split_modules(self):
         ip = getattr(getattr(self.model, "config", None), "infer_params", None)
@@ -950,6 +967,8 @@ class Child:
                 state[name] = getattr(gen, name)
         if hasattr(self.bsm, "hist_prefill_weight"):
             state["hist_prefill_weight"] = self.bsm.hist_prefill_weight()
+        if hasattr(c.cache, "qsa_raw_tail"):
+            state["qsa_raw_tail"] = c.cache.qsa_raw_tail
         if gen.disk_page_cache is not None:
             state["disk_uncache"] = getattr(gen.disk_page_cache, "uncache", None)
         return {"op": "generator", "id": step["id"], "scenario": step.get("scenario"), "ok": True,
