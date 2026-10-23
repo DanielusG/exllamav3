@@ -1,12 +1,17 @@
 # Fork notes
 
-Personal fork of ExLlamaV3 for one machine: Qwen3.8-Flash-Next (MoE, CPU expert split) on two
-RTX 5060 Ti in layer split, served by `exllamav3-openai-server`. Branch `flash-next-1.6.3`, based
-on upstream **v1.6.3**: the commits of `flash-next-1.6.2` (based on v1.6.2) picked in order onto
-v1.6.3, then what 1.6.3 asked of them ("The move to 1.6.3", below). The tuning of the earliest
-fork branches (`flash-next` and `flash-next-placement`, on v1.5.4) was ported onto
-`flash-next-1.6.2` one feature at a time. Every feature stays behind a switch of its own, off by
-default: with every switch off this branch behaves as upstream v1.6.3.
+Personal fork of ExLlamaV3 for one machine: Qwen3.8-Flash-Next (MoE, CPU expert split) on two RTX
+5060 Ti in layer split, served by `exllamav3-openai-server`. Branch `flash-next-1.6.3`, based on
+upstream **v1.6.3**: the commits of `flash-next-1.6.2` (based on v1.6.2) picked in order onto
+v1.6.3, then what 1.6.3 asked of them ("The move to 1.6.3", below). It has run in production under
+`exllamav3-openai-server` since 2026-10-18 13:16, and on 2026-10-23 it was merged into this fork's
+`master`, which until then mirrored upstream and is now the fork's official line: upstream is
+followed through its release tags. The tuning of the earliest fork branches (`flash-next` and
+`flash-next-placement`, on v1.5.4) was ported onto `flash-next-1.6.2` one feature at a time. Every
+feature stays behind a switch of its own, off by default: with every switch off this branch
+behaves as upstream v1.6.3, but for the fixes of upstream's own code, which have no switch and
+change nothing in a run that does not reach what they fix (one so far: "A page a prompt chunk has
+written is not handed back", below).
 
 Everything on this branch is Python. The checkout is used without building anything: put it
 ahead of the installed package on `PYTHONPATH` (the server's wrapper does
@@ -80,8 +85,10 @@ Tests, on the development machine without a GPU (2026-10-18): the fork's own
 `flash-next-1.6.2`, 309 here (three tests added); upstream's tests marked `nogpu`, with a
 stand-in for the compiled extension, come out the same test by test here as on stock v1.6.3
 (430 tests: 230 pass, 43 skip, 157 fail on both, those that need the extension's kernels).
-Nothing of 1.6.3 has run on the cards yet, stock or fork: every measure below was made on 1.5.4
-or 1.6.2, and the exact check is the first thing to run.
+This branch has run in production since 2026-10-18 13:16 (the server's switch to the 1.6.3 wheel,
+with production's flags, which turn every switch of this branch on), without the exact check on
+1.6.3 before it. Every measure below was made on 1.5.4 or 1.6.2, and where a section says a
+feature has not yet run on this base, that is about its measures and checks.
 
 ## What differs from upstream
 
@@ -91,6 +98,106 @@ or 1.6.2, and the exact check is the first thing to run.
 `cache_keepalive.yml` (the keepalive of that build's compiler cache, new in 1.6.x). Nothing here
 is released as a wheel, and a push that carries a workflow file needs a token with the
 `workflow` scope.
+
+### A page a prompt chunk has written is not handed back (a fix: no switch)
+
+A fix of upstream's prompt ingestion (`Job._prefill_co`), found on 2026-10-23 by reading and
+reproduced on the CPU with the real page table; the page table it guards (`generator/pagetable.py`)
+is upstream's, unchanged. In force with every switch off.
+
+**What upstream does.** A job's pages for generation and its prompt's tail (the last page, partial;
+with the MTP head also the last full page when the prompt's length less one is a multiple of a
+page: the page the head leaves out of the cached prefix) are unique pages.
+`PageTable.allocate_pages` takes them from the unreferenced pages in eviction order
+(`CachePage.add_ref_unique`: empty pages, then cached sequences from their tail), often complete
+pages of other conversations. It keeps what such a page was (`CachePage.backup`: its hash, the hash
+before it, its position, its access serial; `can_revert` set) and gives that back when the page's
+last reference goes while `can_revert` is still set (`sub_ref`, `revert`): a page the job never
+wrote stays the other conversation's, which can reuse it by its hash. The decode step gives the
+backup up when it stages its tokens, before its pass (`Job.get_input_ids_list(add_to_cache =
+True)`). A prompt chunk gave it up in its record, after its passes, with the pages' positions and
+tokens; the record of a chunk that ends on a page boundary also gives up the page after it, which
+it links to the chain.
+
+**The hazard.** A chunk released after its passes were issued and without its record: the release
+gives the other conversation's identity back to a page whose K/V (the target's, and the draft
+cache's, which has the same page indices: the MTP head's update writes the chunk there too) is now
+this job's, wholly or in part, at a full page's position. Nothing fails. The other conversation's
+next turn finds the page by its hash in VRAM, ahead of the good copy the CPU tier took when the
+page was evicted, and reuses it; once neither tier holds the good copy, the page's next eviction
+pushes the bad one to the CPU tier, and the disk tier can write it and read it back after a
+restart. It takes two things:
+
+- a release between a chunk's issue and its record. Upstream: a pass that fails (CUDA out of
+  memory, the host-memory guard, any kernel error), contained by `Generator.reap_failed_job`. This
+  fork adds the cancel of a job whose chunk is under way on the prefill thread or in the pipeline
+  (`Generator.cancel`: `_side_drop` and `_pipe_drop` let the chunk run to the end of what it is in,
+  record nothing, and the pages go; `clear_queue` the same) and the failures there
+  (`_side_collect`, `_pipe_fail`);
+- a chunk that writes a page whose backup is still set: the chunk that writes the prompt's tail
+  page (or the full page the MTP head leaves out), unless it starts on that page and is not the
+  job's first, when the record of the chunk before it has given the backup up. On production's
+  setup (recurrent states, the MTP head, chunks of 4096 and the prompt's last page as a pass of its
+  own): the last-page pass when it is the job's first chunk (a prompt that ends less than a page
+  past the checkpoint it resumes from: the same prompt again, or a turn that adds little past the
+  previous answer's tail checkpoint, as a short tool result does), a prompt shorter than a page,
+  and the last chunk of a prompt whose length less one is a multiple of a page. Without recurrent
+  states, the last chunk of the prompt, unless it starts on the tail page.
+
+**The fix.** `Job.forget_revert(seq, start, end)` gives up the backup of the pages at positions
+start to end. `Job._prefill_co` calls it for the positions the chunk's passes write (after a
+partial-page copy, with an atomic multimodal prefill's extension) right before it yields the
+passes: on the generator's thread, before any of them can be issued, whoever issues them
+(`Job.prefill` inline, the prefill thread, the pipeline's halves, any other driver of the
+coroutine). The record gives up what it gave up before. What still goes back: the pages of a job
+released before it planned a chunk (allocated, waiting for its turn), and the pages past what its
+chunks and decode steps reached (the pages for generation of a job let go early).
+
+**Successful runs are the same, bit for bit.** `can_revert` is read in one place, when a page's
+last reference goes (`sub_ref`). Every page a chunk's plan gives up is given up by that chunk's
+record too (the pages of an atomic multimodal extension past the chunk's end by the next chunk's
+record, which feeds them again), and between the two the page is held by this job alone: a unique
+page has a random hash no other job can claim, and a page shared by hash has no backup to give up.
+Its last reference goes only with this job's release, at the job's end, at a requeue, or by a
+cancel or a failure, and the first two come after every chunk is recorded. So where no failure or
+cancel falls between a chunk's plan and its record, every page goes back, or does not, exactly as
+before: the same page table, the same pages reused, evicted and pushed to the tiers, by the same
+jobs, and the same passes. In one case pages that no pass wrote lose their way back: a chunk
+planned in the pipeline but not yet handed to its threads (one too short to run beside the decode
+waits for the chunks before it) when its job is cancelled. Its pages go as empty pages; the old
+conversation gets them back from the CPU tier, which took them when they were evicted, or prefills
+them again.
+
+**Left as upstream** (read, not changed):
+
+- the draft step writes the draft cache at the positions it drafts before the decode step stages
+  them, in the same `iterate()` call; only an exception can come between the two, and it fails the
+  iteration (upstream's `AsyncGenerator` keeps the error for every job after it, the server's
+  worker reports itself poisoned and aborts the disk tier);
+- a DFlash drafter writes its whole block into the draft cache, past the window the verification
+  stages when the confidence cut shortens it, so at the job's end the page past its last position
+  can go back with those slots of the draft cache written. The draft cache only (the tokens are the
+  target's) and DFlash only; not used here.
+
+Tests: `tests/test_page_revert.py` (no GPU, no extension): the real page table, the real `Job` and
+the generator's real rounds (inline, on the prefill thread, in the pipeline) over a stand-in model
+that writes every token into a stand-in K/V cache, at its page and slot, and can fail or wait
+part-way through a pass. A conversation leaves two complete pages; another job takes the second as
+its tail page and its only chunk writes into it; the chunk fails (inline, on the thread, in the
+pipeline's first or second half) or the job is cancelled with the chunk under way (on the thread,
+in the pipeline): the page is no longer under the first conversation's hash, and that
+conversation's next turn reuses only its own pages. Those six fail without the fix: the page goes
+back under the hash, and the next turn reuses both pages, the second with 100 slots of the other
+job's K/V. What stays, with and without the fix: a job cancelled while it waits for its first chunk
+gives its page back whole; a page for generation that no pass wrote goes back at the job's release;
+the decode step gives the backup up as it stages its pass; and turns of three conversations with
+every chunk recorded leave the same page table (hashes, positions, references, access serials,
+`can_revert`) and the same K/V after every step as with the backup given up at the record only,
+inline, on the thread and in the pipeline (the run has pages given up at the plan and pages that
+went back whole). Marked `nogpu`; run with `--noconftest` without the compiled extension. The
+fork's own tests: 321 passed (309 before); upstream's `tests/generator`, with a stand-in for the
+extension, the same test by test as before (34 pass; the rest need the extension's kernels or a
+GPU).
 
 ### Staggered decode (`Generator(stagger_decode = True)`, `EXL3_STAGGER_DECODE=1`)
 
