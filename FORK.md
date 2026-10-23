@@ -1278,7 +1278,7 @@ draft taken at the wrong position; readbacks and head passes counted. Marked `no
 ### The MTP draft window chosen from a measured cost curve (`Generator(draft_window = "cost")`, `EXL3_DRAFT_WINDOW=cost`)
 
 Off by default (`"fixed"`); with it off the generator behaves as upstream. For the MTP head. In the
-server: `--draft-window cost` (its `AGENTS.md`, the rule after 30). Written on this base
+server: `--draft-window cost` (rule 31 of its `AGENTS.md`). Written on this base
 (2026-10-23), on top of the two switches above; not run on the cards.
 
 **What upstream does.** Every decode step verifies `num_draft_tokens` drafts per job. The
@@ -1416,7 +1416,7 @@ Off by default; with it off the cache layers, the kernels and the decode graph a
 the QSA attention layers of Qwen3.8-Flash-Next (12 of its 48 layers, and the MTP head's). The switch
 is the cache's, read when the `Cache` is made, so before the model loads: `Cache(qsa_raw_tail = True)`
 (or a ring size in tokens), else `EXL3_QSA_RAW_TAIL=1` in the environment. In the server:
-`--qsa-compact-raw-keys` (rule 30 of its `AGENTS.md`), passed to both caches only by a library whose
+`--qsa-compact-raw-keys` (rule 32 of its `AGENTS.md`), passed to both caches only by a library whose
 `Cache` takes the argument. Also in `doc/env_vars.md`.
 
 **What upstream keeps.** `cache/qsa.py`, `QSAPlanes`: per page and QSA layer a raw indexer key for
