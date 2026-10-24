@@ -6,7 +6,10 @@ upstream **v1.6.3**: the commits of `flash-next-1.6.2` (based on v1.6.2) picked 
 v1.6.3, then what 1.6.3 asked of them ("The move to 1.6.3", below). It has run in production under
 `exllamav3-openai-server` since 2026-10-18 13:16, and on 2026-10-23 it was merged into this fork's
 `master`, which until then mirrored upstream and is now the fork's official line: upstream is
-followed through its release tags. The tuning of the earliest fork branches (`flash-next` and
+followed through its release tags. On 2026-10-24 the fix of "A page a prompt chunk has written is
+not handed back" and "Content-addressed multimodal pages" (branches `fix-page-revert` and
+`mm-content-hash`, run in production together as `prova-oom-mm` from 10:51 that day) were merged
+into it. The tuning of the earliest fork branches (`flash-next` and
 `flash-next-placement`, on v1.5.4) was ported onto `flash-next-1.6.2` one feature at a time. Every
 feature stays behind a switch of its own, off by default: with every switch off this branch
 behaves as upstream v1.6.3, but for the fixes of upstream's own code, which have no switch and
@@ -198,6 +201,12 @@ went back whole). Marked `nogpu`; run with `--noconftest` without the compiled e
 fork's own tests: 321 passed (309 before); upstream's `tests/generator`, with a stand-in for the
 extension, the same test by test as before (34 pass; the rest need the extension's kernels or a
 GPU).
+
+In production since 2026-10-24 10:51 (branch `prova-oom-mm`, merged into `master` that day), with
+the server's retry of a request after a VRAM OOM: the server's test fault (`EXL3SRV_INJECT_OOM=1`,
+the first chunk of a request fails where it is planned, before any pass) failed a request, which
+was made again and completed. A real chunk failing or cancelled after its plan has not been seen
+with the fix yet.
 
 ### Staggered decode (`Generator(stagger_decode = True)`, `EXL3_STAGGER_DECODE=1`)
 
@@ -1287,7 +1296,7 @@ determine the embedding (tower weights, numerics, every preprocessing input), pe
 and a non-deterministic tower would then reuse K/V computed from other embedding values. Within
 one process the server keeps an image's embedding in an LRU keyed by the image bytes, so the same
 object (and digest) comes back; recomputed after the LRU let it go, or after a restart, the digest
-matches only if the tower is deterministic, not checked on the cards.
+matches only if the tower is deterministic: so it was for one small image on the cards (below).
 
 **Cost, measured on the development machine** (Ryzen AI 9 365 in powersave, Python 3.14, CPU torch;
 not the workstation, whose Python 3.12 has another blake2b implementation; 2026-10-23):
@@ -1336,12 +1345,15 @@ stand-in for the extension the same test by test (34 passed, 20 failed, 187 skip
 suite on this branch (harness from `mm-content-hash`) 818 passed / 4 skipped with the stubbed
 extension and 820 / 2 with the real worker sources, as on `flash-next-1.6.3`.
 
-Not run on the cards. The checks to make first there: the same image embedded in two processes
-gives the same `content_digest` (the tower's determinism, which decides whether image
-conversations survive a restart and an LRU eviction of their embedding); with the switch on,
-`skipped_mm` stays at 0 and an image conversation's `state_writes` move; an image session resumed
-after its RAM checkpoints are gone, and after a restart, reads its pages from disk (`alloc_disk_pages`)
-instead of ingesting the prompt again; the digest's time on the workstation's Python.
+On the cards (2026-10-24, production with the server's `--mm-content-hash`, branch `prova-oom-mm`):
+a conversation with one 64-token image (7265 tokens, the image in its last pages) had all its 29
+complete pages on the disk tier and `skipped_mm` stayed at 0; after a restart the same image got
+the same `content_digest` in the new process (`cb5914e3df840c3e`, the server's IMG line), and the
+conversation's next turn read its 29 pages and their checkpoint from disk (7424 tokens cached, 309
+ingested). Not seen yet: the digest of a large photo (thousands of image tokens) in two processes,
+an image session resumed from disk after its RAM checkpoints went in the same process, the
+digest's own time on the workstation's Python (the server's IMG line times decode, forward and
+digest together: 520-569 ms for the 64-token image).
 
 ## The overnight exact check (`experiments/exact_check.py`)
 
