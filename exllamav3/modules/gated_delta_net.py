@@ -29,6 +29,10 @@ _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" el
 _gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
 # Prefill conv reads the projection output in place (token-major) instead of a transposed bf16 copy
 _conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import: the fused decode path records a speculative pass's shape for the rewind without
+# taking the staging views it does not use (GDNLayerState.staged_shape)
+_host_fastpath = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -385,6 +389,15 @@ class GDNLayerState:
             self.spec_beta[:n].view(bsz, seqlen, -1),
             self.spec_g[:n].view(bsz, seqlen, -1),
         )
+
+
+    def staged_shape(self, bsz: int, seqlen: int):
+        """Host fast path: what staged_views records of a speculative pass (its shape, for the
+        rewind) and its check, without the three views, for a caller that discards them (the
+        fused decode path, which takes 1 <= bsz and 1 <= seqlen only)"""
+        assert seqlen <= self.max_history + 1 and bsz <= self.max_batch_size, \
+            f"speculative pass of {seqlen} tokens x {bsz} rows exceeds the cache's max_history {self.max_history} / max_batch_size {self.max_batch_size}"
+        self.spec_shape = (bsz, seqlen, 1)
 
 
     def staged_step_views(self, bsz: int, step: int):
@@ -1320,7 +1333,10 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history, rsl)
             if save_history:
-                stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
+                if _host_fastpath and spec_step is None and type(rsl) is GDNLayerState:
+                    rsl.staged_shape(bsz, seqlen)
+                else:
+                    stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan, save_history, slots_scan_in)
             if self.tp_reduce:

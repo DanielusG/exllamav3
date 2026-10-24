@@ -876,3 +876,68 @@ def test_the_kept_routed_sum_views_are_the_plain_ones():
     m.experts_cfg.out_bszn = torch.zeros((8, 64))
     v2 = m._fast_out_bszn(1, (1, 1, 64))
     assert v2.data_ptr() == m.experts_cfg.out_bszn.data_ptr()
+
+
+# --------------------------------------------------------------------------------------------
+#   The fused GDN decode path's record of a speculative pass
+# --------------------------------------------------------------------------------------------
+
+def _gdn_source():
+    return open(os.path.join(REPO, "exllamav3", "modules", "gated_delta_net.py")).read()
+
+
+def _method(src: str, cls: str, name: str):
+    import ast
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == name:
+                    ns = {}
+                    exec(compile(ast.Module([item], []), f"<{cls}.{name}>", "exec"), ns)
+                    return ns[name]
+    raise AssertionError(f"{cls}.{name} not found")
+
+
+def test_the_fused_gdn_path_records_the_pass_as_staged_views_does():
+    """The fused decode path (self.bc.run_bszN) calls staged_views only for the record of the
+    pass shape and drops the three views; with the switch it calls staged_shape, which must
+    record the same shape after the same check, for every shape staged_views takes or refuses."""
+    src = _gdn_source()
+    views = _method(src, "GDNLayerState", "staged_views")
+    shape = _method(src, "GDNLayerState", "staged_shape")
+
+    class State:
+        def __init__(self, max_history, max_batch_size):
+            self.max_history, self.max_batch_size = max_history, max_batch_size
+            rows = max_batch_size * (max_history + 1)
+            self.spec_conv = torch.zeros((rows, 6))
+            self.spec_beta = torch.zeros((rows, 2))
+            self.spec_g = torch.zeros((rows, 2))
+            self.spec_shape = None
+
+    # (the fused path takes 1 <= bsz and 1 <= seqlen only: a view of 0 rows is refused by torch)
+    for mh, mb in ((0, 1), (1, 4), (3, 6)):
+        for bsz in range(1, mb + 2):
+            for seqlen in range(1, mh + 3):
+                a, b = State(mh, mb), State(mh, mb)
+                ea = eb = None
+                try:
+                    views(a, bsz, seqlen)
+                except AssertionError as e:
+                    ea = str(e)
+                try:
+                    shape(b, bsz, seqlen)
+                except AssertionError as e:
+                    eb = str(e)
+                assert ea == eb and a.spec_shape == b.spec_shape, (mh, mb, bsz, seqlen)
+    # The call site: only the fused path, only without a token-by-token step (staged_step_views
+    # records those), only for the state class that has it; the torch path keeps its views
+    assert '''            if save_history:
+                if _host_fastpath and spec_step is None and type(rsl) is GDNLayerState:
+                    rsl.staged_shape(bsz, seqlen)
+                else:
+                    stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
+            y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
+            self.bc.run_bszN(''' in src
+    assert src.count("rsl.staged_shape(") == 1
+    assert '_host_fastpath = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")' in src
