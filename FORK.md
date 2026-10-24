@@ -1168,9 +1168,42 @@ the switch (the draft step's two blocking copies and one for the sampling); with
 token), so its serial count is higher. Not measured on the cards: what a readback costs there, and
 whether the cards' idle time in the sampling phase goes.
 
-Not checked beyond reading: an `LLGuidanceFilter` (the tests use a filter with the same interface),
-a hybrid round's window, a TP model, the compiled `fused_sampler` with per-row masks over a window
-(its per-row form is upstream's, used for one row and for batches without drafts).
+Not checked beyond reading: a hybrid round's window, a TP model. An `LLGuidanceFilter` is checked on
+CPU only, with a byte-level tokenizer of the test's own (`tests/test_window_sampling.py`, below; the
+production tokenizer and grammar not). The compiled `fused_sampler` over a window, with and without
+per-row masks (its per-row form is upstream's, used for one row and for batches without drafts), has
+a GPU test in the same file, not yet run on the cards.
+
+**The window's distributions** (`tests/test_window_sampling.py`). Speculative sampling is exact only
+if every row of a window is sampled from exactly the distribution `receive_logits` would sample that
+position from once the drafts before it are accepted, and independently of the other rows. For the
+server's two stacks (thinking: temperature 1.0, top-P 0.95, top-K 20; non-thinking: temperature 0.7,
+top-P 0.8, top-K 20, presence 1.5), over 4-row windows of designed logits (the token crossing P
+carries 3.5% of the mass or more and the cumulative mass is at least 0.01 from P on both sides of it,
+in fp32 and fp16, so rounding cannot move the kept set; the non-thinking rows told apart only by the
+drafts in their past IDs), with and without a mask per row (rows 1-3 each banning a token of their
+kept set, a different rank in each, row 0 none):
+- row 0 against a one-row `forward()` with the same seed: the same token, bit for bit (512 seeds per
+  stack, dtype and mask; on the card with the compiled extension, on CPU over a float64 stand-in);
+- every row's frequencies against the exact distribution computed in float64 (temperature first,
+  top-K, then top-P keeping the token that crosses it, 1.6.3's convention): no token outside the
+  kept set, every token within 5 standard deviations of its probability, and a chi-square over the
+  kept set (bins under 5 expected merged) with a p-value above 1e-6; 16384 windows per case on the
+  card, 4096 over the stand-in;
+- rows 0 and 1 (the same logits before the penalty and the mask) independent: a chi-square over
+  the 4 x 4 table of their top-3 tokens and the rest, p above 1e-6;
+- greedy windows give each row's argmax.
+The same checks fail, over the stand-in, for noise shared across rows, for 1.6.2's top-P (the
+crossing token dropped), for noise offset by a row, for a mask row given to the wrong position and
+for drafts missing from a row's past IDs. With `llguidance` installed, a real `LLGuidanceFilter`
+(a JSON grammar over the test's tokenizer): it takes the window path, and `Job._window_masks` gives,
+position by position, the masks the serial path builds after accepting the drafts before it; a
+refused draft's rows repeat row 0, a draft that completes the grammar leaves the rows after it
+unconstrained (`eos_after_completed` false) or repeats its row (true). The GPU tests skip without
+CUDA and the compiled extension; on the card the file makes about 74000 sampler calls, about a
+minute and a quarter at 1 ms a call (assumed, not measured), plus the CPU tests' minute and a quarter:
+
+    PYTHONPATH=/home/daniele/Desktop/exllamav3 /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_window_sampling.py -q
 
 Tests (no GPU, no extension): `tests/test_mtp_decode.py`: the generator over the toy model of the
 staggered tests (the same tokens and the same drafts accepted as the serial path, with 1-3 draft
@@ -1362,11 +1395,27 @@ trained head; `generator/draft_window.py`). Each step takes the window W that ma
 - *Exactness.* Speculative decoding keeps the target's tokens whatever the window. A position is
   then computed by verification passes of other widths from step to step; on the cards their logits
   can differ in the last bits (the exposure two fixed windows already have against each other), so
-  greedy text is the same only as far as no near-tie falls there. The exact check does not exercise
-  the policy yet.
+  greedy text is the same only as far as no near-tie falls there. Scenario 9 of the exact check
+  (below) exercises the policy, under the test hook of the next point.
+- *A test hook, not for production: a window schedule* (`EXL3_DRAFT_WINDOW_SCHEDULE`, e.g. `3` or
+  `0,1,2,3`; `Generator.draft_window_schedule`, a list or such a string, None for none). The windows
+  the policy takes depend on the step times it measures and on what it explores, so two processes,
+  or two runs in one, take different windows, and a run is not repeatable. With a schedule every
+  decode step takes the next window of it, cycled per step (a staggered decode's group counts as a
+  step), whatever the estimates, the times and the exploration; the window is clipped to what the
+  step allows (`draft_window_set`, `num_draft_tokens`, and the cap beside a prompt chunk: the largest
+  allowed window not above the scheduled one, else the smallest allowed), and the head drafts exactly
+  that window (a window of 0 still drafts its first position, as above). Everything else is the cost
+  path's: the confidences exported, the labels, the step timed when clean, the fold, the readbacks;
+  `draft_window_stats["scheduled"]` counts such steps (not `explored`). The schedule starts again
+  from its first window when the generator is given a job while it has none, and when it changes.
+  Only with `draft_window = "cost"` (a fixed window takes no window from anybody; the generator says
+  so at construction). Unset (the default, and production) the policy never enters the hook's code
+  (`tests/test_draft_window.py::test_without_a_schedule_the_hook_is_never_entered`: the same rounds
+  and the same stats with the hook replaced by one that raises).
 - `draft_window_set` (`EXL3_DRAFT_WINDOW_SET`, e.g. `0,1,3`) limits the windows; default 0 to
   `num_draft_tokens`. Above it nothing is taken (buffers and the cache's `max_history` are sized by it).
-- `draft_window_stats`: steps, windows taken (`chosen`), explored, capped, overridden, timed, positions
+- `draft_window_stats`: steps, windows taken (`chosen`), explored, scheduled, capped, overridden, timed, positions
   drafted, verified and accepted, expected against realised tokens of the steps it chose freely,
   labels, `curve` (`"r:n:W"` -> samples and median ms) and the calibrator's state.
 
@@ -1408,7 +1457,12 @@ and without either MTP decode switch, staggered, switched on and off while jobs 
 following flat, steep and cliffed curves; the head's confidence deciding step by step; every
 readback counted, one per drafted position and one for the sampling with both switches; the window
 capped beside a prompt chunk on the prefill thread, the chunks running beside where a fixed W=3
-waits for them. Marked `nogpu`; run with `--noconftest` without the compiled extension.
+waits for them; the test hook: its parsing, the schedule taken in order whatever the estimates,
+clipped to the windows allowed and to the cap, started again with each stretch of work and when it
+changes, never entered without a schedule, and over the toy generator with schedules `3`,
+`0,1,2,3` and `3,0,3,1`, with and without either MTP decode switch, one to four jobs, staggered: the
+same tokens as a fixed window, the windows taken those of the schedule, the positions drafted
+`max(1, W)`. Marked `nogpu`; run with `--noconftest` without the compiled extension.
 
 ### Raw keys of the block being built only (`Cache(qsa_raw_tail = True)`, `EXL3_QSA_RAW_TAIL=1`)
 
@@ -1518,7 +1572,7 @@ plane's, no model (with CUDA the test file runs them there; it needs `pytest` in
 
     /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_qsa_raw_tail.py -q
 
-Then the model, scenario 8 of the exact check: the plan and the checks, then the run (about 21
+Then the model, scenario 8 of the exact check: the plan and the checks, then the run (about 13
 minutes by the estimate: two loads). `REPORT.md` in the run directory says, per compared run,
 whether the logits are identical bit for bit with the ring and without, and per card the memory
 each load left free, the difference and what the library says the ring saves:
@@ -1565,8 +1619,71 @@ raw-key ring, the same forced runs in a process with the full raw plane and one 
 `EXL3_QSA_RAW_TAIL=1` (a document of 12386 tokens past the sparse threshold with a forced answer of
 512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
 from the disk tier), expected identical against the full plane's process repeated, and the memory
-each load left free per card beside what the library says the ring saves (about 21 minutes by the
-estimate, two loads).
+each load left free per card beside what the library says the ring saves (about 13 minutes by the
+estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below.
+
+**Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
+loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
+with the server's `--draft-num-tokens` at that value) with the batched verify, the batched head
+update, the cost window and the raw-key ring, on top of what production already runs (staggered
+decode, prefill thread, pipeline, tail checkpoint, the MTP head on the first card, the layer split of
+`--device-split`). The MTP switches are `Generator` arguments, so one process with the full raw plane
+holds a generator per set (`off`: none of the four; `v`: verify; `u`: update; `vu`: both, fixed W;
+`s3`: both, cost window under the schedule `W`; `mix1`, `mix2`: both, cost window under the
+schedules of `--s9-mixed`, `0,1,2,3` and `3,0,3,1`; `w1`: none, one draft token); the ring is a cache
+layout made at the load, so a second process with `EXL3_QSA_RAW_TAIL=1` holds `s3` alone. The windows
+come from the test hook of the draft window section: the policy left to itself chooses from step
+times, and no two runs would compare. The workload of every set: a job alone (256 tokens), a batch of
+three (staggered), a document of 12386 tokens ingested beside two jobs generating (prefill thread and
+pipeline: two jobs of 1 + 3 rows stay within the 8 rows a chunk may overlap, so the chunks run beside
+and the cost window's cap, 8 // 2 - 1 = 3, clips nothing), then the next turn resumed from the pages
+in VRAM. Free runs are greedy and compared as far as their tokens go together (the position where
+they part is compared for its logits only; a difference of the sampled token with identical logits
+up to there is the sampling's, reported as such); forced runs take the tokens of `off`'s first free
+run. A forced job takes the serial path of the verify (`forced_tokens`), so only free runs exercise
+it, and the child digests a window sampled at once row by row, each position as the serial path
+would have recorded it (`sample_window`, then `receive_sample` per position). The comparisons, each
+group with its own table in the report and its expected verdict:
+- (a) verify on against off, greedy free runs, update off (`v` against `off`) and on (`vu` against
+  `u`): only how the sampled tokens come back to the host changes, and each row of the fused sampler
+  is computed alone, so **identical** (logits, free tokens, drafts); an error if the run with verify
+  sampled no window at once.
+- (b) the cost window under the schedule `W` against the fixed W (`s3` against `vu`), free and
+  forced: the same computation through the other path (the head drafts a position at a time with its
+  confidence, the round stops at exactly W, the policy's times and labels go on deciding nothing):
+  **identical**.
+- (c) mixed schedules against the fixed W, forced: a position is computed by passes of other widths
+  and rewound by other amounts, so **within the noise** against the shape meter (the same library,
+  the same forced tokens, W=1 fixed against W=3 fixed: the rounding upstream itself shows when the
+  verified rows change); a wrong rewind of the recurrent state or of the head's cache with windows of
+  varying length would be far beyond it. An error if the schedule did not decide the steps or one
+  window only was taken. The first mixed schedule repeated in the same process: **identical** (its
+  floor; the document's job left out, since it joins the batch at a step that depends on time).
+- (d) the batched head update on against off, fixed W, verify off (`u` against `off`, forced): the
+  head's cache gets the same inputs in passes of other shapes, so its drafts and with them which pass
+  verifies a position can change: **within the noise** against the shape meter, drafts reported,
+  not judged; an error if no update was folded.
+- (e) the ring against the full plane with production's MTP switches (`s3` in both processes, free
+  and forced): **identical**, against `s3` repeated in the full plane's process.
+- (f) everything on (the ring's process, `s3`) against everything off (`off`, fixed W), forced: a
+  control row, **within the noise** against the shape meter (which also holds the noise between two
+  processes that scenario 1 measures).
+The decoders beside the document are compared only up to where the document joined the batch in
+both runs (when a chunk is recorded depends on time); the turn requires a resumed prompt, the batch a
+staggered call, the document's rows a chunk beside the decode with the thread and the pipeline on.
+The report's table of runs gives, per run, the windows sampled at once and left to the serial path,
+the folds, the scheduled steps, the windows taken, the drafts accepted and rejected, the chunks
+beside and in flight. Then the memory each load left free per card (the ring's), the placement and
+the libraries, as in scenario 8. The disk tier is not in this scenario (scenario 8 has the ring's
+turn from the disk).
+
+**The switches.** A switch of this branch left off in a process with every switch off must read as
+off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches
+(`mtp_batched_verify`, `mtp_batched_update` off), the draft window (`"fixed"`, upstream's) and the
+schedule (none), next to the earlier ones; `EXL3_MTP_BATCHED_VERIFY`, `EXL3_MTP_BATCHED_UPDATE`,
+`EXL3_DRAFT_WINDOW`, `EXL3_DRAFT_WINDOW_SET` and `EXL3_DRAFT_WINDOW_SCHEDULE` are removed from every
+process's environment with the other switches. Scenario 1 with every switch off reports nothing about
+switches (`tests/test_exact_check.py`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
@@ -1591,8 +1708,9 @@ process on the cards as a problem and the rest as it will be.
     /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
     /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --out /home/daniele/exl3-exact-check
 
-How long: the dry run's estimate is about 2.5 hours (prefill 700 tokens/s, decode 60 tokens/s for
-one job and 60 x sqrt(n) for n, 5 minutes per model load, never measured; ten loads); a scenario
+How long: the dry run's estimate is about 1.9 hours for the default scenarios 1-7 (prefill 700
+tokens/s, decode 60 tokens/s for one job and 60 x sqrt(n) for n, 1 minute per model load, 40-65 s
+measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9; a scenario
 gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
 directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
 the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the
@@ -1604,7 +1722,20 @@ What the check cannot tell: a difference the digest misses (two rows of logits w
 weighted sum of their bits: never for one changed value, about 2**-64 otherwise), a race that does
 not fire in one run, whether the exact mode makes 1.6.3 repeatable (the floors of the first report
 say it), and anything off the paths the scenarios take (images, a decode batch above
-eight rows beside a chunk, tensor parallelism). Tests (no GPU, no extension):
+eight rows beside a chunk, tensor parallelism, the cost window choosing by itself, random sampling:
+with a seed the window sampled at once draws other tokens than the serial path by design, so random
+runs cannot compare bit for bit, and their distributions are `tests/test_window_sampling.py`'s).
+
+The GPU window before the production combination (fish, one line each; production stopped as above):
+scenario 1 with every switch off (the fork against stock upstream, which says the branch is upstream
+when nothing is on), scenario 9, and the window sampling test on the card:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --scenarios 1,9 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s1-s9
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 1 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s1
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 9 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s9
+    PYTHONPATH=/home/daniele/Desktop/exllamav3 /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_window_sampling.py -q
+
+Tests (no GPU, no extension):
 `tests/test_exact_check.py`, with `--noconftest` (comparisons, floors and controls, plan, estimate,
 report, records, watchdog, orchestration and split retry with a fake child, the child over a fake
 library and server, the Runner and the stress over the toy model of the staggered tests).
