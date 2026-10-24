@@ -199,6 +199,74 @@ def test_a_comparison_expected_within_the_noise_takes_its_yardsticks():
     assert EC.evaluate_probs(c, res)["verdict"] == EC.DIFF
 
 
+def free_cmp(**kw):
+    return probs_cmp(free = True, **kw)
+
+
+def test_free_runs_compare_up_to_where_their_tokens_part():
+    same = view([1, 2, 3, 4])
+    res = Res({("p", "t"): runrec(a = same), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+    assert EC.evaluate_probs(free_cmp(), res)["verdict"] == EC.IDENT
+    # The same logits up to and at the position, another token there: the sampling, not the computation
+    sampled = view([1, 2, 9, 4], top = [[1, 0], [2, 0], [3, 0], [4, 0]], logp = [-0.5, -0.51, -3.0, -0.53])
+    res = Res({("p", "t"): runrec(a = sampled), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+    r = EC.evaluate_probs(free_cmp(), res)
+    assert r["verdict"] == EC.DIFF and "campionamento" in r["why"] and r["test"]["n"] == 3 and r["test"]["parted"] == 2
+    assert r["test"]["max"] == pytest.approx(0.0) and any("si separano alla posizione 2" in n for n in r["notes"])
+    # Other logits at the position where they part: a difference of the computation, judged on the floor
+    moved = view([1, 2, 9, 4], digest = [100, 101, 7, 103], top = [[1, 0], [2, 0], [9, 3], [4, 0]])
+    res = Res({("p", "t"): runrec(a = moved), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+    r = EC.evaluate_probs(free_cmp(), res)
+    assert r["verdict"] == EC.DIFF and r["test"]["first_diff"] == 2 and "campionamento" not in r["why"]
+    # ... and within a floor whose own free runs part the same way
+    res = Res({("p", "t"): runrec(a = moved), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = moved)})
+    r = EC.evaluate_probs(free_cmp(), res)
+    assert r["verdict"] == EC.NOISE, r
+    # Forced runs whose tokens differ are still an error
+    res = Res({("p", "t"): runrec(a = sampled), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+    assert EC.evaluate_probs(probs_cmp(), res)["verdict"] == EC.ERR
+    # Parting past the positions compared is no parting
+    res = Res({("p", "t"): runrec(a = sampled), ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+    assert EC.evaluate_probs(free_cmp(upto = 2), res)["verdict"] == EC.IDENT
+
+
+def test_a_window_bound_in_both_runs():
+    # The reader joins the batch after 6 positions of `a` in the test run and after 4 in the reference
+    def run(first):
+        t = runrec(a = view(list(range(10))), r = dict(view([1]), enqueued = 1.5, first_token = first))
+        t["order"] = ["a", "r"]
+        t["timeline"] = [[1.0, [2, 0]], [2.0, [4, 0]], [3.0, [6, 0]], [4.0, [8, 1]], [5.0, [10, 2]]]
+        for when, counts in t["timeline"]:
+            if when >= first:
+                counts[1] = max(1, counts[1])
+        return t
+    res = Res({("p", "t"): run(4.0), ("p", "r1"): run(3.0), ("p", "r2"): run(4.0)})
+    r = EC.evaluate_probs(probs_cmp(upto = {"window": "r"}, drafts = False), res)
+    assert r["test"]["n"] == 6
+    r = EC.evaluate_probs(probs_cmp(upto = {"window": "r", "both": True}, drafts = False), res)
+    assert r["verdict"] == EC.IDENT and r["test"]["n"] == 4
+    # The floor's two runs bound their own comparison
+    assert r["floor"]["n"] == 4
+
+
+def test_what_the_mtp_decode_rows_ask_of_the_test_run():
+    same = view([1, 2, 3])
+
+    def verdict(stats, **req):
+        t = dict(runrec(a = same), stats = stats)
+        res = Res({("p", "t"): t, ("p", "r1"): runrec(a = same), ("p", "r2"): runrec(a = same)})
+        return EC.evaluate_probs(probs_cmp(requires = req), res)
+
+    good = {"verify": {"windows": 3}, "update": {"fold_drafts": 2}, "window": {"scheduled": 4, "w0": 1, "w3": 3}}
+    assert verdict(good, verify_windows = True, folds = True, scheduled = True, windows_varied = True)["verdict"] == EC.IDENT
+    r = verdict(dict(good, verify = {"windows": 0, "serial": 7}), verify_windows = True)
+    assert r["verdict"] == EC.ERR and "7 finestre lasciate al percorso seriale" in r["why"]
+    assert "mtp_batched_update" in verdict(dict(good, update = {"folds": 0}), folds = True)["why"]
+    assert "programma" in verdict(dict(good, window = {"scheduled": 0}), scheduled = True)["why"]
+    r = verdict(dict(good, window = {"scheduled": 4, "w0": 0, "w3": 4}), windows_varied = True)
+    assert r["verdict"] == EC.ERR and "una sola finestra presa ([3])" in r["why"]
+
+
 def test_the_worst_verdict_decides_a_scenario():
     assert EC.worst([EC.IDENT, EC.NOISE, EC.INFO]) == EC.NOISE
     assert EC.worst([EC.IDENT, EC.ERR, EC.DIFF]) == EC.DIFF
@@ -272,8 +340,9 @@ def all_refs(plan):
     return out
 
 
-def test_the_plan_refers_only_to_runs_that_come_before():
-    plan = EC.build_plan(args_for())
+@pytest.mark.parametrize("scenarios", [None, "8", "9"])
+def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
+    plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
     order = {}
     for p in plan["procs"]:
@@ -355,6 +424,173 @@ def test_scenario_6_shares_the_processes_of_scenario_1_or_has_its_own():
     assert all(any(st["op"] == "sweep" for st in p["steps"]) for p in alone["procs"])
 
 
+def test_scenario_8_runs_the_same_forced_runs_with_and_without_the_ring():
+    assert 8 not in args_for().scenarios
+    plan = EC.build_plan(args_for("--scenarios", "8"))
+    procs = [(p["name"], p["library"], p["env"]) for p in plan["procs"]]
+    assert procs == [("s8-fork-full", "fork", {}), ("s8-fork-ring", "fork", {"EXL3_QSA_RAW_TAIL": "1"})]
+    full, ring = plan["procs"]
+    forced = lambda p: [st["id"] for st in p["steps"] if st["op"] == "run" and not st.get("warmup")
+                        and all("forced" in j for j in st["jobs"])]
+    # (the full plane's process ingests the document once more before the free turn it forces on the others)
+    assert [x for x in forced(full) if x != "s8.turn.prep0"] == forced(ring) and "s8.disk.turn" in forced(ring)
+    # the references are the full plane's
+    for st in ring["steps"]:
+        for j in st.get("jobs", []) if st["op"] == "run" else []:
+            if "forced" in j:
+                assert j["forced"]["proc"] == "s8-fork-full"
+    # the document is past the indexer's sparse threshold (Qwen3.8-Flash-Next: about 2k tokens)
+    lengths = [spec["length"] for spec in ring["prompts"].values() if spec["kind"] == "doc"]
+    assert max(lengths) > 8192
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    assert len(probs) == 8
+    for c in probs:
+        assert c["test"]["proc"] == "s8-fork-ring" and c["ref"]["proc"] == "s8-fork-full" and c["expect"] == "identical"
+        assert {r["proc"] for r in c["floor"]} == {"s8-fork-full"} and c["test"]["run"] == c["ref"]["run"]
+    kinds = {c["kind"] for c in plan["comparisons"]}
+    assert {"raw_tail", "same_placement", "library"} <= kinds
+    # the fork's switch is scrubbed from every child unless a process asks for it
+    assert "EXL3_QSA_RAW_TAIL" in EC.FORK_ENV_SWITCHES
+    assert not EC.switch_is_off("qsa_raw_tail", 32) and EC.switch_is_off("qsa_raw_tail", 0)
+
+
+def test_scenario_8_reports_the_ring_and_the_memory_per_card():
+    plan = EC.build_plan(args_for("--scenarios", "8"))
+    res = fake_results(plan)
+    mib = 1 << 20
+    res.records["s8-fork-full"]["load"].update(
+        free = {"0": 1000 * mib, "1": 800 * mib}, draft = True,
+        qsa_raw_tail = {"main": 0, "draft": 0, "layers": 0, "saved": {}})
+    res.records["s8-fork-ring"]["load"].update(
+        free = {"0": 1474 * mib, "1": 1353 * mib}, draft = True,
+        qsa_raw_tail = {"main": 32, "draft": 32, "layers": 13, "saved": {"0": 474 * mib, "1": 553 * mib}})
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert summary_cells(report)[0][1] == EC.IDENT
+    assert "anello di 32 token in 13 strati" in report
+    assert "| cuda:0 | 1000 | 1474 | 474 | 474 |" in report and "| cuda:1 | 800 | 1353 | 553 | 553 |" in report
+    # the ring missing where it was asked for (a library without it, or refused), or there where it was not
+    res.records["s8-fork-ring"]["load"]["qsa_raw_tail"] = {"main": None, "draft": None, "layers": 0, "saved": {}}
+    report = EC.render_report(plan, res, {"started": "s"}, True)
+    assert summary_cells(report)[0][1] == EC.FAIL and "non aveva l'anello" in report
+    res.records["s8-fork-ring"]["load"]["qsa_raw_tail"] = {"main": 32, "draft": 0, "layers": 12, "saved": {}}
+    assert "testa MTP non aveva l'anello" in EC.render_report(plan, res, {"started": "s"}, True)
+
+
+def test_scenario_9_holds_every_generator_in_one_process_and_the_ring_in_another():
+    assert 9 not in args_for().scenarios
+    args = args_for("--scenarios", "9")
+    plan = EC.build_plan(args)
+    procs = [(p["name"], p["library"], p["env"], p["server_args"]) for p in plan["procs"]]
+    assert procs == [("s9-fork-full", "fork", {}, ["--draft-num-tokens", "3"]),
+                     ("s9-fork-ring", "fork", {"EXL3_QSA_RAW_TAIL": "1"}, ["--draft-num-tokens", "3"])]
+    full, ring = plan["procs"]
+    gens = {st["id"]: st["switches"] for st in full["steps"] if st["op"] == "generator"}
+    assert list(gens) == ["g.off", "g.v", "g.u", "g.vu", "g.s3", "g.mix1", "g.mix2", "g.w1"]
+    prod = {"stagger": True, "thread": True, "pipeline": True, "tail": True}
+    for g, sw in gens.items():
+        assert {k: sw[k] for k in prod} == prod, g
+    assert gens["g.off"] == prod and gens["g.v"] == dict(prod, verify = True) and gens["g.u"] == dict(prod, update = True)
+    assert gens["g.s3"] == dict(prod, verify = True, update = True, window = "cost", schedule = [3])
+    assert gens["g.mix1"]["schedule"] == [0, 1, 2, 3] and gens["g.mix2"]["schedule"] == [3, 0, 3, 1]
+    assert gens["g.w1"] == dict(prod, draft_tokens = 1)
+    # The ring's process: the production generator only, with the same runs as the full plane's
+    assert [st["id"] for st in ring["steps"] if st["op"] == "generator"] == ["g.s3"]
+    runs = lambda p, pre: [st["id"] for st in p["steps"] if st["op"] == "run" and st["id"].startswith(pre)]
+    assert runs(ring, "s9.s3.free1") == runs(full, "s9.s3.free1") and runs(ring, "s9.s3.forced1") == runs(full, "s9.s3.forced1")
+    # Every forced token is a free run of `off` in the full plane's process, the warm-ups come first
+    for p in plan["procs"]:
+        ids = [st["id"] for st in p["steps"] if st["op"] == "run"]
+        assert ids[:3] == ["s9.warm.a", "s9.warm.abc", "s9.warm.doc"]
+        for st in p["steps"]:
+            for j in st.get("jobs", []) if st["op"] == "run" else []:
+                if "forced" in j:
+                    assert j["forced"]["proc"] == "s9-fork-full" and j["forced"]["run"].startswith("s9.off.free1.")
+    # The document beside two jobs generating: past the sparse threshold, several chunks, and two
+    # jobs of 1 + W rows within side_max_rows (the chunks run beside the decode, the cost window's
+    # cap clips no window up to W)
+    doc_run = next(st for st in full["steps"] if st["id"] == "s9.off.free1.doc")
+    assert [j["name"] for j in doc_run["jobs"]] == ["a", "b", "r"] and doc_run["until"] == {"job": "r"}
+    assert 2 * (1 + args.s9_window) <= EC.SIDE_MAX_ROWS and EC.SIDE_MAX_ROWS // 2 - 1 >= args.s9_window
+    lengths = [spec["length"] for spec in full["prompts"].values() if spec["kind"] == "doc"]
+    assert max(lengths) > 3 * args.chunk
+    turn = next(st for st in full["steps"] if st["id"] == "s9.off.free1.turn")
+    assert not turn["forget"] and full["prompts"]["turn/s9"]["answer"] == EC.ref("s9-fork-full", "s9.off.free1.doc", "r")
+
+
+def test_scenario_9_s_comparisons_and_what_they_expect():
+    plan = EC.build_plan(args_for("--scenarios", "9"))
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    by = {}
+    for c in probs:
+        by.setdefault(c["group"], []).append(c)
+    assert {g: len(v) for g, v in by.items()} == {"a1": 8, "a2": 8, "b": 16, "c": 16, "c0": 7, "d": 8, "e": 16, "f": 8}
+    for g in ("a1", "a2", "b", "c0", "e"):
+        assert all(c["expect"] == "identical" for c in by[g]), g
+    for g in ("c", "d", "f"):
+        for c in by[g]:
+            # Against the shape meter: the same forced tokens, fixed W=1 against fixed W=3
+            assert c["expect"] == "noise" and not c["drafts"]
+            assert [(y[0]["run"].rsplit(".", 1)[0], y[1]["run"].rsplit(".", 1)[0]) for y in c["yards"]] == \
+                [("s9.off.forced1", "s9.w1.forced1")]
+    # (a) compares free runs, which exercise the batched verify; the forced (b) and (e) rows do not ask for it
+    for c in by["a1"] + by["a2"]:
+        assert c["free"] and c["requires"].get("verify_windows")
+    assert all(c["free"] == ("free" in c["test"]["run"]) for c in by["b"] + by["e"])
+    assert all(("verify_windows" in c["requires"]) == c["free"] for c in by["b"] + by["e"])
+    assert all(c["requires"].get("scheduled") for c in by["b"] + by["c"] + by["c0"] + by["e"] + by["f"])
+    assert all(c["requires"].get("windows_varied") for c in by["c"])
+    assert all(c["requires"].get("folds") for c in by["d"] + by["f"])
+    # (e) and (f) take the test from the ring's process
+    assert {c["test"]["proc"] for c in by["e"] + by["f"]} == {"s9-fork-ring"}
+    assert {c["ref"]["proc"] for c in probs} == {"s9-fork-full"}
+    # The jobs beside the document: up to where it joins the batch in either run, chunks beside asked for
+    for c in probs:
+        if c["test"]["run"].endswith(".doc") and c["test"]["job"] in "ab":
+            assert c["upto"] == {"window": "r", "both": True}
+            assert c["requires"]["beside"] and c["requires"]["pipeline"] == "on" and c["soft"] == {"piped": True}
+    # The mixed schedule repeated: no document, which joins at a step that depends on wall time
+    assert not any(c["test"]["job"] == "r" for c in by["c0"])
+    kinds = {c["kind"] for c in plan["comparisons"]}
+    assert {"raw_tail", "same_placement", "library"} <= kinds
+
+
+def test_scenario_9_s_estimate_fits_the_gpu_window_and_its_options():
+    args = args_for("--scenarios", "9")
+    plan = EC.build_plan(args)
+    est = EC.estimate_plan(plan, args)
+    # Two loads of a minute, about 20 minutes in all
+    assert 12 * 60 <= est["total"] <= 22 * 60, est["total"] / 60
+    assert len(plan["procs"]) == 2
+    other = args_for("--scenarios", "9", "--s9-mixed", "1,3/0,3", "--s9-window", "3")
+    assert other.s9_mixed == [[1, 3], [0, 3]]
+    gens = EC.s9_generators(other)
+    assert gens["mix1"]["schedule"] == [1, 3] and gens["mix2"]["schedule"] == [0, 3]
+    with pytest.raises(SystemExit):
+        EC.parse_cli(["--scenarios", "9", "--s9-window", "2", "--s9-mixed", "0,3"])
+
+
+def test_scenario_9_reports_each_group_with_what_it_expects():
+    plan = EC.build_plan(args_for("--scenarios", "9"))
+    res = fake_results(plan)
+    mib = 1 << 20
+    res.records["s9-fork-full"]["load"].update(draft = True, free = {"0": 1000 * mib},
+                                               qsa_raw_tail = {"main": 0, "draft": 0, "layers": 0, "saved": {}})
+    res.records["s9-fork-ring"]["load"].update(draft = True, free = {"0": 1474 * mib},
+                                               qsa_raw_tail = {"main": 32, "draft": 32, "layers": 13, "saved": {"0": 474 * mib}})
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert summary_cells(report)[0][1] == EC.IDENT, summary_cells(report)
+    for g, title, text in EC.S9_GROUPS:
+        assert f"### {title}: {EC.IDENT}" in report and text in report
+    assert "**identico**" in report and "**entro il rumore**" in report
+    # The counters of every run: windows sampled at once, folds, the schedule's steps, the windows taken
+    assert "| `s9-fork-full` / `s9.v.free1.a` | 10.0 | 6 / 0 | 5 / 4 | 7 / 7 | 0:2 3:5 |" in report
+    # A row of (a) whose run sampled no window at once is an error, not a pass
+    res.records["s9-fork-full"]["s9.v.free1.a"]["stats"]["verify"] = {"windows": 0, "serial": 9}
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    r = rows["s9.a1.v.free1.a.a"]
+    assert r["verdict"] == EC.ERR and "mtp_batched_verify non esercitato" in r["why"]
+
+
 def test_the_exact_environment_of_the_children():
     args = args_for("--env", "EXL3_HOST_MEM_RESERVE_MB=1024")
     base = {"PATH": "/bin", "EXL3_STAGGER_DECODE": "1", "EXL3_MOE_CPU_SPLIT_STATS": "/x", "PYTHONPATH": "/somewhere"}
@@ -410,15 +646,15 @@ def test_the_estimate_and_the_dry_run():
     assert all(budgets[s] >= max(1800.0, 2.9 * est["scenarios"][s]) for s in budgets)
     assert EC.scenario_budgets(est, args_for("--scenario-timeout", "10"))[2] == 600.0
     text = EC.dry_run_text(plan, args, est, budgets, ["modello non trovato: /x"], ["una nota"])
-    for s, title in EC.SCENARIO_TITLES.items():
-        assert f"Scenario {s} - {title}" in text
+    for s in plan["scenarios"]:
+        assert f"Scenario {s} - {EC.SCENARIO_TITLES[s]}" in text
     assert "Totale stimato" in text and "PROBLEMA: modello non trovato" in text and "Nota: una nota" in text
-    assert "prefill 700 token/s" in text and "5 min per caricamento" in text
+    assert "prefill 700 token/s" in text and "1 min per caricamento del modello (40-65 s misurati" in text
 
 
 def test_the_cli_refuses_what_it_cannot_do():
     with pytest.raises(SystemExit):
-        EC.parse_cli(["--scenarios", "1,9"])
+        EC.parse_cli(["--scenarios", "1,10"])
     with pytest.raises(SystemExit):
         EC.parse_cli(["--chunk", "1000"])
     a = EC.parse_cli(["--scenarios", "3,1,3", "--out", "/tmp/x"])
@@ -472,7 +708,9 @@ def fake_results(plan, *, differ = (), missing = ()):
                 recs[st["id"]] = {"op": "run", "id": st["id"], "scenario": st["scenario"], "ok": True, "jobs": jobs,
                                   "order": order, "timeline": line,
                                   "stats": {"side": {"chunks": 3, "beside": 3, "piped": 2, "ahead": 1}, "stagger": {"steps": 5},
-                                            "tail": {"stashes": 4}},
+                                            "tail": {"stashes": 4}, "verify": {"windows": 6, "serial": 0},
+                                            "update": {"folds": 5, "fold_drafts": 4},
+                                            "window": {"scheduled": 7, "steps": 7, "w0": 2, "w1": 0, "w2": 0, "w3": 5}},
                                   "state": {"thread": "on", "pipeline": "on"}, "seconds": 10.0, "left_jobs": 0,
                                   "cancels": [{"job": "r", "progress": 0.51, "seconds": 0.3}] if st.get("cancel") else []}
             elif st["op"] == "disk_scan":
@@ -505,8 +743,8 @@ def test_the_report_of_a_night_where_everything_is_the_same():
     assert [r[1] for r in rows] == [EC.IDENT] * 6 + [EC.PASS], rows
     assert rows[0][3] != "-" and rows[0][4] == "identico"
     assert "**Attenzione**" not in report
-    for s, title in EC.SCENARIO_TITLES.items():
-        assert f"## {s}. {title}" in report
+    for s in plan["scenarios"]:
+        assert f"## {s}. {EC.SCENARIO_TITLES[s]}" in report
 
 
 def test_the_report_says_where_it_differs():
@@ -736,8 +974,10 @@ class FakeWatch:
         pass
 
 
-def toy_env(steps = 5, slots = 4):
-    g = make_generator(draft = True, min_jobs = 2)
+def toy_env(steps = 5, slots = 4, num_draft_tokens = 1, window_jobs = False):
+    g = make_generator(draft = True, min_jobs = 2, num_draft_tokens = num_draft_tokens)
+    g.mtp_verify_stats = {"windows": 0, "serial": 0, "readbacks": 0, "fallbacks": {}}
+    g.readback_stats = {"steps": 0, "readbacks": 0}
     g.model.host = Slots(slots)
     g.model.config.moe_cpu_hosts = {"cuda:0": g.model.host}
     g.side_min_tokens = CHUNK
@@ -770,6 +1010,20 @@ def toy_env(steps = 5, slots = 4):
             results[-1]["token_ids"] = next_token.view(1, 1)
             return eos, tok, rq
 
+    class WindowJob(BenchJob):
+        """With Job's window interface (Generator.mtp_batched_verify): greedy rows, a forced job
+        declines as the real one does"""
+
+        def window_sampling_why(self):
+            return "forced_tokens" if self.forced is not None else None
+
+        def sample_window(self, logits, drafts):
+            self.mid_pass = False
+            return torch.argmax(logits, dim = -1).view(1, -1)
+
+    if window_jobs:
+        BenchJob = WindowJob
+
     prompts = {"q0": toy.PROMPTS["a"], "q1": toy.PROMPTS["b"], "q2": toy.PROMPTS["c"], "q3": toy.PROMPTS["d"]}
 
     def prompt_ids(key):
@@ -799,7 +1053,8 @@ def toy_env(steps = 5, slots = 4):
     x = types.SimpleNamespace(
         torch = torch, gen = g, clock = time.time, watch = FakeWatch(), make_job = make_job, prompt_ids = prompt_ids,
         forced_tokens = forced_tokens, digester = lambda: CH.Digester(torch, None, 2), apply_switches = apply_switches,
-        forget = lambda: 0, stats = lambda: {"side": dict(g.side_stats), "stagger": dict(g.stagger_stats)},
+        forget = lambda: 0, stats = lambda: {"side": dict(g.side_stats), "stagger": dict(g.stagger_stats),
+                                             "verify": {k: v for k, v in g.mtp_verify_stats.items() if k != "fallbacks"}},
         state = lambda: {"thread": g.prefill_thread_state, "pipeline": g.prefill_pipeline_state},
         placement = lambda: None, reset_memory = lambda: None, sample_memory = lambda: None, memory = lambda: {},
         disk_metrics = lambda: None, run_timeout = 120.0,
@@ -943,6 +1198,80 @@ def test_the_stress_schedule_is_the_seed_s():
     assert kinds == {"short", "doc", "long", "turn", "cancel"}
 
 
+@pytest.mark.parametrize("names", ["a", "abc"])
+def test_windows_sampled_at_once_leave_the_records_of_the_serial_path(monkeypatch, names):
+    """With mtp_batched_verify a job's positions skip receive_logits (Job.sample_window); the
+    Digester records them from the window's rows, so a free run with the verify on has the same
+    records, position for position, as one with it off: digests, emitted tokens, the most likely
+    ones and the draft counters"""
+    monkeypatch.setattr(toy.ToyLayerState, "ROWS", 4 * 4)
+    recs = {}
+    for verify in (False, True):
+        x = toy_env(num_draft_tokens = 3, window_jobs = True)
+        x.gen.mtp_batched_verify = verify
+        jobs = [EC.jobspec(n, f"q{i}", 90) for i, n in enumerate(names)]
+        recs[verify] = do(x, EC.run_step("free", 9, jobs, switches = {"stagger": len(names) > 2}))
+        assert not recs[verify]["warnings"], recs[verify]["warnings"]
+        if verify:
+            assert recs[verify]["stats"]["verify"]["windows"] > 20 and recs[verify]["stats"]["verify"]["serial"] == 0
+    for n in names:
+        off, on = recs[False]["jobs"][n], recs[True]["jobs"][n]
+        assert len(on["digest"]) == len(on["tokens"]) == 90 and all(d is not None for d in on["digest"])
+        for key in ("tokens", "digest", "tok", "logp", "topi", "topl", "acc", "rej"):
+            assert on[key] == off[key], (n, key)
+        assert on["accepted"] == off["accepted"] > 5
+    # The same comparison the report makes, on free runs
+    res = Res({("p", "on"): recs[True], ("p", "off"): recs[False]})
+    c = EC.cmp(9, "x", "l", EC.ref("p", "on", names[0]), EC.ref("p", "off", names[0]), free = True,
+               floor = (EC.ref("p", "off", names[0]), EC.ref("p", "on", names[0])))
+    assert EC.evaluate_probs(c, res)["verdict"] == EC.IDENT
+
+
+def test_the_digester_takes_each_position_of_a_window_from_its_row():
+    """A window of four rows of which the generator takes two (the second draft rejected): two
+    entries, each its own row's, then a serial position clears the window"""
+    dig = CH.Digester(torch, None, 2)
+    taken = []
+
+    class J:
+        accepted_draft_tokens = 0
+        rejected_draft_tokens = 0
+
+        def receive_logits(self, logits):
+            return torch.argmax(logits, dim = -1).view(1, 1), None, None, None
+
+        def sample_window(self, logits, drafts):
+            return torch.argmax(logits, dim = -1).view(1, -1)
+
+        def receive_sample(self, logits, next_token, *rest):
+            taken.append(int(next_token.view(-1)[0]))
+            return False, next_token, False
+
+    j = J()
+    dig.wrap(j, "a")
+    logits = torch.tensor([[[0.0, 5.0, 1.0], [3.0, 0.0, 1.0], [0.0, 1.0, 7.0], [9.0, 0.0, 0.0]]])
+    rows = j.sample_window(logits, [1, 0, 2])
+    j.receive_sample(logits[:, 0:1], torch.tensor([[int(rows[0, 0])]]))
+    j.accepted_draft_tokens += 1
+    j.receive_sample(logits[:, 1:2], torch.tensor([[int(rows[0, 1])]]))
+    j.rejected_draft_tokens += 2
+    # The next step takes the serial path: its position is receive_logits', not the window's third row
+    tok = j.receive_logits(torch.tensor([[[1.0, 0.0, 4.0]]]))[0]
+    j.receive_sample(None, tok)
+    out = {"a": {"digest": [], "tok": [], "logp": [], "topi": [], "topl": []}}
+    dig.resolve(out)
+    v = out["a"]
+    assert taken == [1, 0, 2] and v["tok"] == [1, 0, 2] and v["acc"] == [0, 1, 1] and v["rej"] == [0, 0, 2]
+    # Each entry is its own row's: the digest of a row alone, as the serial path would record it
+    alone = CH.Digester(torch, None, 2)
+    for r, t in ((0, 1), (1, 0)):
+        o = {"x": {"digest": [], "tok": [], "logp": [], "topi": [], "topl": []}}
+        alone.pending = {"x": [(alone._post(alone._pre(logits[:, r:r + 1]), torch.tensor([[t]])), (0, 0))]}
+        alone.resolve(o)
+        assert o["x"]["digest"][0] == v["digest"][r] and o["x"]["logp"][0] == pytest.approx(v["logp"][r])
+    assert not dig.errors
+
+
 def test_the_digester_is_the_same_in_every_process():
     d1, d2 = CH.Digester(torch, 6, 3), CH.Digester(torch, 6, 3)
     logits = torch.tensor([[[0.5, -1.0, 2.0, 0.25, 3.0, -0.5, 9.0, 9.0]]])
@@ -997,6 +1326,18 @@ def test_the_library_still_has_what_the_child_reads():
     assert 'EXL3_MOE_RECON_DET' in _src("modules", "moe_batch_recon.py")
     # The digest reads the token the job returns first
     assert "return next_token, next_k_tokens, next_k_probs, next_prob" in job
+    # A window sampled at once goes through the job's sample_window (its logits before the sampler
+    # sees them), then receive_sample once per position the generator takes from it, in order: the
+    # Digester takes each such position's row from there
+    assert "sampled = job.sample_window(batch_logits[a:b, :, :], draft_tokens[row, :width].tolist())" in gen
+    assert "next_token = torch.tensor([[window[0][i]]], dtype = torch.long)" in gen
+    assert gen.count("eos, sampled_token, rq = job.receive_sample(") == 2
+    # The MTP decode's switches and counters, and the test hook's schedule (the cost window)
+    for name in ("mtp_batched_verify: bool = False", "mtp_batched_update: bool = False", 'draft_window: str = "fixed"',
+                 "self.mtp_verify_stats = {", "self.mtp_update_stats = {", "self.readback_stats = {",
+                 "self.draft_window_stats = policy.stats", "schedule = self.draft_window_schedule,"):
+        assert name in gen, name
+    assert '"scheduled": 0' in _src("generator", "draft_window.py")
     # The exact mode's other pins: the GPU fused kernel's deterministic accumulation (default on),
     # the batched reconstruct's fallback default (atomic unless set), the streamed fused tier
     # without the slot scratch (why EXL3_MOE_STREAM_FUSED_T=0), graphs off only on request
@@ -1036,6 +1377,39 @@ def test_a_switch_left_on_does_not_pass_for_off():
     assert EC.switch_is_off("hist_prefill_weight", 1.0) and not EC.switch_is_off("hist_prefill_weight", 0.004)
     assert EC.switch_is_off("tail_checkpoint_interval", 0) and not EC.switch_is_off("tail_checkpoint_interval", 256)
     assert not EC.switch_is_off("tail_checkpoint_interval", True) and EC.switch_is_off("disk_uncache", None)
+    for name in ("mtp_batched_verify", "mtp_batched_update"):
+        assert EC.switch_is_off(name, False) and not EC.switch_is_off(name, True)
+    # The draft window: off is upstream's fixed window, and no test schedule
+    assert EC.switch_is_off("draft_window", "fixed") and not EC.switch_is_off("draft_window", "cost")
+    assert EC.switch_is_off("draft_window_schedule", None) and not EC.switch_is_off("draft_window_schedule", [3])
+    assert not EC.switch_is_off("draft_window_schedule", "3") and not EC.switch_is_off("an_unknown_switch", 0)
+    for name in ("EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE"):
+        assert name in EC.FORK_ENV_SWITCHES
+    # Content-addressed multimodal pages (master's, 2026-10-24): the generator's switch and the digests it
+    # turns on for the process
+    assert "EXL3_MM_CONTENT_HASH" in EC.FORK_ENV_SWITCHES
+    for name in ("mm_content_hash", "mm_content_digests"):
+        assert EC.switch_is_off(name, False) and not EC.switch_is_off(name, True)
+
+
+def test_scenario_1_with_every_switch_of_this_branch_off_says_nothing_about_switches():
+    plan = EC.build_plan(args_for("--scenarios", "1"))
+    res = fake_results(plan)
+    off = {"stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False, "tail_checkpoint_interval": 0,
+           "mtp_batched_verify": False, "mtp_batched_update": False, "draft_window": "fixed",
+           "draft_window_schedule": None, "hist_prefill_weight": 1.0, "qsa_raw_tail": 0, "disk_uncache": False,
+           "mm_content_hash": False, "mm_content_digests": False}
+    for rid, rec in res.records["s1-fork"].items():
+        if rec.get("op") == "generator":
+            rec["switches_state"] = dict(off)
+    assert not EC.capture_checks(plan, res).get(1)
+    res.records["s1-fork"]["g0"]["switches_state"]["draft_window"] = "cost"
+    text = "\n".join(EC.capture_checks(plan, res)[1])
+    assert "non tutti gli interruttori sono spenti (`g0`): draft_window" in text
+    res.records["s1-fork"]["g0"]["switches_state"]["draft_window"] = "fixed"
+    res.records["s1-fork"]["g0"]["switches_state"]["mm_content_digests"] = True
+    text = "\n".join(EC.capture_checks(plan, res)[1])
+    assert "non tutti gli interruttori sono spenti (`g0`): mm_content_digests" in text
 
 
 # --------------------------------------------------------------------------------------------
@@ -1109,7 +1483,14 @@ FAKE_LIB = {
                     self.side_stats = {"chunks": 0, "beside": 0, "piped": 0}
                     self.stagger_stats = {"steps": 0}
                     self.tail_stats = {"stashes": 0}
+                    self.mtp_batched_verify, self.mtp_batched_update = mtp_batched_verify, mtp_batched_update
+                    self.draft_window = draft_window
+                    self.num_draft_tokens = num_draft_tokens or 0
+                    self.mtp_verify_stats = {"windows": 0, "serial": 0, "fallbacks": {}}
+                    self.mtp_update_stats = {"folds": 0, "fold_drafts": 0}
+                    self.draft_window_stats = {"steps": 0, "scheduled": 0, "chosen": {}} if draft_window == "cost" else None
             if FORK:
+                draft_window_schedule = None
                 prefill_thread_state = property(lambda self: "on" if self.prefill_thread else "off")
                 prefill_pipeline_state = property(lambda self: "on" if self.prefill_pipeline else "off")
             def enqueue(self, job):
@@ -1241,7 +1622,8 @@ def write_tree(root, files, fork):
         os.makedirs(os.path.dirname(path), exist_ok = True)
         text = text.replace("@@FORK@@", "True" if fork else "False")
         text = text.replace("@@FORK_ARGS@@", "stagger_decode = False, prefill_thread = False, prefill_pipeline = False, "
-                                             "recurrent_tail_checkpoint = False," if fork else "")
+                                             "recurrent_tail_checkpoint = False, mtp_batched_verify = False, "
+                                             "mtp_batched_update = False, draft_window = 'fixed'," if fork else "")
         text = text.replace("@@FORK_WEIGHT@@", "def hist_prefill_weight():\n    return 1.0" if fork else "")
         with open(path, "w") as f:
             f.write(text)
@@ -1296,7 +1678,9 @@ def test_the_child_over_a_fake_library(tmp_path):
     assert recs["doc"]["jobs"]["r"]["prompt_tokens"] == 600
     # The fork's switches as the generator reads them, the disk tier written and read back
     assert recs["g0"]["switches_state"] == {"stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False,
-                                            "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0}
+                                            "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0,
+                                            "mtp_batched_verify": False, "mtp_batched_update": False, "draft_window": "fixed",
+                                            "draft_window_schedule": None}
     assert recs["g1"]["switches_state"]["stagger_decode"] is True and "disk_cache_dir" in recs["g1"]["kwargs"]
     assert recs["scan"]["flushed"] == {"pages": 1} and recs["scan"]["scan"]["pages"]["ab01"]["ok"]
     # The sweep: the library's own (past the server's wrapper), never during the runs
@@ -1304,6 +1688,26 @@ def test_the_child_over_a_fake_library(tmp_path):
     assert recs["reset"]["modules"] == 2
     status = json.loads((tmp_path / "proc-fork" / "status.json").read_text())
     assert status["op"] in ("unload", "close", "end", "start") or status["run"] is None
+
+
+def test_the_child_hands_the_mtp_decode_switches_to_the_generator(tmp_path):
+    steps = [
+        EC.gen_step("g0", 9, switches = {"verify": True, "update": True, "window": "cost", "schedule": [0, 3]}),
+        EC.run_step("free", 9, [EC.jobspec("a", "q0", 6)]),
+        EC.gen_step("g1", 9, switches = {"draft_tokens": 1}),
+    ]
+    out, recs = run_child(tmp_path, "fork", steps)
+    assert out.returncode == 0, out.stdout + out.stderr
+    st = recs["g0"]["switches_state"]
+    assert st["mtp_batched_verify"] is True and st["mtp_batched_update"] is True
+    assert st["draft_window"] == "cost" and st["draft_window_schedule"] == [0, 3]
+    assert not any(EC.switch_is_off(k, st[k]) for k in ("mtp_batched_verify", "draft_window", "draft_window_schedule"))
+    # The counters of the MTP decode, every window from 0 counted
+    stats = recs["free"]["stats"]
+    assert stats["verify"] == {"windows": 0, "serial": 0} and stats["update"] == {"folds": 0, "fold_drafts": 0}
+    assert stats["window"] == {"steps": 0, "scheduled": 0, "w0": 0} and recs["g0"]["num_draft_tokens"] == 0
+    # Another window than the process's, without an MTP head: refused
+    assert not recs["g1"]["ok"] and "draft_tokens" in recs["g1"]["error"]
 
 
 def test_the_child_refuses_a_library_that_is_not_the_one_asked_for(tmp_path):

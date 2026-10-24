@@ -1355,6 +1355,507 @@ an image session resumed from disk after its RAM checkpoints went in the same pr
 digest's own time on the workstation's Python (the server's IMG line times decode, forward and
 digest together: 520-569 ms for the 64-token image).
 
+### An MTP window verified with one readback (`Generator(mtp_batched_verify = True)`, `EXL3_MTP_BATCHED_VERIFY=1`)
+
+Off by default; with it off the generator behaves as upstream. For the MTP head (whatever window
+the step verifies while the head drafts, a hybrid round's included). In the server:
+`--mtp-batched-verify` (rule 31 of its `AGENTS.md`). Written on this base (2026-10-23); not run on
+the cards.
+
+**What upstream does.** With drafts the decode step samples a job's window a position at a time:
+a sampler call, then `Job.receive_sample`'s `.cpu()`, a readback that waits for the whole pass and
+the sampling behind it, and the next position only once the one before matched its draft; job
+after job. The path with one readback for the batch (`sample_pinned`, one synchronize) is only for
+steps without drafts. With one draft token, n jobs and the head's acceptance a: n (1 + a) readbacks
+a step for the sampling, plus the draft step's two blocking copies. Measured on the v1.5.4 base
+(staggered decode, above): a call's sampling is 2-2.7 ms per job, and the cards idle in the draft and
+sampling phases, 6-7.5 ms of a 23 ms call with 4 jobs.
+
+**What the switch does.** `Generator._verify_windows`, before the serial loop: every job that can
+(`Job.window_sampling_why` returns None) has its window sampled in one call (`Job.sample_window` →
+`CustomSampler.forward_window`), position r as `receive_logits` would sample it once `drafts[:r]`
+were accepted; the samples are compared with the drafts on the device and the drafts matched from
+the first are counted there (`cumprod`); samples and counts of every such job come back through one
+pinned buffer, in one copy and one wait (`_host_wait`: an event on the current stream of the logits'
+card, where the sampling and the copy are, not a synchronize of the whole card). The serial loop then
+takes those jobs' tokens from there and accepts by the count instead of comparing on the host; what
+it checks on the host still ends a window where it did: a recurrent checkpoint boundary (the tail
+checkpoint's included), a stop token, string or limit, a filter's end, a requeue, the loop detector.
+Positions sampled past where a window ends are never used.
+
+- *Masks.* Position 0's is the one `prepare_logit_mask` builds as before (the host side is now kept,
+  `Job.host_logit_mask`). For position r every filter is fed `drafts[:r]` (`Filter.feed`, journaled)
+  and asked for its mask, then all are rolled back (`Filter.rewind`) whatever happens in between
+  (`Job._window_masks`): only filters with a native rollback (`rollback_tokens` overridden:
+  `LLGuidanceFilter`) and no trigger token take this path, the others would replay their whole
+  journal. A draft the previous position's mask refuses cannot be accepted, nor can anything after
+  it; a draft that ends a filter with `eos_after_completed` ends the job if accepted: the rows after
+  either repeat the last one, never read. A filter that completes leaves the rows after it
+  unconstrained by it, as in the serial path. A filter that raises is put back and the job takes the
+  serial path that step (`filter_error`), with nothing drawn. The masks of positions that end up
+  rejected are computed for nothing: with one draft token, one mask more per step for a job with a
+  filter (the serial path computes them only for accepted positions).
+- *Past IDs.* The penalty kernels (`apply_rep_pens`, `apply_pres_freq_pens`) take one row, so a
+  stack whose steps read past IDs (`window_past_ids`) must have them in the head of a fused stack
+  (`window_head`): the head runs per row on the sequence followed by the drafts before it (one
+  upload: the drafts go after the sequence in the job's pinned buffer, past its watermark), the fused
+  tail once over all rows. The server's non-thinking set (presence 1.5) is such a stack; with
+  presence 0 the step is a no-op and no past IDs are read (although `reqs_past_ids` is set).
+- *The random stream.* One draw from the job's generator per window, where the serial path takes
+  one per position. The fused sampler keys its Philox noise on (draw, flat index), so row 0 gets the
+  noise the serial path would give that position with that draw, and every row's noise is
+  independent of the others': each position is sampled from exactly its distribution, and a seed
+  gives the same tokens run after run (for the same drafts, as the serial path), but other tokens
+  than the serial path with the same seed. Greedy sampling gives the serial path's tokens: each row
+  of the fused kernel is computed alone, its vocabulary blocks counted from the vocabulary size, not
+  the batch.
+- *Serial path*, per job and step (`mtp_verify_stats["fallbacks"]`, by reason): `first_token` (token
+  healing, and the first token, whose NaN check is a readback anyway), `forced_tokens`
+  (`constrain_output_now`), `probs` (`return_probs`, `return_top_tokens`), `banned_strings` (a
+  partial match holds tokens back and blocks what it explored at the next position), `min_new_tokens`
+  (stop tokens blocked, a limit the window could cross), `sampler` (a step that keeps state from one
+  call to the next, adaptive-P; one that draws from torch's generator, `SS_Sample_mn`; penalties not
+  in a fused head, e.g. with `EXL3_FUSED_SAMPLER=0`; a sampler that is not a `CustomSampler`),
+  `filter`, `filter_error`, `job` (a job without `window_sampling_why`).
+- *With the other features.* The staggered decode samples a group the same way, through its lane's
+  staging buffers. A prompt chunk on the prefill thread or in the pipeline shares the pass's stream,
+  so the wait waits for what the chunk issued before it, as any readback does (the event waits for
+  nothing on the other streams of the card, a synchronize would). The tail checkpoint cuts the
+  window on the host as before.
+- `readback_stats` counts, whatever the switches, the decode steps that sampled and the readbacks of
+  drafted and sampled tokens they and the MTP draft steps made (not a job's first token: its NaN
+  check and its timing are a wait each). `mtp_verify_stats`: windows sampled at once, windows left to
+  the serial path while the switch is on, the readbacks, the fallbacks.
+
+What it costs when it runs: one draw per window instead of per position (the stream above), the rows
+sampled past the first mismatch (a few kernels; with one draft token at most one row per job), the
+masks above, one upload of the drafts and one of the past IDs per step. Nothing written anywhere.
+
+Counted on the toy model (one in three drafts accepted, readbacks per step once every job has its
+first token): with one draft token 3.3, 4.7, 6.0, 7.3 readbacks a step for 1-4 jobs serially, 3 with
+the switch (the draft step's two blocking copies and one for the sampling); with two draft tokens
+5.5-9.8 serially, 5 with the switch. Production's acceptance is higher (about 0.79 with one draft
+token), so its serial count is higher. Not measured on the cards: what a readback costs there, and
+whether the cards' idle time in the sampling phase goes.
+
+Not checked beyond reading: a hybrid round's window, a TP model. An `LLGuidanceFilter` is checked on
+CPU only, with a byte-level tokenizer of the test's own (`tests/test_window_sampling.py`, below; the
+production tokenizer and grammar not). The compiled `fused_sampler` over a window, with and without
+per-row masks (its per-row form is upstream's, used for one row and for batches without drafts), has
+a GPU test in the same file, not yet run on the cards.
+
+**The window's distributions** (`tests/test_window_sampling.py`). Speculative sampling is exact only
+if every row of a window is sampled from exactly the distribution `receive_logits` would sample that
+position from once the drafts before it are accepted, and independently of the other rows. For the
+server's two stacks (thinking: temperature 1.0, top-P 0.95, top-K 20; non-thinking: temperature 0.7,
+top-P 0.8, top-K 20, presence 1.5), over 4-row windows of designed logits (the token crossing P
+carries 3.5% of the mass or more and the cumulative mass is at least 0.01 from P on both sides of it,
+in fp32 and fp16, so rounding cannot move the kept set; the non-thinking rows told apart only by the
+drafts in their past IDs), with and without a mask per row (rows 1-3 each banning a token of their
+kept set, a different rank in each, row 0 none):
+- row 0 against a one-row `forward()` with the same seed: the same token, bit for bit (512 seeds per
+  stack, dtype and mask; on the card with the compiled extension, on CPU over a float64 stand-in);
+- every row's frequencies against the exact distribution computed in float64 (temperature first,
+  top-K, then top-P keeping the token that crosses it, 1.6.3's convention): no token outside the
+  kept set, every token within 5 standard deviations of its probability, and a chi-square over the
+  kept set (bins under 5 expected merged) with a p-value above 1e-6; 16384 windows per case on the
+  card, 4096 over the stand-in;
+- rows 0 and 1 (the same logits before the penalty and the mask) independent: a chi-square over
+  the 4 x 4 table of their top-3 tokens and the rest, p above 1e-6;
+- greedy windows give each row's argmax.
+The same checks fail, over the stand-in, for noise shared across rows, for 1.6.2's top-P (the
+crossing token dropped), for noise offset by a row, for a mask row given to the wrong position and
+for drafts missing from a row's past IDs. With `llguidance` installed, a real `LLGuidanceFilter`
+(a JSON grammar over the test's tokenizer): it takes the window path, and `Job._window_masks` gives,
+position by position, the masks the serial path builds after accepting the drafts before it; a
+refused draft's rows repeat row 0, a draft that completes the grammar leaves the rows after it
+unconstrained (`eos_after_completed` false) or repeats its row (true). The GPU tests skip without
+CUDA and the compiled extension; on the card the file makes about 74000 sampler calls, about a
+minute and a quarter at 1 ms a call (assumed, not measured), plus the CPU tests' minute and a quarter:
+
+    PYTHONPATH=/home/daniele/Desktop/exllamav3 /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_window_sampling.py -q
+
+Tests (no GPU, no extension): `tests/test_mtp_decode.py`: the generator over the toy model of the
+staggered tests (the same tokens and the same drafts accepted as the serial path, with 1-3 draft
+tokens, staggered, with checkpoint cuts and requeues, jobs declining or failing beside the others);
+readbacks counted on tensors that stand for device memory (every host read of one, every explicit
+wait, every synchronize), against `readback_stats`; the real `Job`'s masks against the serial
+path's, position by position, packed and dense, a refused draft, a filter that completes, ends the
+job or raises, the past IDs, the reasons; the real sampler's `forward_window` over a stand-in for the
+extension against its own `forward()` one row at a time (greedy, masked, with presence), the first
+row's draw, the stacks that qualify. Marked `nogpu`; run with `--noconftest` without the compiled
+extension.
+
+### The MTP head's update and next draft in one pass (`Generator(mtp_batched_update = True)`, `EXL3_MTP_BATCHED_UPDATE=1`)
+
+Off by default; with it off the generator behaves as upstream. For the MTP head. In the server:
+`--mtp-batched-update` (rule 31 of its `AGENTS.md`). Written on this base (2026-10-23); not run on
+the cards.
+
+**What upstream does.** The head drafts position K+1 from the token at K and the target's hidden
+state at K-1, writing its own cache at K (`iterate_draftmodel_mtp_gen`). After the verification,
+every job that accepted A-1 > 0 drafts gets a head pass of its own over K+1..K+A-1, the accepted
+drafts paired with the target's hidden states at K..K+A-2 (`draft_model.prefill`, one job after
+another); the job keeps the target's state at K+A-1 (`mtp_last_hidden`), and the next iteration
+starts with a draft pass over every job at K+A. Each draft token is read back twice, into the drafts
+and into the inputs of the next draft token, both blocking copies. With one draft token and n jobs:
+up to n + 1 head passes and two readbacks a step.
+
+**What the switch does.** After the verification (`Generator._mtp_update`):
+
+- A job that goes on generating is folded (`_mtp_fold`): one pass of the head over every such job,
+  positions K+1..K+W+1 (W the window), the token at K+i paired with the target's state at K+i-1: the
+  accepted drafts for i < A, the token sampled after them for i = A, the rejected drafts and a filler
+  past it. The head's output at K+A is what the next draft pass would compute: the first draft is
+  taken from there (`sample_from_state` on those rows only) and kept on the job with the position it
+  was made at (`Job.mtp_fold`), with the head's state there for the draft tokens after the first.
+  Nothing is read back. The next draft step (`_mtp_take_folds`), when every job of the step has a
+  fold made at the position it stands at, reads them back in one copy, into the drafts and from
+  there into the next draft token's inputs, and runs the head from the second draft token on (with
+  one draft token, not at all). Otherwise the head drafts for every job, as without the switch, and
+  every fold is dropped: a fold is for one draft step. The head's cache then holds at K..K+A what the
+  head pass per job and the next draft pass would have written (the draft pass at K+A writes it again
+  with the same inputs).
+- Jobs that accepted drafts and are not folded get one batched pass over K+1..K+S, S the most drafts
+  a row accepted (`_mtp_update_pass`): a job that ended or was requeued (the pages of a job that ends
+  may stop at K+W), and every job in a step whose window is not the head's own (a hybrid round, the
+  confidence-calibrated draft, which drafts token by token and exports confidences). A job a
+  banned-string rewind abandoned gets neither, as without the switch (its carry is gone; drafting
+  pauses until the next target pass). `mtp_last_hidden` is set as before for every job, so the
+  regular draft pass can always run.
+- With the switch the regular draft loop also takes the next draft token's inputs from the copy it
+  just read back (host to host), not from a second readback.
+
+**Why writing past a job's accepted tokens is harmless.** The head's cache has the target's page
+layout (one page table, `draft_cache.max_num_tokens == cache.max_num_tokens`), and attention reads
+stop at each row's position (`cache_seqlens` plus the pass's own tokens). A job's position only moves
+forward from K+A, and every position it moves through is written again before a pass reads it: the
+next pass that reaches a position writes it first, as the verification pass writes over the target
+cache's rejected drafts. The pages are the job's: up to K+W the verification pass wrote them; K+W+1
+only for a job that goes on, whose next verification writes up to K+A+W, and `_fold_fits` checks the
+page table and the block table all the same (a position on a page outside them would be written
+through a zeroed block-table entry, page 0). Rewinds: a banned-string rewind is never folded; a
+requeue is never folded and comes back as a new prompt whose ingestion updates the head over it. With
+the staggered decode a group is folded when it is sampled, through its lane's staging buffers, its
+jobs' pages its own; the pass is issued where the per-job passes were, between two halves of the
+other group, which has its own copy of the embedding's pinned output (the cursor's); the fold is read
+back at the group's next draft step, as the draft pass was. A fold of r jobs is r x (1 + W) rows, the
+verification pass's count, which the prefill thread already counts against `side_max_rows`
+(`_decode_rows`), so a chunk's head update and a fold meet inside the head's modules no more than a
+draft pass and a chunk did.
+
+**Exactness.** Speculative decoding keeps the target's tokens whatever the drafts. The head's cache
+gets the same inputs as without the switch, in passes of other shapes (r x (1 + W) rows instead of
+1 x (A - 1) and r x 1): on the cards its values can differ in the last bits, so its drafts, the
+acceptance, and with them which target pass computes a position can differ. With greedy sampling
+the tokens are then the same only as far as the target's logits at a position do not depend on the
+pass that computes them (the exact check says; the serial path of upstream has the same exposure to
+a draft that changes).
+
+What it costs when it runs: the fold's rows past each job's accepted tokens (with one draft token,
+one or two positions per job, in a pass that replaces two), the head's attention and MoE at a new
+shape r x (1 + W) (the graph-captured decode paths capture a graph per shape: more graph slots on the
+head's card, the first card, where VRAM is shortest), the rows of the batched update past a row's
+own accepted drafts. Nothing written anywhere.
+
+Counted on the toy model (one in three drafts accepted): one head pass a step instead of 1.3-3.3 for
+1-4 jobs with one draft token (2 instead of 2.3-3.3 with two); readbacks a step 2.3-6.3 with this
+switch alone and 2 with both switches (3 with two draft tokens), for 1-4 jobs, regular or staggered.
+Not measured on the cards.
+
+Not checked beyond reading: a tensor-parallel target (the fold calls the head and its
+`sample_from_state` as the draft step does), MiMo's depth-specialized heads (the fold is a depth-0
+step, `draft_step = 0`, as the update and the first draft step are), the graph captures above.
+
+Tests (no GPU, no extension): `tests/test_mtp_decode.py`. A toy MTP head with a paged cache of its
+own, in the target's page layout: a pass writes each position's token and hidden state, then
+computes each output from the 16 slots before it; a slot must hold the job's token at that position
+and the hidden state the target exported at the one before (or be a later draft step's own write,
+read within its round), else the head drafts a token no target samples. With and without the switch
+(and with the window verified at once): the same tokens and the same drafts accepted as without it,
+no such draft, with 1-3 draft tokens, staggered, across requeues and checkpoint cuts, jobs joining
+(the head drafts for all), folds refused by the page check; the check catches a missing update and a
+draft taken at the wrong position; readbacks and head passes counted. Marked `nogpu`; run with
+`--noconftest` without the compiled extension.
+
+### The MTP draft window chosen from a measured cost curve (`Generator(draft_window = "cost")`, `EXL3_DRAFT_WINDOW=cost`)
+
+Off by default (`"fixed"`); with it off the generator behaves as upstream. For the MTP head. In the
+server: `--draft-window cost` (rule 32 of its `AGENTS.md`). Written on this base
+(2026-10-23), on top of the two switches above; not run on the cards.
+
+**What upstream does.** Every decode step verifies `num_draft_tokens` drafts per job. The
+confidence-target draft (`dynamic_draft_tokens`) stops the head's loop once every row's running
+product of estimated acceptance falls below a fixed target (0.4), whatever a position costs. What
+it costs on this machine (production on 1.6.3, one request, 15-23k context): W=1 30.1 ms a step for
+1.79 tokens, W=3 43.1 ms (37-41 once warm) for 2.52, about 5 ms per drafted position; predictable
+stretches reach 70-84 tok/s at W=3 against about 59 at W=1, the rest lose. The decode paths' fast
+kernels serve up to 8 rows (jobs x (1 + W): MoE fused decode, hyperconnections), so the curve has a
+cliff: W=2 with three jobs, W=1 with five. One window serves a whole batch (or a staggered group).
+
+**What the switch does** (DeepSeek's DSpark policy, with the head's own confidence in place of a
+trained head; `generator/draft_window.py`). Each step takes the window W that maximizes
+
+    (n + sum over the n jobs of a_j1 + a_j1 a_j2 + ... + a_j1 ... a_jW) / T(n, W)
+
+- *Estimates.* a_jk is job j's k-th draft's acceptance given the ones before, from its winning
+  logit through a `DraftConfidenceCalibrator` of the policy's own (the dynamic draft's bins and
+  decay; the target it is made with is not used). The head exports the logit with each position
+  (`export_draft_conf`), and it comes back with the drafts: a non-blocking copy into pinned memory
+  just before the drafts' blocking readback on the same stream (`_dw_stage_conf`). The fold of
+  `mtp_batched_update` exports it too, kept on the job with the draft, and `_mtp_take_folds` reads it
+  back in the drafts' copy. No readback of its own: `readback_stats` counts the same per drafted
+  position as before.
+- *Labels.* Every verified position: with the window sampled at once (`mtp_batched_verify`) the
+  target's sample at position r was made as if `drafts[:r]` were accepted, so every position of the
+  window is a label, past the first mismatch too (with a filter, up to it: past a refused draft the
+  rows repeat the last mask); serially, the accepted ones and the first that was not. A step that
+  verifies nothing labels the first draft with the token the target sampled, so labels never stop
+  (a calibrator that decays without labels goes back to its burn-in, whose estimate is 1.0: tried,
+  it oscillated). Soft labels (the target's probability of each draft, DSpark's calibration) are
+  not used: the fused sampler does not expose the processed distribution, a raw softmax would be
+  wrong for greedy requests and for top-P/top-K stacks, and the hard labels of whole windows give
+  n x W labels a step (the calibrator's burn-in, 64 labels, is a few steps).
+- *The choice, as the head drafts.* The head drafts a position at a time, each with a readback
+  already. After each position the windows drafted so far are scored with their estimates, the
+  longer ones with a prediction (each job's next positions as likely as its last one), and drafting
+  stops once no longer window is predicted to beat the best one drafted (`DraftWindowRound`). A
+  position drafted and then not verified (its estimate turned out low) is a head pass for nothing,
+  and such a step is not timed.
+- *W = 0.* Allowed: past the 8-row cliff (five or six jobs, production runs `max_batch_size` 6)
+  only W = 0 stays under it, and a stretch the head gets wrong pays nothing for its rows. The head's
+  first draft is still made (its pass writes the head's cache at the job's position, and its logit
+  decides between 0 and more; with `mtp_batched_update` it comes from the last fold at no cost); the
+  step then takes upstream's path without drafts (one token per job, one synchronize).
+- *T(n, W).* The median of the last 32 wall times of steps with n jobs and window W, regular and
+  staggered steps apart. A step is timed from the end of the last decode step's sampling to the end
+  of its own (`time.perf_counter()` where the host has just waited for the pass: after
+  `_verify_windows`' wait with the switch, after the serial path's last readback without), so it
+  holds everything a step costs, the last step's head update and what the caller does between two
+  `iterate()` calls included. It is kept only when nothing else ran in it (`_dw_end`): the same jobs
+  (none started, ended, requeued or cancelled), no prompt ingested in the iteration, no tail
+  checkpoint taken, no cap on the window, no position drafted past the window, and in a staggered
+  decode a call that also issued the next group (a staggered call's time goes to the group it
+  sampled, whose window was chosen a call earlier). The first time of each (n, W) is dropped (the
+  first step at a shape captures its graphs); a change of either MTP decode switch forgets the curve.
+  The cliff is read from the times, not written anywhere.
+- *Exploration.* A window with fewer than 4 times for these jobs is taken to time it (the one with
+  the fewest first, only in a step that can be timed); a window the policy does not take is timed
+  again after 512 steps, then after twice as many each time it still is not taken, up to 16 x 512,
+  one such refresh at most every 32 steps: a window past the cliff is taken about six times in 20000
+  steps once known (`tests/test_draft_window.py`). Until a window is known for these jobs the
+  policy takes the longest, as without it; until the calibrator has its labels the estimates are 1.0.
+- *A prompt chunk beside the decode* (`prefill_thread`, `prefill_pipeline`). A chunk may overlap a
+  decode step of at most `side_max_rows` rows (8). `_decode_rows` counts the step at the narrowest
+  window the policy may take, and while a chunk is under way the draft step caps the window so that
+  n x (1 + W) stays within it (`_dw_begin`): with three jobs and W up to 3, chunks now run beside a
+  decode of W <= 1, where at a fixed W=3 (12 rows) every chunk was waited for. With the hybrid draft
+  the count stays at the widest (its window is decided after the prefill round).
+- *With the head's update in one pass.* `_mtp_fold` folded only a window of `num_draft_tokens`
+  without the calibrator. Its content does not depend on who drafted (position K+i pairs the token
+  there with the target's state at K+i-1) and its width is the step's, so a window the policy chose
+  is folded whatever its width; a window of 0 over K+1 (the head's cache at K was written this step,
+  by the draft pass or by the fold whose draft the step took). Each window is then a shape of the
+  fold as well as of the verification pass.
+- *Other features.* The staggered decode chooses a window per group, at its draft step. A hybrid
+  round that replaces the window is not the policy's: not timed, not labelled, not folded. Checkpoint
+  boundaries, the tail checkpoint, stop conditions and requeues cut a window on the host as before;
+  a banned-string rewind gives no labels. The confidence-target draft is not used while the policy
+  is on. The switch can be flipped between steps (attribute of the same name).
+- *Exactness.* Speculative decoding keeps the target's tokens whatever the window. A position is
+  then computed by verification passes of other widths from step to step; on the cards their logits
+  can differ in the last bits (the exposure two fixed windows already have against each other), so
+  greedy text is the same only as far as no near-tie falls there. Scenario 9 of the exact check
+  (below) exercises the policy, under the test hook of the next point.
+- *A test hook, not for production: a window schedule* (`EXL3_DRAFT_WINDOW_SCHEDULE`, e.g. `3` or
+  `0,1,2,3`; `Generator.draft_window_schedule`, a list or such a string, None for none). The windows
+  the policy takes depend on the step times it measures and on what it explores, so two processes,
+  or two runs in one, take different windows, and a run is not repeatable. With a schedule every
+  decode step takes the next window of it, cycled per step (a staggered decode's group counts as a
+  step), whatever the estimates, the times and the exploration; the window is clipped to what the
+  step allows (`draft_window_set`, `num_draft_tokens`, and the cap beside a prompt chunk: the largest
+  allowed window not above the scheduled one, else the smallest allowed), and the head drafts exactly
+  that window (a window of 0 still drafts its first position, as above). Everything else is the cost
+  path's: the confidences exported, the labels, the step timed when clean, the fold, the readbacks;
+  `draft_window_stats["scheduled"]` counts such steps (not `explored`). The schedule starts again
+  from its first window when the generator is given a job while it has none, and when it changes.
+  Only with `draft_window = "cost"` (a fixed window takes no window from anybody; the generator says
+  so at construction). Unset (the default, and production) the policy never enters the hook's code
+  (`tests/test_draft_window.py::test_without_a_schedule_the_hook_is_never_entered`: the same rounds
+  and the same stats with the hook replaced by one that raises).
+- `draft_window_set` (`EXL3_DRAFT_WINDOW_SET`, e.g. `0,1,3`) limits the windows; default 0 to
+  `num_draft_tokens`. Above it nothing is taken (buffers and the cache's `max_history` are sized by it).
+- `draft_window_stats`: steps, windows taken (`chosen`), explored, scheduled, capped, overridden, timed, positions
+  drafted, verified and accepted, expected against realised tokens of the steps it chose freely,
+  labels, `curve` (`"r:n:W"` -> samples and median ms) and the calibrator's state.
+
+What it costs when it runs: the head's winning logit (`max` in place of `argmax` over its logits),
+one non-blocking copy of n floats per drafted position, Python per step (the policy's part, 22 us a
+step with three jobs and 20 bins on the development machine), a head pass now and then for a
+position not verified. On the cards each window
+is a shape of its own: with windows 0-3 the verification pass takes 1-4 tokens per job instead of
+the one width of a fixed window, and the fold as many (graph slots of the attention and statics per
+shape and card, the head's on the first card, where VRAM is shortest: not measured; a window of 0
+is a 1-token verification shape production never ran with MTP). The main cache needs
+`max_history = num_draft_tokens` as for a fixed window of that size: on this base the recurrent
+state is two rows per slot whatever `max_history` (1.5.4 kept a whole state per history step: the
+111 MiB a token and slot of the server's rule 5); what grows is each GDN layer's conv ring and
+staged scan inputs, 4 x fdim_qkv + 6 x num_v_heads bytes per layer, slot and history token
+(`GDNLayerState`), on Flash-Next (36 GDN layers, fdim_qkv about 10k, 48 value heads: from its
+57 MiB checkpoint) about 1.4-2 MiB per slot and draft token, 17-24 MiB with six slots from 1 to 3
+draft tokens. Nothing written anywhere.
+
+On the toy (`tests/test_draft_window.py`, acceptance one in three at every position, a clock the
+target's pass moves by a synthetic cost of its shape): one job on a flat curve takes W=3, two jobs
+on a steep one W=0, three jobs on a curve with a cliff past 8 rows W=1 and the windows past the
+cliff only to time them; expected tokens within 10% of realised. The toy's acceptance is not
+production's (about 0.79 at the first position, about 0.58 after it from the 1.6.3 run above), so
+it says nothing of the tok/s on the cards.
+
+Not checked beyond reading: a TP head's confidence (`tp_dispatch_lm_head_argmax(return_max = True)`);
+a head that exports no confidence (the Qwen 3.5/3.8 heads do, through the target's head) gets the
+calibrator's overall rate, which without labels stays 1.0, so the policy then weighs every draft as
+certain; the graph shapes' VRAM, whether the step time's median is stable enough on the cards with the
+prefill thread and the expert sweeps around it.
+
+Tests (no GPU, no extension): `tests/test_draft_window.py`: the policy on its own (the curve's
+medians, clean steps only, the first dropped; flat curve, steep curve with low acceptance, a cliff,
+the head stopping early, jobs counted together, no measure, restricted windows, a cap, the switches;
+20000 simulated steps: every window timed, the cliff rarely after); the generator over the toy with
+a clock its passes move: the same tokens with the policy as without, with 1 and 3 draft tokens, with
+and without either MTP decode switch, staggered, switched on and off while jobs run; the window
+following flat, steep and cliffed curves; the head's confidence deciding step by step; every
+readback counted, one per drafted position and one for the sampling with both switches; the window
+capped beside a prompt chunk on the prefill thread, the chunks running beside where a fixed W=3
+waits for them; the test hook: its parsing, the schedule taken in order whatever the estimates,
+clipped to the windows allowed and to the cap, started again with each stretch of work and when it
+changes, never entered without a schedule, and over the toy generator with schedules `3`,
+`0,1,2,3` and `3,0,3,1`, with and without either MTP decode switch, one to four jobs, staggered: the
+same tokens as a fixed window, the windows taken those of the schedule, the positions drafted
+`max(1, W)`. Marked `nogpu`; run with `--noconftest` without the compiled extension.
+
+### Raw keys of the block being built only (`Cache(qsa_raw_tail = True)`, `EXL3_QSA_RAW_TAIL=1`)
+
+Off by default; with it off the cache layers, the kernels and the decode graph are upstream's. For
+the QSA attention layers of Qwen3.8-Flash-Next (12 of its 48 layers, and the MTP head's). The switch
+is the cache's, read when the `Cache` is made, so before the model loads: `Cache(qsa_raw_tail = True)`
+(or a ring size in tokens), else `EXL3_QSA_RAW_TAIL=1` in the environment. In the server:
+`--qsa-compact-raw-keys` (rule 33 of its `AGENTS.md`), passed to both caches only by a library whose
+`Cache` takes the argument. Also in `doc/env_vars.md`.
+
+**What upstream keeps.** `cache/qsa.py`, `QSAPlanes`: per page and QSA layer a raw indexer key for
+every token (`raw_k`, 256 x 128 fp16, 64 KiB) beside the pooled keys (one per 4-token block,
+16 KiB). The raw plane has one reader, the pooled-key rebuild of the blocks an append touches
+(`_qsa_pool_update_kernel`: in the decode graph's slots, `attention.cpp` with the plane `set_qsa`
+was given, and in `QSAIndexer.update_planes`), and of those blocks only the one the append starts
+in has raw keys from before the append: at most compress_ratio - 1 = 3. The other uses of `raw_k`
+in the library: `bc_attn.py` hands the plane to the slot, `attn.py` zeroes page 0 for the
+autosplit's measuring pass, `build_mask` and the `*_ref` functions are the parity tests' torch
+references (the non-cached path projects its raw keys and pools them without a plane). At
+production's 370k-token cache that is 1445 pages x 64 KiB = 90 MiB per layer, 1.06 GiB for the 12
+layers (5 on the first card, 7 on the second with production's device split) and 90 MiB more for
+the MTP head (first card), plus 64 KiB per QSA layer in every page image the CPU and disk tiers
+store.
+
+**What the switch does.** The raw plane becomes a ring of 32 tokens per page (`RAW_TAIL_DEFAULT`;
+8 KiB per page and layer): token t of a page at slot t % 256 % 32, i.e. the last 32 positions
+written to the page. With 32 it saves 56 KiB per page and layer: at 370k 79 MiB per layer, about
+474 MiB on the first card (5 layers and the MTP head) and 553 MiB on the second (computed from the
+shapes, `QSAPlanes.raw_tail_saved_bytes`; `Cache` prints the total). Three kernels in
+`modules/attention_fn/qsa_triton.py`, sharing the full plane kernel's arithmetic statement for
+statement (`_qsa_pool_tail_block`: fp32 sums in token order, mean -> fp16, norm -> fp16, rope in
+fp16), so the pooled keys, the block selection and the attention output are bit for bit the full
+plane's:
+
+- `_qsa_raw_tail_append_kernel`: the append, the last 32 rows of each sequence written.
+- `_qsa_pool_update_ring_kernel`: the decode graph's pool update, every raw key read from the ring,
+  after the append. It takes the full plane kernels' runtime arguments, in the same order, so the
+  slot launches it unchanged; the slots' appends (up to 16 rows, `MAX_QLEN`) and the 3 tokens
+  before them fit 32 distinct slots (`BCAttn._configure_qsa` asserts it per slot).
+- `_qsa_pool_update_rows_kernel`: `update_planes`' pool update, for appends of any length (prompt
+  chunks, the eager fallbacks): the append's own raw keys from the staged rows, the 3 before it from
+  the ring. It runs before the append, whose writes may take those slots (a chunk's last 32
+  positions can share slots with the block it started in).
+
+**Where the ring holds what is read.** When an append starts at p, the ring must hold the raw keys
+of [p - p % 4, p) as their last writes left them. A page is written in order from its start, so
+that holds unless something wrote 32 positions further on in the same page since. The cases:
+
+- *Speculative passes.* A pass of L rows at p is taken back to p' > p (the token it follows is
+  kept), after positions up to p + L - 1 were written: the next pass reads [p' - 3, p'), so
+  L + 3 <= 32, the same bound as a graph slot's. The generator checks its widest pass
+  (`max_draft_tokens + 1`: the MTP, n-gram or hybrid draft window) against the ring of both caches
+  when it is made (`check_raw_tail`, a ValueError): with 32, at most 28 draft tokens (production:
+  1). The MTP head's cache writes its drafts one row at a time at K..K+W-1 and then the accepted
+  K+1..K+A-1 again from the target's states: the same bound.
+- *Banned-string rewinds.* GDN states have no in-place rollback (`rollback_capacity` 0), so on
+  Flash-Next a rewind restores a page-aligned checkpoint and replays, rewriting every position from
+  there. A model without recurrent states rewinds by truncation, to any depth; and its prompt
+  cache copies a partial page (`Job._prefill_co`'s partial-page reuse, `copy_page` with a token
+  count off a block boundary) and goes on in the middle of a block. `Cache` refuses the ring for
+  such a model with a warning and keeps the full plane; also for a model whose prompt passes can
+  run past a chunk's end and be taken back (`atomic_mm_prefill`). No QSA model is either today.
+  The MTP head has no recurrent states of its own (`Qwen4ExpMTPModel`'s caps) and its cache
+  follows the target's: an MTP head's cache takes the ring, and the generator refuses to start
+  (`check_raw_tail`, `raw_tail_refusal` of its own model) if its model is one of the two.
+- *Prompt cache, page sharing, tiers.* Only complete pages are reused (by hash in VRAM, from the
+  CPU tier, from the disk tier), shared between jobs or stored, and a job starts at a page boundary;
+  so do a requeued job, a resume from a tail checkpoint and a replay. A complete page's raw keys
+  are never read again. `copy_page` copies the whole ring row (its one partial-page caller is the
+  refused case above).
+- *Defrag* rotates `get_tensors()`, which leaves the ring out: it runs with no page referenced, and
+  a partial page's ring is read only by the sequence writing it.
+- *Tensor parallelism.* `tp_export` carries the ring to the rank that holds a QSA layer whole (the
+  ring is the same per-layer storage there). Not run.
+
+**Page images and the disk tier.** The ring is not in `get_tensors()`, so the CPU tier's slots and
+the disk tier's page files lose the raw keys: 64 KiB per QSA layer (832 KiB with the MTP head's
+layer) of every page image. The disk tier's fingerprint covers the image layout
+(`cache_fingerprint`'s `segments` and `image_size`), so the switch on and off are two fingerprint
+directories: a page of one layout is never read under the other; going back opens the old one, and
+the one not in use keeps its share of the root's budget until removed (rule 27 of the server).
+
+- `Cache.qsa_raw_tail` is the ring in effect (0: off, refused, or no QSA layer); a layer's
+  `raw_tail` the same per layer. `util/memory.py`'s report counts the ring as cache.
+- `update_planes_ref` (the torch reference of the parity tests) has the ring's form too.
+- The ring's size can be chosen (`qsa_raw_tail = 64`, `EXL3_QSA_RAW_TAIL=64`) for longer drafts;
+  below 19 tokens (16 + 3) it is refused.
+
+**What has been checked, and where** (2026-10-23, the development machine, no GPU): the kernels in
+Triton's interpreter against the full plane's, the same random appends into both, the pooled planes
+compared bit for bit after every append (prompt chunks of 1 to 4096 tokens starting inside blocks
+and pages, decode passes of up to 16 rows with drafts rejected and accepted, the MTP head's
+pattern, a replay from a page boundary, pages taken over by another sequence and shared by prefix,
+several sequences per call, with and without a pass-through part in the pooled keys' rope), the
+graph slot's launches with the slot's own arguments, the eager path through `update_planes`
+itself; two checks that the comparison sees a difference (the eager kernels in the other order; a
+pass longer than the ring serves). Then `BCAttn._configure_qsa` compiling for sm_120 with the
+triton wheel's ptxas: the ring's kernels in place of the full plane's with the same runtime
+signature, and the floating-point instructions of the ring's pool updates (graph and eager) the
+same as the full plane's, in the same order, modifiers included. Nothing has run on the cards: the
+compiled kernels' results there, the C++ slot launching them, the memory freed per card, and a
+real model's outputs with the switch on and off are the GPU check below.
+
+**The GPU check** (on the workstation, production stopped, this branch checked out in
+`~/Desktop/exllamav3`; fish, one line each). First the kernels on the card against the full
+plane's, no model (with CUDA the test file runs them there; it needs `pytest` in the environment):
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_qsa_raw_tail.py -q
+
+Then the model, scenario 8 of the exact check: the plan and the checks, then the run (about 13
+minutes by the estimate: two loads). `REPORT.md` in the run directory says, per compared run,
+whether the logits are identical bit for bit with the ring and without, and per card the memory
+each load left free, the difference and what the library says the ring saves:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --scenarios 8 --out /home/daniele/exl3-exact-check-qsa
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 8 --out /home/daniele/exl3-exact-check-qsa
+
+Tests: `tests/test_qsa_raw_tail.py` (no GPU, no extension; the kernel tests need triton, and run on
+the card where CUDA is available: on the workstation they are the first GPU check). Marked
+`nogpu`; run with `--noconftest`. On a machine with no CUDA the file switches Triton's interpreter
+on for the session when it is the first to import triton (the switch is read at the import); the
+compile checks run in a process of their own.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
@@ -1383,7 +1884,80 @@ off, the next turn resumed from it in RAM and after a restart from the disk tier
 labelled identical or within the noise; (6) the placement weight unset against stock, the same
 sweeps after the same traffic; (7) ten minutes of concurrent traffic with every production switch
 on, a watchdog on every library call (faulthandler: stacks of all threads in the process's
-`hang-stacks.txt`).
+`hang-stacks.txt`). On request (`--scenarios 8`, not in the default list): (8) the QSA
+raw-key ring, the same forced runs in a process with the full raw plane and one with
+`EXL3_QSA_RAW_TAIL=1` (a document of 12386 tokens past the sparse threshold with a forced answer of
+512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
+from the disk tier), expected identical against the full plane's process repeated, and the memory
+each load left free per card beside what the library says the ring saves (about 13 minutes by the
+estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below.
+
+**Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
+loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
+with the server's `--draft-num-tokens` at that value) with the batched verify, the batched head
+update, the cost window and the raw-key ring, on top of what production already runs (staggered
+decode, prefill thread, pipeline, tail checkpoint, the MTP head on the first card, the layer split of
+`--device-split`). The MTP switches are `Generator` arguments, so one process with the full raw plane
+holds a generator per set (`off`: none of the four; `v`: verify; `u`: update; `vu`: both, fixed W;
+`s3`: both, cost window under the schedule `W`; `mix1`, `mix2`: both, cost window under the
+schedules of `--s9-mixed`, `0,1,2,3` and `3,0,3,1`; `w1`: none, one draft token); the ring is a cache
+layout made at the load, so a second process with `EXL3_QSA_RAW_TAIL=1` holds `s3` alone. The windows
+come from the test hook of the draft window section: the policy left to itself chooses from step
+times, and no two runs would compare. The workload of every set: a job alone (256 tokens), a batch of
+three (staggered), a document of 12386 tokens ingested beside two jobs generating (prefill thread and
+pipeline: two jobs of 1 + 3 rows stay within the 8 rows a chunk may overlap, so the chunks run beside
+and the cost window's cap, 8 // 2 - 1 = 3, clips nothing), then the next turn resumed from the pages
+in VRAM. Free runs are greedy and compared as far as their tokens go together (the position where
+they part is compared for its logits only; a difference of the sampled token with identical logits
+up to there is the sampling's, reported as such); forced runs take the tokens of `off`'s first free
+run. A forced job takes the serial path of the verify (`forced_tokens`), so only free runs exercise
+it, and the child digests a window sampled at once row by row, each position as the serial path
+would have recorded it (`sample_window`, then `receive_sample` per position). The comparisons, each
+group with its own table in the report and its expected verdict:
+- (a) verify on against off, greedy free runs, update off (`v` against `off`) and on (`vu` against
+  `u`): only how the sampled tokens come back to the host changes, and each row of the fused sampler
+  is computed alone, so **identical** (logits, free tokens, drafts); an error if the run with verify
+  sampled no window at once.
+- (b) the cost window under the schedule `W` against the fixed W (`s3` against `vu`), free and
+  forced: the same computation through the other path (the head drafts a position at a time with its
+  confidence, the round stops at exactly W, the policy's times and labels go on deciding nothing):
+  **identical**.
+- (c) mixed schedules against the fixed W, forced: a position is computed by passes of other widths
+  and rewound by other amounts, so **within the noise** against the shape meter (the same library,
+  the same forced tokens, W=1 fixed against W=3 fixed: the rounding upstream itself shows when the
+  verified rows change); a wrong rewind of the recurrent state or of the head's cache with windows of
+  varying length would be far beyond it. An error if the schedule did not decide the steps or one
+  window only was taken. The first mixed schedule repeated in the same process: **identical** (its
+  floor; the document's job left out, since it joins the batch at a step that depends on time).
+- (d) the batched head update on against off, fixed W, verify off (`u` against `off`, forced): the
+  head's cache gets the same inputs in passes of other shapes, so its drafts and with them which pass
+  verifies a position can change: **within the noise** against the shape meter, drafts reported,
+  not judged; an error if no update was folded.
+- (e) the ring against the full plane with production's MTP switches (`s3` in both processes, free
+  and forced): **identical**, against `s3` repeated in the full plane's process.
+- (f) everything on (the ring's process, `s3`) against everything off (`off`, fixed W), forced: a
+  control row, **within the noise** against the shape meter (which also holds the noise between two
+  processes that scenario 1 measures).
+The decoders beside the document are compared only up to where the document joined the batch in
+both runs (when a chunk is recorded depends on time); the turn requires a resumed prompt, the batch a
+staggered call, the document's rows a chunk beside the decode with the thread and the pipeline on.
+The report's table of runs gives, per run, the windows sampled at once and left to the serial path,
+the folds, the scheduled steps, the windows taken, the drafts accepted and rejected, the chunks
+beside and in flight. Then the memory each load left free per card (the ring's), the placement and
+the libraries, as in scenario 8. The disk tier is not in this scenario (scenario 8 has the ring's
+turn from the disk).
+
+**The switches.** A switch of this branch left off in a process with every switch off must read as
+off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches
+(`mtp_batched_verify`, `mtp_batched_update` off), the draft window (`"fixed"`, upstream's) and the
+schedule (none), next to the earlier ones; `EXL3_MTP_BATCHED_VERIFY`, `EXL3_MTP_BATCHED_UPDATE`,
+`EXL3_DRAFT_WINDOW`, `EXL3_DRAFT_WINDOW_SET` and `EXL3_DRAFT_WINDOW_SCHEDULE` are removed from every
+process's environment with the other switches. Since the merge of `master` of 2026-10-24 the same holds
+for content-addressed multimodal pages: `mm_content_hash` (the generator's switch) and
+`mm_content_digests` (the embeddings' digests, which the switch turns on for the whole process,
+`tokenizer.mm_embedding.content_digests`) must read off, and `EXL3_MM_CONTENT_HASH` is removed with the
+others. No scenario turns it on: the check's prompts are text, whose pages hash the same either way.
+Scenario 1 with every switch off reports nothing about switches (`tests/test_exact_check.py`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
@@ -1408,8 +1982,9 @@ process on the cards as a problem and the rest as it will be.
     /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --out /home/daniele/exl3-exact-check
     /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --out /home/daniele/exl3-exact-check
 
-How long: the dry run's estimate is about 2.5 hours (prefill 700 tokens/s, decode 60 tokens/s for
-one job and 60 x sqrt(n) for n, 5 minutes per model load, never measured; ten loads); a scenario
+How long: the dry run's estimate is about 1.9 hours for the default scenarios 1-7 (prefill 700
+tokens/s, decode 60 tokens/s for one job and 60 x sqrt(n) for n, 1 minute per model load, 40-65 s
+measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9; a scenario
 gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
 directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
 the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the
@@ -1421,7 +1996,20 @@ What the check cannot tell: a difference the digest misses (two rows of logits w
 weighted sum of their bits: never for one changed value, about 2**-64 otherwise), a race that does
 not fire in one run, whether the exact mode makes 1.6.3 repeatable (the floors of the first report
 say it), and anything off the paths the scenarios take (images, a decode batch above
-eight rows beside a chunk, tensor parallelism). Tests (no GPU, no extension):
+eight rows beside a chunk, tensor parallelism, the cost window choosing by itself, random sampling:
+with a seed the window sampled at once draws other tokens than the serial path by design, so random
+runs cannot compare bit for bit, and their distributions are `tests/test_window_sampling.py`'s).
+
+The GPU window before the production combination (fish, one line each; production stopped as above):
+scenario 1 with every switch off (the fork against stock upstream, which says the branch is upstream
+when nothing is on), scenario 9, and the window sampling test on the card:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --scenarios 1,9 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s1-s9
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 1 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s1
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 9 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s9
+    PYTHONPATH=/home/daniele/Desktop/exllamav3 /home/daniele/miniconda3/envs/tabbyapi/bin/python -m pytest --noconftest /home/daniele/Desktop/exllamav3/tests/test_window_sampling.py -q
+
+Tests (no GPU, no extension):
 `tests/test_exact_check.py`, with `--noconftest` (comparisons, floors and controls, plan, estimate,
 report, records, watchdog, orchestration and split retry with a fake child, the child over a fake
 library and server, the Runner and the stress over the toy model of the staggered tests).

@@ -122,7 +122,8 @@ def _load_stubbed():
     job_mod = real("generator.job")
     stub("generator.cpu_cache", CPUPageCache = _Any)
     stub("generator.disk_cache", DiskPageCache = _Any)
-    stub("generator.draft_confidence", DraftConfidenceCalibrator = _Any)
+    real("generator.draft_confidence")
+    real("generator.draft_window")
     stub("generator.visualizer", CacheVisualizer = _Any)
     gen_mod = real("generator.generator")
     return gen_mod, job_mod, pt_mod

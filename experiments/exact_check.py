@@ -30,6 +30,10 @@ Scenarios (--scenarios):
   6  expert placement with the prefill weight unset against stock: same traffic, same sweeps,
      same placement decisions (in the processes of scenario 1)
   7  stress for hangs with every production switch on, watchdog on every library call
+  8  (on request, not in the default list) the QSA raw-key ring (EXL3_QSA_RAW_TAIL): the same forced
+     runs in a process with the full raw plane and one with the ring (a document past the sparse
+     threshold, the same beside three jobs generating, the next turn from VRAM and from the disk
+     tier), and the memory each load leaves on the cards
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -105,6 +109,8 @@ SIDE_MAX_ROWS = 8
 FORK_ENV_SWITCHES = (
     "EXL3_STAGGER_DECODE", "EXL3_PREFILL_THREAD", "EXL3_PREFILL_PIPELINE", "EXL3_TAIL_CHECKPOINT",
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
+    "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
+    "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
 )
 
 PROMPTS = [
@@ -415,20 +421,22 @@ def gen_step(gid: str, scenario: int, switches: dict | None = None, disk: str | 
 
 def cmp(scenario: int, cid: str, label: str, test: dict, refr: dict, *, expect: str = "identical",
         floor=None, floor2=None, yards=None, upto=None, drafts: bool = True, requires: dict | None = None,
-        soft: dict | None = None) -> dict:
+        soft: dict | None = None, free: bool = False, group: str | None = None) -> dict:
     """
     One probability comparison: `test` against `refr` (same forced tokens), judged against the
     same reference run repeated (`floor`, else `floor2`). `yards` are controls: for a comparison
     expected within the noise they are the yardstick; for one expected identical, a control that
     differs from the reference says the test cannot be identical for a reason of upstream's own
     (the row is then within that control's noise, said so). `upto`: an int, {"window": job} (the
-    positions generated during that job's ingestion) or {"before_first_end": True}. `requires`:
-    what the test run must have exercised, else the row is an error; `soft`: the same, as a note.
+    positions generated during that job's ingestion; with "both", in the reference run as well),
+    or {"before_first_end": True}. `requires`: what the test run must have exercised, else the row
+    is an error; `soft`: the same, as a note. `free`: the two runs are free greedy runs, not forced
+    (compared up to where their tokens part, see evaluate_probs). `group`: the report's sub-table.
     """
     return {
         "kind": "probs", "scenario": scenario, "id": cid, "label": label, "test": test, "ref": refr,
         "expect": expect, "floor": floor, "floor2": floor2, "yards": yards or [], "upto": upto,
-        "drafts": drafts, "requires": requires or {}, "soft": soft or {},
+        "drafts": drafts, "requires": requires or {}, "soft": soft or {}, "free": free, "group": group,
     }
 
 
@@ -462,6 +470,8 @@ SCENARIO_TITLES = {
     5: "Checkpoint che segue la risposta",
     6: "Piazzamento degli esperti col peso del prefill non impostato",
     7: "Stress: blocchi",
+    8: "Chiavi grezze del QSA solo per il blocco in costruzione",
+    9: "La combinazione di produzione: MTP a più bozze, verifica e aggiornamento in un colpo, finestra a costo, anello",
 }
 
 
@@ -907,7 +917,245 @@ def build_plan(args) -> dict:
         procs.append(p)
         comps.append({"kind": "stress", "scenario": 7, "id": "s7.stress", "run": ref(P, "s7.stress", ""), "close": ref(P, "s7.close", "")})
 
+    # ---------------------------------------------------------------- scenario 8
+    if 8 in sc:
+        # The QSA raw-key ring: the same forced runs with the full raw plane and with the ring, in two
+        # processes (the cache is made at the load, from the environment), the full one first: it makes
+        # the references
+        PF, PR = "s8-fork-full", "s8-fork-ring"
+        r8 = doc("s8r", args.s8_prompt, 1)
+        turn_key = "turn/s8"
+        turn_spec = {"kind": "turn", "base": r8, "answer": ref(PF, "s8.doc.free", "r"), "suffix": TURN_SUFFIX}
+        for name, env in ((PF, {}), (PR, {"EXL3_QSA_RAW_TAIL": "1"})):
+            p = Proc(name, "fork", [8], env = env)
+            p.add(gen_step("g0", 8))
+            p.add(run_step("s8.warm.1", 8, [jobspec("a", q(0), W)], warmup = True))
+            p.add(run_step("s8.warm.r", 8, [jobspec("r", doc("s8w", doc_length(64, 8), 2), 8)], warmup = True))
+            if name == PF:
+                p.add(run_step("s8.doc.free", 8, [jobspec("r", r8, args.s8_tokens)]))
+                for i, x in enumerate("abc"):
+                    p.add(run_step(f"s8.free.{x}", 8, [jobspec(x, q(i), T)]))
+                p.add(run_step("s8.turn.prep0", 8, [jobspec("r", r8, forced = ref(PF, "s8.doc.free", "r"))]))
+                p.add(run_step("s8.turn.free", 8, [jobspec("t", turn_key, 32)], forget = False))
+            doc_job = lambda: jobspec("r", r8, forced = ref(PF, "s8.doc.free", "r"))
+            for k in (1, 2):
+                p.add(run_step(f"s8.doc.ref{k}", 8, [doc_job()]))
+            # Sparse decode in a batch of four (the eager sparse path, or the server's per-sequence replay)
+            for k in (1, 2):
+                p.add(run_step(f"s8.mix.ref{k}", 8, [doc_job()] + [jobspec(x, q(i), forced = ref(PF, f"s8.free.{x}", x))
+                                                                  for i, x in enumerate("abc")]))
+            # The next turn from the complete pages left in VRAM
+            for k in (1, 2):
+                p.add(run_step(f"s8.turn.prep{k}", 8, [doc_job()]))
+                p.add(run_step(f"s8.turn.ref{k}", 8, [jobspec("t", turn_key, forced = ref(PF, "s8.turn.free", "t"))], forget = False))
+            # ... and from the disk tier: a new generator over the same directory, after the close of the
+            # one that wrote it (which flushes)
+            p.add(gen_step("g1", 8, disk = f"s8-{name}"))
+            p.add(run_step("s8.disk.doc", 8, [doc_job()]))
+            p.add(gen_step("g2", 8, disk = f"s8-{name}"))
+            p.add(run_step("s8.disk.turn", 8, [jobspec("t", turn_key, forced = ref(PF, "s8.turn.free", "t"))], forget = False))
+            p.add({"op": "disk_scan", "id": "s8.disk.scan", "scenario": 8, "disk": f"s8-{name}"})
+            p.add(gen_step("g3", 8))
+            p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+            procs.append(p)
+
+        def both(run, job, label, floor_run = None):
+            rid = f"s8.{run}" if floor_run else f"s8.{run}.ref1"
+            fr = floor_run or run
+            comps.append(cmp(8, f"s8.{run}.{job}", label, ref(PR, rid, job), ref(PF, rid, job),
+                             floor = (ref(PF, f"s8.{fr}.ref1", job), ref(PF, f"s8.{fr}.ref2", job))))
+        both("doc", "r", f"`r` (documento di {args.s8_prompt} token) e la sua risposta imposta: anello contro piano intero")
+        for x in "rabc":
+            both("mix", x, f"`{x}` nel batch del documento e di tre domande: anello contro piano intero")
+        both("turn", "t", "turno dopo ripreso dalle pagine in VRAM: anello contro piano intero")
+        both("disk.doc", "r", "`r` col tier su disco acceso: anello contro piano intero", floor_run = "doc")
+        both("disk.turn", "t", "turno dopo ripreso dal tier su disco con un generatore nuovo: anello contro piano intero",
+             floor_run = "turn")
+        comps.append({"kind": "raw_tail", "scenario": 8, "id": "s8.memory", "full": PF, "ring": PR,
+                      "label": "l'anello nei due processi e la memoria libera per scheda"})
+        comps.append({"kind": "same_placement", "scenario": 8, "id": "s8.placement", "procs": [PF, PR]})
+        comps.append({"kind": "library", "scenario": 8, "id": "s8.library", "procs": {PF: "fork", PR: "fork"}})
+
+    # ---------------------------------------------------------------- scenario 9
+    if 9 in sc:
+        s9_plan(args, procs, comps)
+
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
+
+
+def parse_windows_list(text: str) -> list:
+    """A draft window schedule as the CLI takes it ("0,1,2,3"): ints, in order"""
+    out = [int(x) for x in str(text).replace(" ", "").split(",") if x]
+    if not out or min(out) < 0:
+        raise ValueError(f"programma di finestre non valido: {text!r}")
+    return out
+
+
+# Scenario 9's generators: the production switches every one of them has (stagger with three jobs
+# or more, the prefill thread and two chunks in flight, the checkpoint that follows the answer)
+# and what each adds. "window": "cost" with "schedule" is the cost path with the test hook's
+# deterministic windows (generator/draft_window.py); "draft_tokens": 1 a fixed W=1 over the
+# caches made for W, the shape meter
+S9_PROD = {"stagger": True, "thread": True, "pipeline": True, "tail": True}
+S9_JOBS = ("a", "abc", "doc", "turn")
+
+
+def s9_generators(args) -> dict:
+    mtp = {"verify": True, "update": True}
+    gens = {
+        "off": dict(S9_PROD),
+        "v": dict(S9_PROD, verify = True),
+        "u": dict(S9_PROD, update = True),
+        "vu": dict(S9_PROD, **mtp),
+        "s3": dict(S9_PROD, **mtp, window = "cost", schedule = [args.s9_window]),
+        "w1": dict(S9_PROD, draft_tokens = 1),
+    }
+    for k, sched in enumerate(args.s9_mixed, 1):
+        gens[f"mix{k}"] = dict(S9_PROD, **mtp, window = "cost", schedule = list(sched))
+    return gens
+
+
+def s9_plan(args, procs: list, comps: list):
+    """
+    Scenario 9, the production combination: the MTP head drafting args.s9_window tokens with the
+    batched verify, the batched head update and the cost window (deterministic, through the test
+    schedule), and the QSA raw-key ring, on top of the switches production already runs. One
+    process with the full raw plane holds every generator (the MTP switches are Generator
+    arguments), one with the ring (a cache layout, made at the load) the production generator
+    only. The workload of every set: a job alone, a batch of three (staggered), a document
+    ingested beside two jobs generating (prefill thread and pipeline; two jobs of 1 + W rows stay
+    within side_max_rows, so the chunks run beside the decode and the cost window's cap does not
+    clip a window of up to 3), the next turn resumed from the pages in VRAM.
+    """
+    PF, PR = "s9-fork-full", "s9-fork-ring"
+    W9 = args.s9_window
+    T9 = args.s9_tokens
+    R9 = args.s9_reader
+    L = args.lead
+    rdoc = doc("s9r", args.s9_prompt, 1)
+    turn_key = "turn/s9"
+    turn_spec = {"kind": "turn", "base": rdoc, "answer": ref(PF, "s9.off.free1.doc", "r"), "suffix": TURN_SUFFIX}
+    gens = s9_generators(args)
+    mixes = [g for g in gens if g.startswith("mix")]
+    src = "s9.off.free1"           # the free runs every forced run takes its tokens from
+    after = {"after": "a", "tokens": L}
+
+    def workload(g: str, kind: str, k: int) -> list:
+        pre = f"s9.{g}.{kind}{k}"
+        if kind == "free":
+            return [
+                run_step(f"{pre}.a", 9, [jobspec("a", q(0), T9)]),
+                run_step(f"{pre}.abc", 9, [jobspec(x, q(i), T9) for i, x in enumerate("abc")]),
+                run_step(f"{pre}.doc", 9, [jobspec("a", q(0), 6000), jobspec("b", q(1), 6000),
+                                           jobspec("r", rdoc, R9, start = after)], until = {"job": "r"}),
+                run_step(f"{pre}.turn", 9, [jobspec("t", turn_key, 32)], forget = False),
+            ]
+        return [
+            run_step(f"{pre}.a", 9, [jobspec("a", q(0), forced = ref(PF, f"{src}.a", "a"))]),
+            run_step(f"{pre}.abc", 9, [jobspec(x, q(i), forced = ref(PF, f"{src}.abc", x)) for i, x in enumerate("abc")]),
+            run_step(f"{pre}.doc", 9, [jobspec("a", q(0), forced = ref(PF, f"{src}.doc", "a")),
+                                       jobspec("b", q(1), forced = ref(PF, f"{src}.doc", "b")),
+                                       jobspec("r", rdoc, forced = ref(PF, f"{src}.doc", "r"), start = after)],
+                     until = {"job": "r"}),
+            run_step(f"{pre}.turn", 9, [jobspec("t", turn_key, forced = ref(PF, f"{src}.turn", "t"))], forget = False),
+        ]
+
+    def process(name: str, env: dict, order: list) -> Proc:
+        p = Proc(name, "fork", [9], env = env, server_args = ["--draft-num-tokens", str(W9)])
+        for i, (g, sets) in enumerate(order):
+            p.add(gen_step(f"g.{g}", 9, switches = gens[g]))
+            if i == 0:
+                # The graphs, and the first round of the prefill thread and of the pipeline (which
+                # share the CPU expert worker's slots out among the lanes) before anything compared
+                p.add(run_step("s9.warm.a", 9, [jobspec("a", q(0), args.warmup_tokens)], warmup = True))
+                p.add(run_step("s9.warm.abc", 9, [jobspec(x, q(i), args.warmup_tokens) for i, x in enumerate("abc")],
+                               warmup = True))
+                p.add(run_step("s9.warm.doc", 9, [jobspec("a", q(0), 6000),
+                                                  jobspec("r", doc("s9w", doc_length(64, 8), 2), 8, start = {"after": "a", "tokens": 16})],
+                               until = {"job": "r"}, warmup = True))
+            for kind, k in sets:
+                p.add(*workload(g, kind, k))
+        p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+        return p
+
+    order = [("off", [("free", 1), ("free", 2), ("forced", 1)]), ("v", [("free", 1)]),
+             ("u", [("free", 1), ("forced", 1)]), ("vu", [("free", 1), ("forced", 1)]),
+             ("s3", [("free", 1), ("free", 2), ("forced", 1), ("forced", 2)])]
+    order += [(m, [("forced", 1), ("forced", 2)] if j == 0 else [("forced", 1)]) for j, m in enumerate(mixes)]
+    order += [("w1", [("forced", 1)])]
+    procs.append(process(PF, {}, order))
+    procs.append(process(PR, {"EXL3_QSA_RAW_TAIL": "1"}, [("s3", [("free", 1), ("forced", 1)])]))
+
+    def jobs_of(kind_runs = S9_JOBS, with_r = True):
+        """(workload, job, label, upto, requirements, soft) of every compared job"""
+        out = []
+        for wl in kind_runs:
+            if wl == "a":
+                out.append(("a", "a", "`a` da solo", None, {}, {}))
+            elif wl == "abc":
+                for x in "abc":
+                    out.append(("abc", x, f"`{x}` nel batch di tre (decode sfalsato)", None, {"stagger_calls": True}, {}))
+            elif wl == "doc":
+                for x in "ab":
+                    out.append(("doc", x, f"`{x}` durante l'ingestione di `r` accanto (thread, pezzi in volo)",
+                                {"window": "r", "both": True}, {"thread": "on", "pipeline": "on", "beside": True}, {"piped": True}))
+                if with_r:
+                    out.append(("doc", "r", f"`r` (documento di {args.s9_prompt} token) ingerito accanto ad `a` e `b`, poi nel batch",
+                                None, {"thread": "on", "pipeline": "on"}, {"piped": True}))
+            elif wl == "turn":
+                out.append(("turn", "t", "turno dopo ripreso dalla VRAM", None, {"resumed": True}, {}))
+        return out
+
+    def rows(group, label, test, refr, kind, *, expect = "identical", floor = None, yards = None, free = False,
+             drafts = True, need = None, with_r = True, test_proc = PF, ref_proc = PF, floor_proc = PF):
+        for wl, job, what, upto, req, soft in jobs_of(with_r = with_r):
+            req = dict(req, **(need or {}))
+            fl = None
+            if floor is not None:
+                fl = (ref(floor_proc, f"s9.{floor[0]}.{wl}", job), ref(floor_proc, f"s9.{floor[1]}.{wl}", job))
+            ys = [(ref(PF, f"s9.{y0}.{wl}", job), ref(PF, f"s9.{y1}.{wl}", job)) for y0, y1 in (yards or [])]
+            comps.append(cmp(9, f"s9.{group}.{test}.{wl}.{job}", f"({group[0]}) {label}: {what}" + (", token liberi" if free else ""),
+                             ref(test_proc, f"s9.{test}.{wl}", job), ref(ref_proc, f"s9.{refr}.{wl}", job),
+                             expect = expect, floor = fl, yards = ys, upto = upto, drafts = drafts,
+                             requires = req, soft = soft, free = free, group = group))
+
+    verify_free = {"verify_windows": True}
+    meter = [("off.forced1", "w1.forced1")]
+    # (a) the batched verify on against off, free greedy runs (forced jobs take the serial path)
+    rows("a1", "verifica in un colpo accesa contro spenta, aggiornamento spento", "v.free1", "off.free1", "free",
+         floor = ("off.free1", "off.free2"), free = True, need = verify_free)
+    rows("a2", "verifica in un colpo accesa contro spenta, aggiornamento acceso", "vu.free1", "u.free1", "free",
+         floor = ("s3.free1", "s3.free2"), free = True, need = verify_free)
+    # (b) the cost path under the schedule "W" against the fixed W, same switches
+    rows("b", f"finestra a costo col programma «{W9}» contro W={W9} fisso", "s3.free1", "vu.free1", "free",
+         floor = ("s3.free1", "s3.free2"), free = True, need = dict(verify_free, scheduled = True))
+    rows("b", f"finestra a costo col programma «{W9}» contro W={W9} fisso, imposti", "s3.forced1", "vu.forced1", "forced",
+         floor = ("s3.forced1", "s3.forced2"), need = {"scheduled": True})
+    # (c) mixed schedules against the fixed W, against the shape meter; the first one repeated
+    for m in mixes:
+        sched = ",".join(str(w) for w in gens[m]["schedule"])
+        rows("c", f"finestre dal programma «{sched}» contro W={W9} fisso", f"{m}.forced1", "vu.forced1", "forced",
+             expect = "noise", yards = meter, drafts = False, need = {"scheduled": True, "windows_varied": True})
+    if mixes:
+        sched = ",".join(str(w) for w in gens[mixes[0]]["schedule"])
+        rows("c0", f"programma «{sched}» ripetuto nello stesso processo", f"{mixes[0]}.forced2", f"{mixes[0]}.forced1",
+             "forced", need = {"scheduled": True}, with_r = False)
+    # (d) the batched head update on against off, against the shape meter, drafts reported
+    rows("d", f"aggiornamento della testa in un passaggio acceso contro spento, W={W9} fisso", "u.forced1", "off.forced1",
+         "forced", expect = "noise", yards = meter, drafts = False, need = {"folds": True})
+    # (e) the ring against the full plane, the production MTP switches on in both processes
+    rows("e", "anello contro piano intero, interruttori MTP di produzione", "s3.free1", "s3.free1", "free",
+         floor = ("s3.free1", "s3.free2"), free = True, need = dict(verify_free, scheduled = True), test_proc = PR)
+    rows("e", "anello contro piano intero, interruttori MTP di produzione, imposti", "s3.forced1", "s3.forced1", "forced",
+         floor = ("s3.forced1", "s3.forced2"), need = {"scheduled": True}, test_proc = PR)
+    # (f) everything on against everything off, against the shape meter
+    rows("f", f"tutto acceso (anello, programma «{W9}», verifica, aggiornamento) contro tutto spento (W={W9} fisso)",
+         "s3.forced1", "off.forced1", "forced", expect = "noise", yards = meter, drafts = False,
+         need = {"scheduled": True, "folds": True}, test_proc = PR)
+    comps.append({"kind": "raw_tail", "scenario": 9, "id": "s9.memory", "full": PF, "ring": PR,
+                  "label": "(e) l'anello nei due processi e la memoria libera per scheda"})
+    comps.append({"kind": "same_placement", "scenario": 9, "id": "s9.placement", "procs": [PF, PR]})
+    comps.append({"kind": "library", "scenario": 9, "id": "s9.library", "procs": {PF: "fork", PR: "fork"}})
 
 
 # --------------------------------------------------------------------------------------------
@@ -1127,12 +1375,22 @@ def _drafts_upto(v: dict, n: int):
     return list(zip(acc[:n], rej[:n]))
 
 
-def compare_jobs(refv: dict, testv: dict, upto: int | None = None) -> dict | None:
+def parting(refv: dict | None, testv: dict | None) -> int | None:
+    """The first position where two free runs' tokens differ (None: the same as far as both go)"""
+    if refv is None or testv is None:
+        return None
+    rt, tt = refv.get("tokens") or [], testv.get("tokens") or []
+    return next((i for i, (x, y) in enumerate(zip(rt, tt)) if x != y), None)
+
+
+def compare_jobs(refv: dict, testv: dict, upto: int | None = None, parted: int | None = None) -> dict | None:
     """
     One job of a test run against the same job of a reference run (the same forced tokens),
     position by position over the first `upto` positions: whether the logits are the same bits
     (digest), the log-probability of the forced token, the most likely tokens, and the MTP
-    head's accepted and rejected drafts up to each position.
+    head's accepted and rejected drafts up to each position. `parted`: free runs whose tokens
+    part there; that position's logits come from the same tokens in both and are compared
+    (digest, most likely tokens), its emitted tokens' log-probabilities are not.
     """
     if refv is None or testv is None:
         return None
@@ -1141,6 +1399,8 @@ def compare_jobs(refv: dict, testv: dict, upto: int | None = None) -> dict | Non
     n = min(n, min(len(testv.get(k) or []) for k in keys))
     if upto is not None:
         n = min(n, upto)
+    if parted is not None:
+        n = min(n, parted + 1)
     if n <= 0:
         return None
     rt, tt = refv["tokens"][:n], testv["tokens"][:n]
@@ -1155,7 +1415,7 @@ def compare_jobs(refv: dict, testv: dict, upto: int | None = None) -> dict | Non
         finite = a is not None and b is not None and math.isfinite(a) and math.isfinite(b)
         if not finite:
             nonfinite += 1
-        else:
+        elif i != parted:
             deltas.append(abs(a - b))
         da, db = refv["digest"][i], testv["digest"][i]
         if da is None or db is None:
@@ -1163,7 +1423,8 @@ def compare_jobs(refv: dict, testv: dict, upto: int | None = None) -> dict | Non
             dig_same = True
         else:
             dig_same = da == db
-        ok = finite and dig_same and a == b and refv["topi"][i] == testv["topi"][i] and refv["topl"][i] == testv["topl"][i]
+        ok = finite and dig_same and (a == b or i == parted) and refv["topi"][i] == testv["topi"][i] \
+            and refv["topl"][i] == testv["topl"][i]
         same.append(ok)
         if (refv["topi"][i] or [None])[0] != (testv["topi"][i] or [None])[0]:
             flips += 1
@@ -1188,10 +1449,11 @@ def compare_jobs(refv: dict, testv: dict, upto: int | None = None) -> dict | Non
         "nonfinite": nonfinite,
         "tokens_ok": tokens_ok,
         "digests": digests,
-        "identical": first is None and nonfinite == 0,
+        "identical": first is None and nonfinite == 0 and parted is None,
         "drafts": drafts,
         "drafts_ref": drafts_ref,
         "drafts_same": drafts_same,
+        "parted": parted,
     }
 
 
@@ -1258,6 +1520,19 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
         out.append("nessuna chiamata sfalsata")
     if req.get("tail_stashes") and not (stats.get("tail") or {}).get("stashes"):
         out.append("nessun checkpoint di coda preso")
+    # The MTP decode's switches (the fork's counters, the run's difference)
+    verify, update, window = (stats.get(k) or {} for k in ("verify", "update", "window"))
+    if req.get("verify_windows") and not verify.get("windows"):
+        out.append(f"nessuna finestra campionata in una volta (mtp_batched_verify non esercitato: {verify.get('serial', 0)} "
+                   "finestre lasciate al percorso seriale)")
+    if req.get("folds") and not (update.get("fold_drafts") or update.get("folds")):
+        out.append("nessun aggiornamento della testa MTP piegato in un passaggio (mtp_batched_update non esercitato)")
+    if req.get("scheduled") and not window.get("scheduled"):
+        out.append("nessun passo con la finestra del programma (draft_window \"cost\" con il programma non esercitato)")
+    if req.get("windows_varied"):
+        taken = sorted(int(k[1:]) for k, v in window.items() if k.startswith("w") and k[1:].isdigit() and v)
+        if len(taken) < 2:
+            out.append(f"una sola finestra presa ({taken}): le forme non sono cambiate")
     j = job_view(rec, job) or {}
     if req.get("resumed") and not j.get("cached_tokens"):
         out.append("nessun token ripreso dalla cache")
@@ -1291,6 +1566,14 @@ def evaluate_probs(c: dict, res: Results) -> dict:
             return row
         inside = tokens_before(t_rec, c["test"]["job"], w[1])
         started = tokens_at(t_rec, c["test"]["job"], w[0])
+        if upto.get("both"):
+            # Where the reader joins the batch depends on wall time (a chunk beside the decode is
+            # recorded once it is done): past it in either run the batches differ
+            wr = ingestion_window(r_rec, upto["window"])
+            if wr is None:
+                row.update(verdict = ERR, why = f"`{upto['window']}` non ha dato token nel giro di riferimento")
+                return row
+            inside = min(inside, tokens_before(r_rec, c["ref"]["job"], wr[1]))
         window = (started, inside)
         if inside <= started:
             row.update(verdict = ERR, why = "nessuna posizione generata durante l'ingestione", window = window)
@@ -1302,11 +1585,18 @@ def evaluate_probs(c: dict, res: Results) -> dict:
         if upto is not None and upto <= 0:
             row.update(verdict = ERR, why = "un job è finito prima che si potesse confrontare una posizione")
             return row
-    test = compare_jobs(job_view(r_rec, c["ref"]["job"]), job_view(t_rec, c["test"]["job"]), upto)
+    free = bool(c.get("free"))
+    refv, testv = job_view(r_rec, c["ref"]["job"]), job_view(t_rec, c["test"]["job"])
+    parted = parting(refv, testv) if free else None
+    if parted is not None and upto is not None and parted >= upto:
+        parted = None
+    test = compare_jobs(refv, testv, upto, parted)
     if test is None:
         row.update(verdict = ERR, why = "nessuna posizione registrata")
         return row
     row.update(test = test, window = window)
+
+    spec = c.get("upto")
 
     def pair(p):
         if p is None:
@@ -1314,7 +1604,19 @@ def evaluate_probs(c: dict, res: Results) -> dict:
         a, b = res.rec(p[0]), res.rec(p[1])
         if a is None or b is None or not a.get("ok") or not b.get("ok"):
             return None
-        return compare_jobs(job_view(a, p[0]["job"]), job_view(b, p[1]["job"]), upto)
+        va, vb = job_view(a, p[0]["job"]), job_view(b, p[1]["job"])
+        bound = upto
+        if isinstance(spec, dict) and spec.get("window") and spec.get("both"):
+            # The positions before the reader joined the batch in this pair's own two runs
+            wa, wb = ingestion_window(a, spec["window"]), ingestion_window(b, spec["window"])
+            if wa is None or wb is None:
+                return None
+            bound = min(tokens_before(a, p[0]["job"], wa[1]), tokens_before(b, p[1]["job"], wb[1]))
+        if free:
+            # A floor of free runs too: up to where its own two runs part
+            pa = parting(va, vb)
+            return compare_jobs(va, vb, bound, pa if pa is None or bound is None or pa < bound else None)
+        return compare_jobs(va, vb, bound)
 
     floor = pair(c.get("floor"))
     floor2 = pair(c.get("floor2"))
@@ -1323,9 +1625,12 @@ def evaluate_probs(c: dict, res: Results) -> dict:
     probs = requirement_problems(c.get("requires") or {}, t_rec, c["test"]["job"], res)
     for line in requirement_problems(c.get("soft") or {}, t_rec, c["test"]["job"], res):
         row["notes"].append(f"**Attenzione**: {line}")
-    if not test["tokens_ok"]:
+    if not test["tokens_ok"] and not free:
         row.update(verdict = ERR, why = "i token usciti non sono quelli imposti: le due sequenze non sono le stesse")
         return row
+    if free and parted is not None:
+        row["notes"].append(f"**Attenzione**: i token liberi si separano alla posizione {parted}: confrontate le "
+                            f"posizioni fino a quella compresa (i suoi logit vengono dagli stessi token)")
     if c["expect"] == "info":
         row["verdict"] = INFO
         return row
@@ -1335,6 +1640,11 @@ def evaluate_probs(c: dict, res: Results) -> dict:
     judge_drafts = bool(c.get("drafts")) and test["drafts_same"] is not None
     if test["nonfinite"]:
         row.update(verdict = DIFF, why = f"valori non finiti in {test['nonfinite']} posizioni")
+        return row
+    if free and parted is not None and test["first_diff"] is None and test["digests"]:
+        # The same logits up to and at the position, another token out of them: the sampling
+        row.update(verdict = DIFF, why = f"logit identici fino alla posizione {parted} compresa, ma lì il token "
+                                         "campionato è diverso: il campionamento, non il calcolo")
         return row
     if test["identical"] and (not judge_drafts or test["drafts_same"]):
         row["verdict"] = IDENT
@@ -1549,9 +1859,42 @@ def evaluate_resume(c: dict, res: Results) -> dict:
     return row
 
 
+def evaluate_raw_tail(c: dict, res: Results) -> dict:
+    """Scenario 8: the ring as each process loaded it (none in `full`, on in `ring`, main cache and MTP
+    head's), and the memory per card each load left free, against what the library says it saves"""
+    row = {"id": c["id"], "scenario": c["scenario"], "label": c["label"], "expect": "identical", "notes": []}
+    loads = {k: (res.records.get(c[k], {}).get("load") or {}) for k in ("full", "ring")}
+    if not all(r.get("ok") for r in loads.values()):
+        row.update(verdict = ERR, why = "manca il caricamento di un processo")
+        return row
+    full, ring = (loads[k].get("qsa_raw_tail") or {} for k in ("full", "ring"))
+    problems = []
+    if full.get("main") or full.get("draft"):
+        problems.append(f"`{c['full']}` aveva l'anello ({full.get('main')}, testa MTP {full.get('draft')})")
+    if not ring.get("main"):
+        problems.append(f"`{c['ring']}` non aveva l'anello (cache {ring.get('main')}: libreria senza, o rifiutato)")
+    elif loads["ring"].get("draft") and not ring.get("draft"):
+        problems.append(f"`{c['ring']}`: la cache della testa MTP non aveva l'anello")
+    rows = []
+    ff, fr = loads["full"].get("free") or {}, loads["ring"].get("free") or {}
+    saved = ring.get("saved") or {}
+    mib = lambda v: "-" if v is None else round(v / (1 << 20))
+    for d in sorted(set(ff) | set(fr), key = int):
+        a, b = ff.get(d), fr.get(d)
+        rows.append([f"cuda:{d}", mib(a), mib(b), "-" if a is None or b is None else mib(b - a),
+                     mib(saved.get(str(d), saved.get(d)))])
+    row["table"] = rows
+    row["ring"] = ring.get("main")
+    if problems:
+        row.update(verdict = FAIL, why = "; ".join(problems))
+    else:
+        row.update(verdict = PASS, why = f"anello di {ring.get('main')} token in {ring.get('layers')} strati")
+    return row
+
+
 EVALUATORS = {
     "probs": evaluate_probs, "crc": evaluate_crc, "placement": evaluate_placement, "tokens": evaluate_tokens,
-    "cancel": evaluate_cancel, "stress": evaluate_stress, "resume": evaluate_resume,
+    "cancel": evaluate_cancel, "stress": evaluate_stress, "resume": evaluate_resume, "raw_tail": evaluate_raw_tail,
 }
 
 
@@ -1569,6 +1912,8 @@ def evaluate_all(plan: dict, res: Results) -> list:
             row = {"id": c.get("id"), "scenario": c.get("scenario"), "label": c.get("label", c.get("id")),
                    "expect": c.get("expect", "identical"), "verdict": ERR, "why": f"confronto non calcolabile: {e!r}", "notes": []}
         row["kind"] = kind
+        if c.get("group"):
+            row["group"] = c["group"]
         rows.append(row)
     return rows
 
@@ -1580,15 +1925,26 @@ def evaluate_all(plan: dict, res: Results) -> list:
 SWITCHES_OFF = {
     "stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False,
     "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0, "disk_uncache": False,
+    "mtp_batched_verify": False, "mtp_batched_update": False, "qsa_raw_tail": 0,
+    "draft_window": "fixed", "draft_window_schedule": None,
+    # Content-addressed multimodal pages: the generator's switch, and the embeddings' digests, which it
+    # turns on for the whole process (tokenizer.mm_embedding.content_digests)
+    "mm_content_hash": False, "mm_content_digests": False,
 }
 
 
 def switch_is_off(name: str, value) -> bool:
     """Whether a generator's switch, as the child read it, is at upstream's behaviour. By type:
-    in Python True == 1 == 1.0, and a switch left on must not pass for a weight of one."""
+    in Python True == 1 == 1.0, and a switch left on must not pass for a weight of one; a
+    switch with a name ("fixed") is off only with that name, and one whose off is None (the
+    draft window's test schedule) only when None."""
     if value is None:
         return True
     want = SWITCHES_OFF.get(name)
+    if want is None:
+        return False
+    if isinstance(want, str) or isinstance(value, str):
+        return value == want
     if isinstance(want, bool) or isinstance(value, bool):
         return value is False
     try:
@@ -1782,7 +2138,77 @@ SCENARIO_TEXT = {
        "decode sfalsato, thread di prefill, pezzi in volo, checkpoint di coda, tier su disco con `EXL3_DISK_CACHE_UNCACHE=1`, "
        "MTP 1, peso del prefill 0.004 e sweep del piazzamento come in produzione. Superato: nessuna chiamata della libreria "
        "oltre il cane da guardia, nessuna eccezione, la coda si svuota e `close()` finisce.",
+    8: "Due processi del fork con gli stessi giri imposti: uno con il piano intero delle chiavi grezze dell'indicizzatore QSA "
+       "(`full`), l'altro con l'anello (`EXL3_QSA_RAW_TAIL=1`, `ring`). Un documento oltre la soglia sparsa con la risposta "
+       "imposta, lo stesso accanto a tre job che generano, il turno dopo ripreso dalle pagine in VRAM e, con un generatore "
+       "nuovo, dal tier su disco (pagine senza le chiavi grezze: un'altra cartella di impronta). Atteso identico: le chiavi "
+       "aggregate escono bit per bit le stesse. Il metro è `full` ripetuto. Sotto, la memoria che ciascun caricamento lascia "
+       "libera per scheda, accanto a quella che la libreria dice di risparmiare.",
+    9: "Quello che la produzione accenderà tutto insieme: la testa MTP con più bozze (W, `--draft-num-tokens`), la "
+       "verifica della finestra in un colpo, l'aggiornamento della testa in un passaggio, la finestra scelta dal costo e "
+       "l'anello delle chiavi grezze, sopra a quello che gira già (decode sfalsato con tre job o più, thread di prefill e "
+       "pezzi in volo, checkpoint che segue la risposta) in ogni generatore. Due processi del fork: `s9-fork-full` col "
+       "piano intero delle chiavi grezze tiene tutti i generatori (gli interruttori MTP sono argomenti del Generator: "
+       "`off` W fisso e nessun interruttore nuovo, `v` verifica, `u` aggiornamento, `vu` tutti e due, `s3` finestra a "
+       "costo col programma di prova «W», `mix1`/`mix2` programmi misti, `w1` W=1 fisso sulle stesse cache, il metro "
+       "delle forme); `s9-fork-ring` con l'anello (`EXL3_QSA_RAW_TAIL=1`, una disposizione della cache, fatta al "
+       "caricamento) solo il generatore di produzione. Il carico di ogni serie: `a` da solo, `a`/`b`/`c` in un batch di "
+       "tre (sfalsato), un documento `r` ingerito accanto ad `a` e `b` che generano (2 job x (1 + W) righe, dentro "
+       "`side_max_rows`: i pezzi girano accanto al decode e il tetto della finestra a costo non taglia finestre fino a 3), "
+       "il turno dopo ripreso dalle pagine in VRAM. I giri imposti prendono i token dai giri liberi di `off`. La finestra "
+       "a costo sceglie W dai tempi misurati ed esplora, quindi due processi sceglierebbero diversamente: qui la sceglie "
+       "il programma di prova (`EXL3_DRAFT_WINDOW_SCHEDULE`, `Generator.draft_window_schedule`), ciclico per passo di "
+       "decode, ritagliato su quello che il passo permette, con tutto il resto del percorso a costo invariato. `a` e `b` "
+       "accanto al documento si confrontano fino al passo in cui `r` entra nel batch in uno dei due giri: quel passo "
+       "dipende dal tempo (un pezzo accanto al decode si registra quando ha finito). Il tier su disco non c'è: lo "
+       "scenario 8 confronta l'anello col disco, e gli interruttori MTP non toccano le immagini delle pagine.",
 }
+
+# Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
+S9_GROUPS = [
+    ("a1", "(a) verifica in un colpo accesa contro spenta, aggiornamento spento",
+     "(a) Verifica della finestra in un colpo (`mtp_batched_verify`) accesa contro spenta, aggiornamento della testa "
+     "spento, W fisso, giri liberi greedy (un job con token imposti prende il percorso seriale, `forced_tokens`: "
+     "solo i giri liberi esercitano la verifica). Cambia solo come i token campionati tornano all'host; col "
+     "campionamento greedy ogni riga del campionatore fuso è calcolata da sola, quindi atteso **identico**: logit, "
+     "token liberi e bozze. Errore se il giro con la verifica non ha campionato nessuna finestra in una volta. "
+     "Metro: `off` ripetuto."),
+    ("a2", "(a) verifica in un colpo accesa contro spenta, aggiornamento acceso",
+     "(a) La stessa cosa con l'aggiornamento della testa acceso in tutti e due i giri (`vu` contro `u`). Atteso "
+     "**identico**. Metro: `s3` ripetuto (stessi interruttori, W dal programma)."),
+    ("b", "(b) finestra a costo col programma «W» contro W fisso",
+     "(b) Finestra a costo col programma «W» contro W fisso, verifica e aggiornamento accesi in tutti e due: lo "
+          "stesso calcolo per l'altra strada (la testa bozza una posizione alla volta con la confidenza esportata, il "
+          "giro si ferma esattamente a W, i tempi e le etichette del criterio vanno avanti senza decidere niente). "
+          "Atteso **identico**, giri liberi e imposti: dice che il percorso a costo in sé non aggiunge differenze."),
+    ("c", "(c) finestre miste dal programma contro W fisso",
+     "(c) Finestre miste dal programma contro W fisso: le forme dei passaggi cambiano passo per passo, quindi una "
+          "posizione viene calcolata da passaggi di altra larghezza (e riavvolta di quantità diverse). Atteso **entro "
+          "il rumore** contro il metro delle forme: la stessa libreria, gli stessi token imposti, W=1 fisso contro W "
+          "fisso, l'arrotondamento che upstream stesso mostra quando cambiano le righe verificate. Un riavvolgimento "
+          "sbagliato dello stato ricorrente o della cache della testa con finestre di lunghezza variabile darebbe "
+          "scarti molto oltre il metro. Errore se il programma non ha deciso i passi o se è stata presa una sola "
+          "finestra."),
+    ("c0", "(c) il programma misto ripetuto",
+     "(c) Il primo programma misto ripetuto nello stesso processo: atteso **identico** (il pavimento del gruppo). "
+     "`r` non c'è: entra nel batch a un passo che dipende dal tempo, e con un programma misto la finestra di ogni "
+     "passo dopo dipende da quanti passi sono venuti prima."),
+    ("d", "(d) aggiornamento della testa in un passaggio acceso contro spento",
+     "(d) Aggiornamento della testa in un passaggio (`mtp_batched_update`) acceso contro spento, W fisso, verifica "
+          "spenta: la cache della testa riceve gli stessi ingressi in passaggi di altra forma, quindi le sue bozze, "
+          "l'accettazione e con loro le posizioni che ogni passaggio verifica possono cambiare. Atteso **entro il "
+          "rumore** contro il metro delle forme; bozze accettate/rifiutate nella tabella, non giudicate. Errore se "
+          "nessun aggiornamento è stato piegato."),
+    ("e", "(e) anello contro piano intero, interruttori MTP di produzione",
+     "(e) Anello delle chiavi grezze contro piano intero con gli interruttori MTP di produzione (W dal programma, "
+          "verifica e aggiornamento accesi), due processi: le chiavi aggregate escono bit per bit le stesse, quindi "
+          "atteso **identico**, giri liberi e imposti, il batch sfalsato e il documento accanto ai job compresi. "
+          "Metro: `s3` ripetuto nel processo col piano intero."),
+    ("f", "(f) tutto acceso contro tutto spento",
+     "(f) Tutto acceso (il processo con l'anello, programma «W», verifica, aggiornamento) contro tutto spento (W "
+          "fisso, nessun interruttore nuovo), giri imposti: riga di controllo, atteso **entro il rumore** contro il metro "
+          "delle forme (dentro c'è anche il rumore tra due processi, che lo scenario 1 misura)."),
+]
 
 
 def render_report(plan: dict, res: Results, meta: dict, finished: bool) -> str:
@@ -1901,7 +2327,15 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
     out = [f"## {s}. {SCENARIO_TITLES[s]}", "", SCENARIO_TEXT[s], ""]
     rel = [r for r in rows if r.get("scenario") == s]
     probs = [r for r in rel if r.get("kind") == "probs"]
-    if probs:
+    groups = [(g, t, text) for g, t, text in S9_GROUPS if any(r.get("group") == g for r in probs)] if s == 9 else []
+    if groups:
+        for g, title, text in groups:
+            sub = [r for r in probs if r.get("group") == g]
+            out += [f"### {title}: {worst([r['verdict'] for r in sub])}", "", text, "", probs_table(sub), ""]
+            for r in sub:
+                for n in r.get("notes") or []:
+                    out += [f"{n} (riga «{r['label']}»)", ""]
+    elif probs:
         out += [probs_table(probs), ""]
         for r in probs:
             for n in r.get("notes") or []:
@@ -1942,6 +2376,11 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
         elif kind == "resume":
             out += [f"**{r['label']}**", "", table(["turno", "token del prompt", "ripresi", "da rileggere", "da un checkpoint di coda",
                                                    "secondi al primo token"], r.get("table") or []), ""]
+        elif kind == "raw_tail":
+            out += [headline(r), ""]
+            if r.get("table"):
+                out += [table(["scheda", "libera dopo il caricamento, piano intero MiB", "con l'anello MiB", "differenza MiB",
+                               "risparmio secondo la libreria MiB"], r["table"]), ""]
         elif kind == "stress":
             st = r.get("stress") or {}
             out += [headline(r), ""]
@@ -1971,6 +2410,8 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
     # Memory and timing per run, for the scenarios where they are asked for
     if s in (3, 4, 5):
         out += runs_table(s, plan, res)
+    if s == 9:
+        out += mtp_runs_table(s, plan, res)
     hangs = []
     for proc in plan["procs"]:
         if s in proc["scenarios"]:
@@ -2020,6 +2461,41 @@ def runs_table(s: int, plan: dict, res: Results) -> list:
             "picco di memoria allocata da PyTorch per scheda (GiB) e memoria libera minima vista dal driver durante il giro (MiB).", "",
             table(["giro", "secondi", "ingestione del documento", "pezzi sul thread", "picco GiB per scheda",
                    "libera minima MiB per scheda", "chiamata più lunga s"], rows), ""]
+
+
+def mtp_runs_table(s: int, plan: dict, res: Results) -> list:
+    """What each run of scenario 9 exercised: windows sampled at once (and left to the serial
+    path), the head's folded updates, the steps the schedule decided and the windows taken, the
+    drafts accepted / rejected, the chunks beside the decode and in flight"""
+    rows = []
+    for proc in plan["procs"]:
+        if s not in proc["scenarios"]:
+            continue
+        recs = res.records.get(proc["name"], {})
+        for st in proc["steps"]:
+            if st.get("op") != "run" or st.get("scenario") != s or st.get("warmup"):
+                continue
+            rec = recs.get(st["id"])
+            if rec is None:
+                continue
+            stats = rec.get("stats") or {}
+            v, u, w, side = (stats.get(k) or {} for k in ("verify", "update", "window", "side"))
+            taken = " ".join(f"{k[1:]}:{n}" for k, n in sorted(w.items()) if k.startswith("w") and k[1:].isdigit() and n)
+            jobs = rec.get("jobs") or {}
+            acc = sum(int(j.get("accepted") or 0) for j in jobs.values())
+            rej = sum(int(j.get("rejected") or 0) for j in jobs.values())
+            rows.append([f"`{proc['name']}` / `{st['id']}`", fmt(rec.get("seconds"), 1),
+                         f"{v.get('windows', 0)} / {v.get('serial', 0)}", f"{u.get('folds', 0)} / {u.get('fold_drafts', 0)}",
+                         f"{w.get('scheduled', 0)} / {w.get('steps', 0)}", taken or "-", f"{acc} / {rej}",
+                         f"{side.get('beside', 0)} / {side.get('piped', 0)}", fmt(rec.get("max_step_s"), 2)])
+    if not rows:
+        return []
+    return ["### I giri", "", "Per giro: finestre campionate in una volta / lasciate al percorso seriale (`mtp_verify_stats`), "
+            "aggiornamenti della testa piegati / bozze prese da un aggiornamento piegato (`mtp_update_stats`), passi decisi "
+            "dal programma / passi della finestra a costo, finestre prese (W:passi), bozze accettate / rifiutate di tutti i "
+            "job, pezzi accanto al decode / partiti con un altro in volo.", "",
+            table(["giro", "secondi", "verifica in un colpo", "aggiornamenti piegati", "programma", "finestre",
+                   "bozze acc. / rif.", "pezzi accanto / in volo", "chiamata più lunga s"], rows), ""]
 
 
 # --------------------------------------------------------------------------------------------
@@ -2663,8 +3139,8 @@ def dry_run_text(plan: dict, args, est: dict, budgets: dict, problems: list, not
     lines.append(f"Ipotesi della stima: prefill {args.assume_prefill:.0f} token/s (qualunque cosa giri accanto; 700-720 nel "
                  f"traffico vero del 9-11 ottobre), decode {args.assume_decode:.0f} token/s per un job e "
                  f"{args.assume_decode:.0f} x radice(n) in tutto per n job insieme (63/86/103/117 token/s per 1-4 job, "
-                 f"misurati il 9 ottobre con --attn-per-sequence), {args.assume_load_min:.0f} min per caricamento del "
-                 "modello (mai misurato: il rapporto dice quello vero), pochi secondi per giro di contorno. Con lo stesso "
+                 f"misurati il 9 ottobre con --attn-per-sequence), {args.assume_load_min:g} min per caricamento del "
+                 "modello (40-65 s misurati il 24 ottobre 2026), pochi secondi per giro di contorno. Con lo stesso "
                  "rapporto si può rifare il conto: --assume-prefill, --assume-decode, --assume-load-min.")
     lines.append("")
     for s in plan["scenarios"]:
@@ -2707,7 +3183,9 @@ def parse_cli(argv: list | None = None):
     ap = argparse.ArgumentParser(
         description = f"Controllo notturno di identità bit a bit del fork {FORK_BRANCH} contro upstream {BASE_RELEASE}, "
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
-    ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7", help = "scenari da eseguire, es. 1,2 (default tutti)")
+    ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7",
+                    help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; a richiesta l'8, l'anello delle chiavi grezze "
+                           "del QSA, e il 9, la combinazione di produzione con la decodifica MTP nuova)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -2757,6 +3235,16 @@ def parse_cli(argv: list | None = None):
                     help = "ripete il prompt lungo in linea per il metro (default sì)")
     ap.add_argument("--s5-answer", type = int, default = 1100)
     ap.add_argument("--s5-next", type = int, default = 32)
+    ap.add_argument("--s8-prompt", type = int, default = 12386, help = "token del documento dello scenario 8 (oltre la soglia sparsa)")
+    ap.add_argument("--s8-tokens", type = int, default = 512, help = "token imposti al documento dello scenario 8")
+    ap.add_argument("--s9-window", type = int, default = 3, help = "bozze MTP dello scenario 9 (--draft-num-tokens, W fisso)")
+    ap.add_argument("--s9-tokens", type = int, default = 256, help = "token dei job da soli e del batch di tre nello scenario 9")
+    ap.add_argument("--s9-prompt", type = int, default = 12386,
+                    help = "token del documento dello scenario 9 (oltre la soglia sparsa, più pezzi da 4096)")
+    ap.add_argument("--s9-reader", type = int, default = 64, help = "token del documento dello scenario 9 dopo il prompt")
+    ap.add_argument("--s9-mixed", type = lambda v: [parse_windows_list(x) for x in v.split("/") if x.strip()],
+                    default = [[0, 1, 2, 3], [3, 0, 3, 1]],
+                    help = "programmi di finestre misti dello scenario 9, separati da / (default 0,1,2,3/3,0,3,1)")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)
@@ -2779,7 +3267,8 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--child-cmd", default = None, help = argparse.SUPPRESS)
     ap.add_argument("--assume-prefill", type = float, default = 700.0)
     ap.add_argument("--assume-decode", type = float, default = 60.0)
-    ap.add_argument("--assume-load-min", type = float, default = 5.0)
+    ap.add_argument("--assume-load-min", type = float, default = 1.0,
+                    help = "minuti per caricamento del modello nella stima (default 1: 40-65 s misurati il 24 ottobre 2026)")
     args = ap.parse_args(argv)
     args.scenarios = sorted({int(x) for x in str(args.scenarios).split(",") if x.strip()})
     unknown = [s for s in args.scenarios if s not in SCENARIO_TITLES]
@@ -2791,6 +3280,8 @@ def parse_cli(argv: list | None = None):
     args.fork_path = os.path.abspath(os.path.expanduser(args.fork_path))
     if args.chunk % 256:
         ap.error("--chunk: multiplo di 256")
+    if args.s9_window < 1 or any(max(m) > args.s9_window for m in args.s9_mixed):
+        ap.error("--s9-window: almeno 1, e i programmi di --s9-mixed non oltre")
     return args
 
 

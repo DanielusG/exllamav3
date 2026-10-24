@@ -17,6 +17,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from .draft_window import DraftWindowPolicy, parse_windows, parse_schedule
 from .job import Job
 from .filter import Filter
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -82,6 +83,15 @@ class Generator:
     # can be added to one shared by every such generator
     stagger_decode = False
     prefill_thread = False
+    mtp_batched_verify = False
+    mtp_batched_update = False
+    draft_window = "fixed"
+    draft_window_set = None
+    draft_window_schedule = None
+    draft_window_policy = None
+    draft_window_stats = None
+    _dw_round = None
+    _dw_dirty = False
     _stagger_backlog = ()
     _stagger_run = None
     _flight = None
@@ -120,6 +130,10 @@ class Generator:
         stagger_decode: bool = False,
         prefill_thread: bool = False,
         prefill_pipeline: bool = False,
+        mtp_batched_verify: bool = False,
+        mtp_batched_update: bool = False,
+        draft_window: str = "fixed",
+        draft_window_set: list[int] | str | None = None,
         mm_content_hash: bool = False,
         **kwargs
     ):
@@ -223,6 +237,61 @@ class Generator:
             available where the prefill thread is not. Can be switched at any time (attribute of the same name).
             EXL3_PREFILL_PIPELINE=1 in the environment turns it on for callers that do not pass the argument. See
             _pipe_round().
+
+        :param mtp_batched_verify:
+            With the MTP head drafting: sample every position of each job's speculative window in one
+            sampler call, compare the samples with the drafts on the device, and read the tokens and the
+            accepted lengths of every such job back at once, instead of a sampler call and a readback per
+            position and job. Greedy sampling gives the same tokens; with random sampling a job draws one
+            random number per window instead of one per position, so the same seed samples other tokens
+            (as reproducibly). A job whose window cannot be sampled ahead (Job.window_sampling_why: token
+            healing or its first token, forced tokens, probabilities asked for, banned strings, stop tokens
+            still blocked by min_new_tokens, a stateful sampler step, a filter without native rollback or
+            with a trigger token) takes the serial path that step. Can be switched at any time (attribute
+            of the same name). EXL3_MTP_BATCHED_VERIFY=1 in the environment turns it on for callers that do
+            not pass the argument. See _verify_windows().
+
+        :param mtp_batched_update:
+            With the MTP head drafting: after the verification, bring the head's cache up to the accepted
+            tokens and draft the next token in one batched pass of the head over every job that goes on
+            generating (_mtp_fold), instead of one pass of the head per job that accepted a draft and a
+            draft pass of the head at the start of the next iteration. Positions past a job's accepted
+            tokens are written too, with nothing that will be read: every one of them is written again
+            before any pass reads it. The next draft step then reads the drafts back without running the
+            head for the first draft token; it runs the head as before when a job of the step has none
+            (a job just past its prompt, a job that ended or was requeued, a banned-string rewind, the
+            confidence-calibrated draft). Speculative decoding stays exact; the head's cache gets the same
+            inputs in passes of other shapes, so drafts, and with them which positions each target pass
+            computes, can differ. Can be switched at any time (attribute of the same name).
+            EXL3_MTP_BATCHED_UPDATE=1 in the environment turns it on for callers that do not pass the
+            argument.
+
+        :param draft_window:
+            With the MTP head drafting: "fixed" (default) verifies num_draft_tokens drafts every step;
+            "cost" chooses each step's window W (one for the batch, or for each group of a staggered
+            decode) from 0 to num_draft_tokens to maximize the expected tokens per second,
+            (n + sum over the n jobs of the running products of the drafts' estimated acceptance up
+            to W) / T(n, W): the estimates from the head's winning logit, calibrated online against
+            the verified drafts (DraftConfidenceCalibrator), T the measured wall time of such steps
+            (median of the last ones, for every window timed at first and from time to time after).
+            W = 0 verifies no draft that step (the head's first draft is still made). Speculative
+            decoding keeps the target's tokens; the window decides what each pass verifies (on the
+            cards passes of other widths can move a position's logits in the last bits, as between
+            two fixed windows). Takes the place of dynamic_draft_tokens for the MTP head. Can be switched at any time (attribute of the same
+            name). EXL3_DRAFT_WINDOW=cost in the environment turns it on for callers that do not pass
+            the argument. See _dw_begin() and generator/draft_window.py.
+
+        :param draft_window_set:
+            The windows draft_window = "cost" may choose from, a list or "0,1,3" (EXL3_DRAFT_WINDOW_SET);
+            None: every window from 0 to num_draft_tokens. Each window is a shape of the verification
+            pass and of the head's update, with graphs of its own on the cards.
+
+            A test hook, read from the environment only: EXL3_DRAFT_WINDOW_SCHEDULE="3" or "0,1,2,3"
+            makes draft_window = "cost" take the next window of that schedule at every decode step
+            (cycled, clipped to what the step allows) instead of the policy's choice, so that runs of
+            the cost path can be compared bit for bit (the exact check). Attribute
+            draft_window_schedule (a list or such a string, None for none); see generator/
+            draft_window.py.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -377,6 +446,11 @@ class Generator:
         # The widest verification pass any round can take: the regular drafter's window or a hybrid draft
         self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
         self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
+        # A QSA raw-key ring (Cache(qsa_raw_tail), cache/qsa.py) keeps the block the next pass starts
+        # in only for verification passes it was sized for
+        if getattr(cache, "qsa_raw_tail", 0) or getattr(draft_cache, "qsa_raw_tail", 0):
+            from ..cache.qsa import check_raw_tail
+            check_raw_tail([cache, draft_cache], self.max_draft_tokens + 1, model)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
@@ -400,6 +474,25 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
+
+        # Readbacks of drafted and sampled tokens by the decode steps (each a host wait for the GPU),
+        # counted whatever the switches: decode steps that sampled, readbacks they and their draft
+        # steps made. Not counted: a job's first token (its NaN check and timing are a wait each)
+        self.readback_stats = {"steps": 0, "readbacks": 0}
+
+        # Speculative windows sampled in one call each and read back together (_verify_windows):
+        # windows sampled so, windows left to the serial path while the switch is on (and why)
+        self.mtp_batched_verify = mtp_batched_verify or \
+            os.environ.get("EXL3_MTP_BATCHED_VERIFY", "0") not in ("", "0")
+        self.mtp_verify_stats = {"windows": 0, "serial": 0, "readbacks": 0, "fallbacks": {}}
+
+        # The head's cache brought up to the accepted tokens, and the next draft made, in one pass
+        # (_mtp_fold): head passes it issued, rows it brought up to date in them (each job's), rows
+        # that also drafted their next token, draft steps that took those drafts without running the
+        # head, draft steps that ran it with some job's draft left unused
+        self.mtp_batched_update = mtp_batched_update or \
+            os.environ.get("EXL3_MTP_BATCHED_UPDATE", "0") not in ("", "0")
+        self.mtp_update_stats = {"passes": 0, "rows": 0, "folds": 0, "fold_drafts": 0, "fold_misses": 0}
 
         # Staggered decode (iterate_staggered)
         self._stagger_init(stagger_decode)
@@ -582,6 +675,37 @@ class Generator:
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # The MTP draft window chosen per step from a measured cost curve (_dw_begin). The policy
+        # (generator/draft_window.py) is made at the first step that uses it; draft_window_stats
+        # are its counters, the curve among them
+        if draft_window == "fixed":
+            draft_window = os.environ.get("EXL3_DRAFT_WINDOW", "").strip().lower() or "fixed"
+        if draft_window not in ("fixed", "cost"):
+            raise ValueError(f'draft_window must be "fixed" or "cost", not {draft_window!r}')
+        self.draft_window = draft_window
+        if draft_window_set is None:
+            draft_window_set = os.environ.get("EXL3_DRAFT_WINDOW_SET")
+        self.draft_window_set = parse_windows(draft_window_set)
+        # The test hook's window schedule (draft_window.py): None unless the environment asks
+        self.draft_window_schedule = parse_schedule(os.environ.get("EXL3_DRAFT_WINDOW_SCHEDULE"))
+        if self.draft_window_schedule is not None:
+            print(f" !! EXL3_DRAFT_WINDOW_SCHEDULE={os.environ.get('EXL3_DRAFT_WINDOW_SCHEDULE')}: a test hook, the "
+                  "MTP draft window follows that schedule" + (" (draft_window = \"cost\" only: no effect with "
+                  "the window fixed)" if self.draft_window != "cost" else ""), flush = True)
+        self.draft_window_policy = None
+        self.draft_window_stats = None
+        self._dw_round = None
+        self._dw_dirty = False
+        if self.draft_window == "cost":
+            if not self.mtp_draft:
+                print(' !! draft_window = "cost" chooses the MTP head\'s window: no MTP head, the window stays fixed',
+                      flush = True)
+            else:
+                if self.draft_window_set and max(self.draft_window_set) > self.num_draft_tokens:
+                    print(f" !! Draft windows above num_draft_tokens ({self.num_draft_tokens}) are never taken: "
+                          f"{self.draft_window_set}", flush = True)
+                self._dw_policy()
 
 
     def num_remaining_jobs(self):
@@ -773,6 +897,10 @@ class Generator:
 
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
+        # The test hook's draft window schedule starts again with each stretch of work (a run of
+        # the exact check takes it from its first entry, whatever ran before)
+        if self.draft_window_policy is not None and not self.pending_jobs and not self.active_jobs:
+            self.draft_window_policy.restart_schedule()
         self.pending_jobs.append(job)
         if self.disk_page_cache is not None:
             # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
@@ -918,6 +1046,11 @@ class Generator:
         if self._stagger_backlog:
             results, self._stagger_backlog = self._stagger_backlog, []
         self.iterate_start_jobs(results)
+
+        # With the cost-chosen draft window: a decode step with a prompt being ingested in the same
+        # iteration is not timed (_dw_end)
+        if self.draft_window == "cost":
+            self._dw_dirty = any(not job.is_prefill_done() for job in self.active_jobs)
 
         # Perform one round of prefill
         self._prefill_round(results)
@@ -1323,6 +1456,7 @@ class Generator:
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
+        self._dw_round = None
         jobs = self._step_jobs()
 
         # Get shape of active batch
@@ -1379,7 +1513,31 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
-        for idx in range(window):
+
+        # With draft_window = "cost" the window is chosen as the head drafts (_dw_begin): the head's
+        # confidences come back with each position's drafts, the policy says when to stop and which
+        # window to verify. It takes the place of the confidence-target draft
+        dw = self._dw_begin(batch_size)
+        if dw is not None:
+            cal = None
+
+        # With mtp_batched_update the head's update of the last step made each job's first draft
+        # already (_mtp_fold), at the position it stands at: read back, the head runs from the second
+        # draft token on. One job without one and the head drafts for all, as always
+        start = 0
+        first_conf = None
+        if self.mtp_batched_update:
+            start, temp_hidden, first_conf = self._mtp_take_folds(
+                jobs, batch_size, batch_ids, cache_seqlens, temp_hidden, dw is not None,
+            )
+        stop = False
+        if dw is not None:
+            dw.start = start
+            window = dw.draft_limit()
+            if start:
+                stop = dw.add(first_conf)
+
+        for idx in range(start, start if stop else window):
             params = {
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
@@ -1388,16 +1546,29 @@ class Generator:
                 "cache_seqlens": cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
             }
-            if cal is not None:
+            if cal is not None or dw is not None:
                 params["export_draft_conf"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
+            conf_buf = self._dw_stage_conf(params.get("draft_conf"), batch_size) if dw is not None else None
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            if self.mtp_batched_update:
+                # The next draft step's inputs from the copy just read back, not a second readback
+                batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
+                self._note_readbacks(1)
+            else:
+                batch_ids.copy_(new_ids)
+                self._note_readbacks(2)
             cache_seqlens += 1
             temp_hidden = batch_state
+            if dw is not None:
+                # The confidences came back with the drafts (the blocking copy above waited for them)
+                dw.passes += 1
+                if dw.add(None if conf_buf is None else conf_buf.view(-1).tolist()):
+                    break
+                continue
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
                 c = draft_conf.float().cpu()
@@ -1408,6 +1579,17 @@ class Generator:
                     window = idx + 1
                     break
 
+        if dw is not None:
+            # The window the policy chose; 0 verifies no draft (the step samples one token per job)
+            window = dw.close()
+            self._dw_round = dw
+            if window == 0:
+                # Not verified, but the token the step samples labels the first draft (_dw_end)
+                dw.probe = self.draft_ids_pinned[:batch_size, 0].tolist()
+                return None
+            dw.drafts = self.draft_ids_pinned[:, :window]
+            return dw.drafts
+
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
                 "ids": self.draft_ids_pinned[:batch_size, :window],
@@ -1416,6 +1598,136 @@ class Generator:
             }
 
         return self.draft_ids_pinned[:, :window]
+
+
+    # ---------------------------------------------------------------------------------------
+    #   The MTP draft window chosen from a measured cost curve (draft_window = "cost")
+    # ---------------------------------------------------------------------------------------
+
+    def _dw_policy(self) -> DraftWindowPolicy | None:
+        """The cost policy of the draft window when it is on (draft_window = "cost", the MTP head
+        drafting), else None. Made at the first use."""
+        if self.draft_window != "cost" or not self.mtp_draft:
+            return None
+        policy = self.draft_window_policy
+        if policy is None:
+            policy = self.draft_window_policy = DraftWindowPolicy(self.draft_window_set)
+            self.draft_window_stats = policy.stats
+        return policy
+
+
+    def _dw_begin(self, n: int):
+        """
+        The draft step of n jobs starts: the round of the cost policy that chooses its window
+        (DraftWindowRound), None when the policy is off.
+
+        A prompt chunk under way on the prefill thread (or two in the pipeline) runs beside this
+        step's decode only because the decode is at most side_max_rows rows x tokens, which
+        _decode_rows counted at the narrowest window the policy may take: the window is capped so
+        the verification pass stays within that (n x (1 + W) rows; the head's fold has as many).
+        Such a step is not timed, and neither is one in an iteration that ingests a prompt.
+        """
+        policy = self._dw_policy()
+        if policy is None:
+            return None
+        cap = None
+        if self._side is not None or any(p.future is not None for p in self._pipe):
+            cap = self.side_max_rows // max(1, n) - 1
+        return policy.begin(
+            "s" if self._step_group is not None else "r", n, self.num_draft_tokens, cap,
+            timed = not self._dw_dirty and cap is None,
+            switches = (bool(self.mtp_batched_verify), bool(self.mtp_batched_update)),
+            schedule = self.draft_window_schedule,
+        )
+
+
+    def _dw_stage_conf(self, conf, n: int):
+        """The head's confidences of a drafted position (draft_conf: the winning logit per row),
+        copied into pinned memory without a wait of their own: the blocking readback of the drafts
+        that follows on the same stream completes it. None when the head exported none (or not
+        one per row)."""
+        if conf is None or conf.numel() != n:
+            return None
+        buf = self._staging("dw_conf", n, 1, torch.float)
+        buf.copy_(conf.reshape(n, 1).float(), non_blocking = True)
+        return buf
+
+
+    def _dw_end(self, dw, jobs, logit_mapping, accepted_lengths, rewound_jobs, windows, draft_tokens):
+        """
+        A decode step's sampling is done (the host has just waited for its pass): the step's time,
+        the calibrator's labels and the counters of the cost policy. Returns the round when the step
+        verified the policy's own window (not a hybrid round's), else None.
+
+        The step's time is from the end of the last decode step's sampling to now, so it includes
+        everything a step costs (the last step's head update, the draft passes, the pass, the
+        sampling, the caller between two iterate() calls), and goes to the curve only if nothing
+        else ran in it: the same jobs (no job started, ended or was requeued since), no prompt
+        ingested in the iteration (_dw_dirty), no tail checkpoint taken, no cap on the window, the
+        head drafting no more positions than the window verifies, and in a staggered decode a call
+        that also issued the next group. A staggered call's time goes to the group it sampled.
+
+        Labels: with the window sampled at once (mtp_batched_verify) the target's sample at every
+        position of the window was made as if the drafts before it were accepted, so every
+        position is a label (with a filter, up to the first draft not matched); serially, the
+        accepted positions and the first one that was not. A window of 0 labels the first draft
+        (made, not verified) with the token the step sampled, so the labels never stop while the
+        policy verifies nothing.
+        """
+        policy = self.draft_window_policy
+        if policy is None:
+            return None
+        t = time.perf_counter()
+        staggered = self._step_group is not None
+        own = dw is not None and (draft_tokens is dw.drafts if dw.window else draft_tokens is None)
+        tail = getattr(self, "tail_stats", None)
+        signature = (
+            staggered, bool(self.mtp_batched_verify), bool(self.mtp_batched_update),
+            tail.get("stashes") if tail else None, tuple(id(j) for j in self.active_jobs),
+        )
+        clean = own and not self._dw_dirty and not dw.capped and dw.passes == dw.expected_passes() \
+            and (not staggered or self._flight is not None)
+        policy.point(t, signature, dw.key() if own else None, clean, own and dw.target is not None)
+        if dw is None:
+            return None
+        if not own:
+            policy.overridden(dw)
+            return None
+
+        w = dw.window
+        rows = [job for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
+        accepted = 0
+        if len(rows) == dw.n == len(accepted_lengths):
+            for row, job in enumerate(rows):
+                n_acc = accepted_lengths[row] - 1
+                accepted += n_acc
+                if id(job) in rewound_jobs or not dw.conf:
+                    continue
+                window = windows.get(id(job)) if windows else None
+                if w == 0:
+                    # The first draft against the token the target sampled there
+                    seq = job.sequences[0]
+                    m = len(seq.sequence_ids)
+                    labels = [(0, dw.probe[row] == seq.sequence_ids.torch_slice(m - 1, m).item())]
+                elif window is not None:
+                    # (with a filter, the rows past a draft its mask refused repeat the last mask:
+                    # not labels)
+                    drafts = draft_tokens[row, :w].tolist()
+                    upto = min(w, window[1] + 1) if job.filters else w
+                    labels = [(r, window[0][r] == drafts[r]) for r in range(upto)]
+                else:
+                    drafts = draft_tokens[row, :w].tolist()
+                    labels = [(r, True) for r in range(n_acc)]
+                    if n_acc < w:
+                        seq = job.sequences[0]
+                        m = len(seq.sequence_ids)
+                        labels.append((n_acc, drafts[n_acc] == seq.sequence_ids.torch_slice(m - 1, m).item()))
+                for r, ok in labels:
+                    conf = dw.conf[r] if r < len(dw.conf) else None
+                    if conf is not None:
+                        policy.label(conf[row], ok)
+        policy.finish(dw, sum(accepted_lengths), accepted)
+        return dw
 
 
     # TODO: Refactor, share code with other draft fns
@@ -1761,11 +2073,17 @@ class Generator:
     def _decode_rows(self) -> int:
         """Rows x tokens of the decode step the jobs past their prompt make together, the
         verification pass counted at its widest (max_draft_tokens: the hybrid draft's window is
-        decided after the prefill round)."""
+        decided after the prefill round). With the cost-chosen draft window (and no hybrid draft)
+        it is counted at the narrowest window the policy may take: when a chunk then runs beside
+        the step, the draft step keeps the window within side_max_rows (_dw_begin)."""
+        width = 1 + self.max_draft_tokens
+        policy = self._dw_policy()
+        if policy is not None and not self.hybrid_draft_tokens:
+            width = 1 + policy.windows_for(self.num_draft_tokens)[0]
         rows = 0
         for job in self.active_jobs:
             if job.is_prefill_done():
-                rows += len(job.sequences) * (1 + self.max_draft_tokens)
+                rows += len(job.sequences) * width
         return rows
 
 
@@ -2884,6 +3202,9 @@ class Generator:
         sampling filters start); the results list is the one of the iterate() call that resumes
         the step, which need not be the call that started it (iterate_staggered).
         """
+        # The cost policy's round of this step's window (iterate_draftmodel_mtp_gen made it, for
+        # this step only)
+        dw, self._dw_round = self._dw_round, None
         jobs = self._step_jobs()
 
         # Get shape of active batch
@@ -3006,6 +3327,7 @@ class Generator:
         for job in batch_jobs:
             job.prepare_logit_mask()
             job.prepare_sampling_past_ids()
+        self._note_readbacks(0, step = True)
 
         # TODO: Batch sampling
         # Pass to jobs to sample
@@ -3046,6 +3368,7 @@ class Generator:
         # launch-to-readback round trip per job. Sampler launch order (and with it each job's
         # RNG draw) matches the serial loop exactly. Per-job constraints (filters, penalties)
         # are unaffected because no job's token depends on another job's result.
+        windows = None
         if draft_tokens is None and batch_logits.shape[1] == 1:
             # Single-token results stage through one pinned buffer and one synchronize, so the
             # batch pays one launch-to-readback round trip instead of one per job
@@ -3067,6 +3390,7 @@ class Generator:
                 launched.append((job, token_logits, sampled))
             if launched:
                 torch.cuda.synchronize(batch_logits.device)
+                self._note_readbacks(1)
                 # The sampled tokens are the next forward's inputs
                 self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
@@ -3097,17 +3421,30 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            # With mtp_batched_verify the windows that can be sampled at once are, and read back
+            # together: id(job) -> (sampled tokens, drafts matched from the first). The serial loop
+            # below then takes their tokens from there, the rest as before
+            windows = None
+            if draft_tokens is not None and self.mtp_batched_verify and self.mtp_draft:
+                windows = self._verify_windows(jobs, logit_mapping, batch_logits, draft_tokens)
+
             for idx, (job, a, b) in enumerate(zip(jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+                window = windows.get(id(job)) if windows else None
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if window is None:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
+                        self._note_readbacks(1)
+                    else:
+                        next_token = torch.tensor([[window[0][i]]], dtype = torch.long)
+                        next_k_tokens, next_k_probs, next_prob = None, None, None
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -3162,7 +3499,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        if window is not None:
+                            mismatch = i >= window[1]
+                        else:
+                            mismatch = draft_tokens[j, i].item() != sampled_token.item()
+                        if mismatch or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -3170,6 +3511,11 @@ class Generator:
                         else:
                             job.accepted_draft_tokens += 1
                             accepted_length += 1
+
+                            # A window sampled at once had every position's mask and past IDs made
+                            # ahead; receive_sample has fed the filters the token
+                            if window is not None:
+                                continue
 
                             # Advance filters
                             for f in job.filters:
@@ -3206,6 +3552,10 @@ class Generator:
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+
+        # The cost-chosen draft window: this step's time, the calibrator's labels, the counters
+        if dw is not None or self.draft_window == "cost":
+            dw = self._dw_end(dw, jobs, logit_mapping, accepted_lengths, rewound_jobs, windows, draft_tokens)
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)
@@ -3271,7 +3621,12 @@ class Generator:
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
-        if self.mtp_draft:
+        if self.mtp_draft and self.mtp_batched_update:
+            self._mtp_update(
+                jobs, logit_mapping, batch_ids, block_index, p_cache_seqlens, p_export_states[-1],
+                accepted_lengths, rewound_jobs, completed_jobs + requeuing_jobs, draft_tokens, dw,
+            )
+        elif self.mtp_draft:
             target_hidden = p_export_states[-1]
             accepted_idx = 0
             for job, a_idx, b_idx in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
@@ -3324,6 +3679,287 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def _mtp_update(self, jobs, logit_mapping, batch_ids, block_index, cache_seqlens, target_hidden,
+                    accepted_lengths, rewound_jobs, done_jobs, draft_tokens, dw = None):
+        """
+        The MTP head's update after a verification (mtp_batched_update), in place of a head pass per
+        job that accepted a draft (positions K+1..K+A-1, the accepted drafts with the target's hidden
+        states) and the next iteration's draft pass (position K+A, the token sampled after them, with
+        the target's state at K+A-1).
+
+        A job that goes on generating is folded (_mtp_fold): one pass of the head over all of them
+        writes positions K+1..K+W+1 (W the window) and drafts from position K+A. The rest of the
+        jobs that accepted a draft (a job that ended or was requeued, whose pages may end at K+W, or
+        a window that is not the head's own: a hybrid round, the calibrated draft, which drafts step
+        by step) get one batched pass over K+1..K+A-1 (_mtp_update_pass). A job a banned-string
+        rewind abandoned gets neither (its carry is gone; drafting pauses until the next target pass,
+        as without the switch).
+
+        Why writing past a job's accepted tokens is harmless: the head's cache has the target's page
+        layout, attention reads stop at each row's position, and a job's position only moves forward
+        from K+A through positions written again before they are read (the next pass that reaches a
+        position writes it first, as the target's verification pass does over rejected drafts). The
+        positions are on pages the job owns: up to K+W the verification pass wrote them; past it a
+        folded job still generates, so its next verification will write up to K+A+W (_fold_fits
+        checks the page table all the same).
+
+        With the window chosen by the cost policy (dw: the step verified the window it chose, of any
+        width up to num_draft_tokens, 0 included) the jobs are folded too: the fold's content does
+        not depend on the window (position K+i pairs the token there with the target's state at
+        K+i-1, whoever drafted it), only its width does. A window of 0 is folded over K+1: the
+        head's cache at K was written this step, by the draft pass or by the last step's fold
+        whose first draft the step took.
+        """
+        width = batch_ids.shape[-1]
+        if dw is not None:
+            fold = True
+        else:
+            fold = draft_tokens is not None and draft_tokens.shape[-1] == self.num_draft_tokens and \
+                self.draft_calibrator is None
+        done = {id(job) for job in done_jobs}
+        folds, updates = [], []
+        row = 0
+        for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b:
+                continue
+            n = accepted_lengths[row]
+            row += 1
+            if id(job) in rewound_jobs:
+                continue
+            # As without the switch: what the regular draft pass starts from, should this job need one
+            job.mtp_last_hidden = target_hidden[a:b, n - 1:n, :].clone()
+            kv = int(cache_seqlens[a])
+            if fold and id(job) not in done and job.sequences[0].kv_position == kv + n and \
+                    self._fold_fits(job, kv + width):
+                folds.append((job, a, n))
+            elif n > 1:
+                updates.append((job, a, n))
+        if updates:
+            self._mtp_update_pass(updates, batch_ids, block_index, cache_seqlens, target_hidden)
+        if folds:
+            self._mtp_fold(folds, batch_ids, cache_seqlens, target_hidden)
+
+
+    @staticmethod
+    def _fold_fits(job, last: int) -> bool:
+        """Whether position `last` of a job is on a page it owns, in its block table"""
+        seq = job.sequences[0]
+        page = last // PAGE_SIZE
+        return page < len(seq.allocated_pages) and page < seq.block_index_tensor.shape[-1]
+
+
+    def _mtp_update_pass(self, rows, batch_ids, block_index, cache_seqlens, target_hidden):
+        """One pass of the head over positions K+1..K+S of each row (S the most drafts a row
+        accepted), the drafts with the target's hidden states: what a head pass per job writes, and
+        past a row's own accepted drafts positions the verification pass wrote too (see _mtp_update)."""
+        span = max(n for _, _, n in rows) - 1
+        k = len(rows)
+        ids = self._staging("mtp_update_ids", k, span, torch.long)
+        seqlens = self._staging("mtp_update_seqlens", k)
+        table = self._staging("mtp_update_table", k, block_index.shape[-1])
+        hidden = []
+        for r, (job, a, n) in enumerate(rows):
+            ids[r].copy_(batch_ids[a, 1:1 + span])
+            seqlens[r] = cache_seqlens[a] + 1
+            table[r].copy_(block_index[a])
+            hidden.append(target_hidden[a:a + 1, :span, :])
+        self.draft_model.prefill(ids, {
+            "attn_mode": "flash_attn",
+            "block_table": table,
+            "cache": self.draft_cache,
+            "cache_seqlens": seqlens,
+            "target_hidden": torch.cat(hidden, dim = 0),
+        })
+        self.mtp_update_stats["passes"] += 1
+        self.mtp_update_stats["rows"] += k
+
+
+    def _mtp_fold(self, rows, batch_ids, cache_seqlens, target_hidden):
+        """
+        One pass of the head over positions K+1..K+W+1 of each job that goes on generating, and its
+        next draft (mtp_batched_update, see _mtp_update). Position K+i pairs the token at K+i with
+        the target's hidden state at K+i-1: the accepted drafts for i < A, the token sampled after
+        them for i = A, the rejected drafts (and a filler) past it. The head's output at K+A is
+        what the next draft pass would compute, so the job's first draft is taken from there and
+        kept on the job (mtp_fold) for the next draft step, with the head's state at that position
+        for the draft tokens after it. Nothing is read back here: the next draft step does it.
+        """
+        width = batch_ids.shape[-1]
+        k = len(rows)
+        pages = max((int(cache_seqlens[a]) + width) // PAGE_SIZE + 1 for _, a, _ in rows)
+        pages = (pages + 15) // 16 * 16
+        ids = self._staging("mtp_fold_ids", k, width, torch.long)
+        seqlens = self._staging("mtp_fold_seqlens", k)
+        table = self._staging("mtp_fold_table", k, pages)
+        table.zero_()
+        hidden = []
+        for r, (job, a, n) in enumerate(rows):
+            seq = job.sequences[0]
+            ids[r, :width - 1].copy_(batch_ids[a, 1:])
+            ids[r, width - 1] = batch_ids[a, width - 1]
+            last = len(seq.sequence_ids)
+            ids[r, n - 1] = int(seq.sequence_ids.torch_slice(last - 1, last).item())
+            seqlens[r] = cache_seqlens[a] + 1
+            src = seq.block_index_tensor[:, :pages]
+            table[r, :src.shape[-1]].copy_(src[0])
+            hidden.append(target_hidden[a:a + 1, :width, :])
+        params = {
+            "target_hidden": torch.cat(hidden, dim = 0),
+            "attn_mode": "flash_attn",
+            "block_table": table,
+            "cache": self.draft_cache,
+            "cache_seqlens": seqlens,
+            "draft_step": 0,
+        }
+        # The cost policy reads the first draft's confidence with the draft (_mtp_take_folds)
+        with_conf = self._dw_policy() is not None
+        if with_conf:
+            params["export_draft_conf"] = True
+        state = self.draft_model.forward(ids, params)
+        picked = torch.cat([state[r:r + 1, n - 1:n, :] for r, (_, _, n) in enumerate(rows)], dim = 0)
+        lm_head = self.model.modules[self.model.logit_layer_idx]
+        picked = lm_head.prepare_for_device(picked, params)
+        drafted = self.draft_model.sample_from_state(picked, params)
+        conf = params.get("draft_conf") if with_conf else None
+        deeper = self.num_draft_tokens > 1
+        for r, (job, a, n) in enumerate(rows):
+            job.mtp_fold = (
+                int(cache_seqlens[a]) + n, drafted[r:r + 1], picked[r:r + 1] if deeper else None,
+                conf[r:r + 1] if conf is not None else None,
+            )
+        stats = self.mtp_update_stats
+        stats["passes"] += 1
+        stats["rows"] += k
+        stats["folds"] += k
+
+
+    def _mtp_take_folds(self, jobs, batch_size, batch_ids, cache_seqlens, temp_hidden, with_conf = False):
+        """
+        The draft step's first draft token from the last step's fold (mtp_batched_update): when
+        every job of the step has one made at the position it stands at, the drafts are read back
+        (one copy) into the draft and into the inputs of the head's next draft token, the positions
+        move on one, and the head's states at those positions are what it drafts on from. Returns
+        (the first draft token still to make, the hidden states to make it from, the drafts'
+        confidences as host values when with_conf and the folds made them, else None). Every job's
+        fold is used or dropped here: a fold is for one draft step. The confidence-target draft
+        needs the first draft's confidence and takes no fold; the cost policy (with_conf) gets it
+        with the drafts, in the same readback.
+        """
+        ready = [job for job in jobs if job.is_prefill_done()]
+        folds = [getattr(job, "mtp_fold", None) for job in ready]
+        for job in ready:
+            job.mtp_fold = None
+        if (self.draft_calibrator is not None and not with_conf) or not folds or not all(
+            f is not None and f[0] == job.sequences[0].kv_position for f, job in zip(folds, ready)
+        ):
+            if any(f is not None for f in folds):
+                self.mtp_update_stats["fold_misses"] += 1
+            return 0, temp_hidden, None
+        conf = None
+        if with_conf and all(len(f) > 3 and f[3] is not None for f in folds):
+            conf = self._dw_stage_conf(torch.cat([f[3] for f in folds], dim = 0), batch_size)
+        self.draft_ids_pinned[:batch_size, 0:1].copy_(torch.cat([f[1] for f in folds], dim = 0))
+        self._note_readbacks(1)
+        batch_ids.copy_(self.draft_ids_pinned[:batch_size, 0:1])
+        cache_seqlens += 1
+        if self.num_draft_tokens > 1:
+            temp_hidden = torch.cat([f[2] for f in folds], dim = 0)
+        self.mtp_update_stats["fold_drafts"] += 1
+        return 1, temp_hidden, (conf.view(-1).tolist() if conf is not None else None)
+
+
+    def _note_readbacks(self, n: int, step: bool = False):
+        """Count readbacks of drafted or sampled tokens (readback_stats), and a decode step that
+        samples. A Generator made without __init__ has no counters"""
+        stats = getattr(self, "readback_stats", None)
+        if stats is not None:
+            stats["readbacks"] += n
+            if step:
+                stats["steps"] += 1
+
+
+    @staticmethod
+    def _host_wait(device):
+        """
+        Wait on the host for what has been issued so far on the current stream of `device`, the
+        stream the decode step's sampling and its copies go to: not for the whole device, so a
+        copy stream of the CPU expert worker's host or anything else on another stream of the card
+        is not waited for (a chunk on the prefill thread shares the stream, and is waited for up to
+        here, as by any readback). Nothing to wait for off CUDA.
+        """
+        device = torch.device(device)
+        if device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            event.synchronize()
+
+
+    def _verify_windows(self, jobs, logit_mapping, batch_logits, draft_tokens) -> dict | None:
+        """
+        Speculative windows sampled at once (mtp_batched_verify). The serial path samples a job's
+        window a position at a time, each a sampler call and a readback, the next position only
+        once the one before matched its draft. Here every job that can (Job.window_sampling_why)
+        has its window sampled in one call (Job.sample_window: position r as if drafts[:r] were
+        accepted), the samples are compared with the drafts on the device and the number of drafts
+        matched from the first is counted there, and the tokens and counts of every such job come
+        back in one copy and one wait. The serial loop then accepts from them exactly as from its
+        own samples: a position whose draft did not match ends the window, and so do what it checks
+        on the host, a recurrent checkpoint boundary (the tail checkpoint's too), a stop condition, a
+        requeue (positions sampled past where the window ends are never used). Jobs that cannot take
+        the serial path in the same step, after this wait.
+
+        Returns {id(job): (tokens of the window, drafts matched)}, or None when no job's window was
+        sampled so.
+        """
+        stats = self.mtp_verify_stats
+        width = draft_tokens.shape[-1]
+        rows = width + 1
+        if width < 1:
+            return None
+
+        taken = []
+        samples = []
+        j = 0
+        for job, a, b in zip(jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b:
+                continue
+            row = j
+            j += 1
+            why_fn = getattr(job, "window_sampling_why", None)
+            why = "job" if why_fn is None else why_fn()
+            if why is None:
+                sampled = job.sample_window(batch_logits[a:b, :, :], draft_tokens[row, :width].tolist())
+                if sampled is None:
+                    why = "filter_error"
+            if why is not None:
+                stats["serial"] += 1
+                stats["fallbacks"][why] = stats["fallbacks"].get(why, 0) + 1
+                continue
+            taken.append((job, row))
+            samples.append(sampled.view(1, rows))
+        if not taken:
+            return None
+
+        # The drafts of the jobs taken, uploaded from pinned staging; samples and matched counts
+        # come back through one pinned buffer, in one copy
+        n = len(taken)
+        device = batch_logits.device
+        drafts = self._staging("verify_drafts", n, width, torch.long)
+        for k, (job, row) in enumerate(taken):
+            drafts[k].copy_(draft_tokens[row, :width])
+        sampled = torch.cat(samples, dim = 0)
+        drafted = drafts.to(device, non_blocking = True)
+        matched = (sampled[:, :width] == drafted).long().cumprod(dim = 1).sum(dim = 1, keepdim = True)
+        out = self._staging("verify_out", n, rows + 1, torch.long)
+        out.copy_(torch.cat((sampled, matched), dim = 1), non_blocking = True)
+        self._host_wait(device)
+        self._note_readbacks(1)
+        stats["windows"] += n
+        stats["readbacks"] += 1
+
+        return {id(job): (r[:rows], r[rows]) for (job, _), r in zip(taken, out.tolist())}
 
 
     def reap_failed_job(self, job, error, results: list):

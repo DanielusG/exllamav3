@@ -254,6 +254,19 @@ order. flash-attn is an optional dependency; when it is not installed, this swit
 FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
 attention sinks); this switch exists for A/B comparison.
 
+### `EXL3_QSA_RAW_TAIL` (default: `0`)
+
+QSA attention layers (Qwen3.8-Flash-Next, `cache/qsa.py`): keep the indexer's raw keys only for the
+blocks being built. Upstream keeps a raw key for every token of every page (64 KiB per page and QSA
+layer), but only the pooled-key rebuild of the block an append starts in reads them, and only the
+last 3 before the append. With `1` the raw plane is a ring of 32 tokens per page (an integer from 19
+to 256: a ring of that many tokens), 56 KiB less VRAM per page and layer with 32, and page images
+in the CPU and disk tiers without the raw keys (the disk tier's fingerprint changes with them: a
+directory of its own). The pooled keys, the selection and the attention output are bit for bit the
+same. Read when the `Cache` is made; `Cache(qsa_raw_tail = ...)` takes precedence. Refused, with a
+warning, for models without recurrent states; a generator whose drafts are longer than the ring
+serves (28 draft tokens with 32) refuses to start. FORK.md has the rules.
+
 ## EXL3 GEMM / GEMV
 
 ### `EXL3_GEMV` (default: `1`)
@@ -351,6 +364,20 @@ their Gumbel noise by token id rather than sorted position, so individual seeds 
 samples from the same distribution. Stacks the collapse does not recognize fall back to the
 step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
 against the reference implementation.
+
+## Speculative decoding
+
+### `EXL3_DRAFT_WINDOW_SCHEDULE` (default: unset)
+
+A test hook of the fork's cost draft window (`Generator(draft_window = "cost")`, `EXL3_DRAFT_WINDOW=cost`;
+FORK.md, "The MTP draft window chosen from a measured cost curve"), not for production. A comma-separated
+list of windows (`3`, `0,1,2,3`): every decode step takes the next window of the list, cycled per step,
+instead of the window the policy would choose from its measured step times, so the windows a run takes
+are repeatable (the exact check's scenario 9 uses it). Each window is clipped to what the step allows
+(`EXL3_DRAFT_WINDOW_SET`, `num_draft_tokens`, the cap beside a prompt chunk); everything else is the cost
+path's. The schedule starts again when the generator gets a job while it has none. Read once, when the
+generator is made (`Generator.draft_window_schedule` changes it afterwards); no effect with the fixed
+window. Unset, the policy never reaches the hook's code.
 
 ## CPU MoE offload
 

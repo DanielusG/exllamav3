@@ -108,3 +108,35 @@ class DraftConfidenceCalibrator:
         k = below[-1] if below else populated[0]
         tested, accepted = self.bins[k]
         return accepted / tested
+
+    def estimate_many(self, scores: list | None) -> list | None:
+        """
+        estimate() for several scores, the populated bins sorted once. None (no scores: a drafter
+        that exports none) gives None, for the caller to fall back on rate().
+        """
+        if scores is None:
+            return None
+        if self.total < self.burn_in or not self.bins:
+            return [1.0] * len(scores)
+        populated = sorted(k for k, v in self.bins.items() if v[0] >= self.min_count)
+        if not populated:
+            return [1.0] * len(scores)
+        out = []
+        for score in scores:
+            idx = math.floor(score / self.bin_width)
+            k = populated[0]
+            for p in populated:
+                if p > idx:
+                    break
+                k = p
+            tested, accepted = self.bins[k]
+            out.append(accepted / tested)
+        return out
+
+    def rate(self) -> float:
+        """Acceptance over every bin (decayed), 1.0 until burn_in labels have been seen."""
+        if self.total < self.burn_in:
+            return 1.0
+        tested = sum(v[0] for v in self.bins.values())
+        accepted = sum(v[1] for v in self.bins.values())
+        return accepted / tested if tested > 0 else 1.0
