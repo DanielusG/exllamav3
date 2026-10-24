@@ -1944,13 +1944,17 @@ the GDN fused path's record. `GDNLayerState.staged_shape` exists and nothing cal
 counters boot C set it with `EXL3_MOE_CPU_PROF=1`) brackets every CPU-split submit and collect with
 two `torch.cuda.Event`s recorded on the current stream. Its own work (creating, recording and reading
 the events) is 9.7-11.7% of the generator thread's samples in the night's three counters captures (one
-request at 60k and at 125k, three at 60k), 10.5-15.2% of its issue time, and all of the 2.7% the
+request at 60k and at 125k, three at 60k), 10.5-15.2% of its issue time: of the 16% the report gives
+the CPU split's bookkeeping (60k, one request) 11.7 points are the profiler and 4.6 the split (the
+submit and collect into the CPU expert worker's host, with their launches). All of the 2.7% the
 report counts in `torch.cuda.is_available()` (`_get_available_device_type`, from `current_stream()`
-and events without a device) is inside it. The decode path makes no such call with the profiler off:
+and events without a device) is inside it too. The decode path makes no such call with the profiler off:
 there is nothing of that kind to take out of production's step (the report's first item). The events
 are recorded on the current device's stream, cuda:0, for the layers on cuda:1 too, so the profiler's
 brackets of the second card's layers do not time that card's work. Not changed here (upstream's code).
-Issue times measured with it on include it.
+Issue times measured with it on include it: the night's tooling runs py-spy in its counters mode only
+(`nightprof.py`), so every issue time of the report has it, the A/B of where the generator's thread
+runs (P11c and P12d, 20.0 against 23.5 ms a step) too.
 
 **Measured on the CPU** (`experiments/host_fastpath_bench.py`: the sources loaded off and on as the
 tests load them, the extension a function that does nothing, Qwen3.8-Flash-Next's sizes: 4 streams of
