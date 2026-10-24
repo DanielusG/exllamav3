@@ -1055,9 +1055,17 @@ class Child:
                          "stagger_min_jobs": getattr(gen, "stagger_min_jobs", None)}
         state = {}
         for name in ("stagger_decode", "prefill_thread", "prefill_pipeline", "tail_checkpoint_interval",
-                     "mtp_batched_verify", "mtp_batched_update", "draft_window", "draft_window_schedule"):
+                     "mtp_batched_verify", "mtp_batched_update", "draft_window", "draft_window_schedule",
+                     "mm_content_hash"):
             if hasattr(gen, name):
                 state[name] = getattr(gen, name)
+        # The embeddings' content digests: process-wide, and left on by a generator made with mm_content_hash
+        try:
+            from exllamav3.tokenizer import mm_embedding as _mm
+            if hasattr(_mm, "content_digests"):
+                state["mm_content_digests"] = _mm.content_digests()
+        except Exception:
+            pass
         if hasattr(self.bsm, "hist_prefill_weight"):
             state["hist_prefill_weight"] = self.bsm.hist_prefill_weight()
         if hasattr(c.cache, "qsa_raw_tail"):

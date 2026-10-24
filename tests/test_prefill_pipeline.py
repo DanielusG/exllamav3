@@ -968,7 +968,8 @@ def _load_job():
     stub("util.tensor", SeqTensor = _Any)
     sys.modules[f"{pkg}.util"].profile_opt = lambda *a, **k: None
     sys.modules[f"{pkg}.tokenizer"].MMEmbedding = _Any
-    stub("generator.pagetable", Sequence = _Any, tensor_hash_checksum = lambda ids, prev: b"", random_hash = lambda: b"")
+    stub("generator.pagetable", Sequence = _Any, tensor_hash_checksum = lambda ids, prev: b"",
+         content_hash_checksum = lambda ids, prev: b"", random_hash = lambda: b"")
     stub("generator.filter", Filter = _Any)
     stub("generator.loop_detect", LoopDetector = _Any)
     stub("generator.sampler", Sampler = _Any, DefaultSampler = _Any)

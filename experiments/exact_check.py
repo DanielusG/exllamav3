@@ -110,7 +110,7 @@ FORK_ENV_SWITCHES = (
     "EXL3_STAGGER_DECODE", "EXL3_PREFILL_THREAD", "EXL3_PREFILL_PIPELINE", "EXL3_TAIL_CHECKPOINT",
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
     "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
-    "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE",
+    "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
 )
 
 PROMPTS = [
@@ -1927,6 +1927,9 @@ SWITCHES_OFF = {
     "tail_checkpoint_interval": 0, "hist_prefill_weight": 1.0, "disk_uncache": False,
     "mtp_batched_verify": False, "mtp_batched_update": False, "qsa_raw_tail": 0,
     "draft_window": "fixed", "draft_window_schedule": None,
+    # Content-addressed multimodal pages: the generator's switch, and the embeddings' digests, which it
+    # turns on for the whole process (tokenizer.mm_embedding.content_digests)
+    "mm_content_hash": False, "mm_content_digests": False,
 }
 
 

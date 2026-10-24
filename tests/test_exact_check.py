@@ -1385,6 +1385,11 @@ def test_a_switch_left_on_does_not_pass_for_off():
     assert not EC.switch_is_off("draft_window_schedule", "3") and not EC.switch_is_off("an_unknown_switch", 0)
     for name in ("EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE"):
         assert name in EC.FORK_ENV_SWITCHES
+    # Content-addressed multimodal pages (master's, 2026-10-24): the generator's switch and the digests it
+    # turns on for the process
+    assert "EXL3_MM_CONTENT_HASH" in EC.FORK_ENV_SWITCHES
+    for name in ("mm_content_hash", "mm_content_digests"):
+        assert EC.switch_is_off(name, False) and not EC.switch_is_off(name, True)
 
 
 def test_scenario_1_with_every_switch_of_this_branch_off_says_nothing_about_switches():
@@ -1392,7 +1397,8 @@ def test_scenario_1_with_every_switch_of_this_branch_off_says_nothing_about_swit
     res = fake_results(plan)
     off = {"stagger_decode": False, "prefill_thread": False, "prefill_pipeline": False, "tail_checkpoint_interval": 0,
            "mtp_batched_verify": False, "mtp_batched_update": False, "draft_window": "fixed",
-           "draft_window_schedule": None, "hist_prefill_weight": 1.0, "qsa_raw_tail": 0, "disk_uncache": False}
+           "draft_window_schedule": None, "hist_prefill_weight": 1.0, "qsa_raw_tail": 0, "disk_uncache": False,
+           "mm_content_hash": False, "mm_content_digests": False}
     for rid, rec in res.records["s1-fork"].items():
         if rec.get("op") == "generator":
             rec["switches_state"] = dict(off)
@@ -1400,6 +1406,10 @@ def test_scenario_1_with_every_switch_of_this_branch_off_says_nothing_about_swit
     res.records["s1-fork"]["g0"]["switches_state"]["draft_window"] = "cost"
     text = "\n".join(EC.capture_checks(plan, res)[1])
     assert "non tutti gli interruttori sono spenti (`g0`): draft_window" in text
+    res.records["s1-fork"]["g0"]["switches_state"]["draft_window"] = "fixed"
+    res.records["s1-fork"]["g0"]["switches_state"]["mm_content_digests"] = True
+    text = "\n".join(EC.capture_checks(plan, res)[1])
+    assert "non tutti gli interruttori sono spenti (`g0`): mm_content_digests" in text
 
 
 # --------------------------------------------------------------------------------------------
