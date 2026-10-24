@@ -1867,8 +1867,9 @@ on `master` at fcd111d5. Also in `doc/env_vars.md`.
 
 **Why.** The night profiling of 2026-10-24 (the server's `docs/REPORT-profiling-20261024.md`, 2.2, 2.4
 and 2.6 a): the thread that issues a decode step (`exl3-generator-worker`) spends 25-30 ms of each
-step preparing and launching about a thousand kernels, and with three requests staggered it waits
-for the cards 5-7% of the time: the host is the step. Inclusive shares of that thread (py-spy): the
+step preparing and launching about a thousand kernels (measured with the split profiler on, whose own
+share is 3-4 ms of it: below), and with three requests staggered it waits for the cards 5-7% of the
+time: the host is the step. Inclusive shares of that thread (py-spy): the
 MoE module 27%, the gated residual sites 24% (96 a pass, ~90 µs each), the workspace cache's lookups
 11%, GDN 8%. A good part of it is the same bookkeeping, call after call, for the same shapes: format
 a workspace key string, look it up, slice the backing, view it to the shape.
