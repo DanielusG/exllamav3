@@ -4,6 +4,7 @@ from functools import lru_cache
 import heapq
 import torch
 import hashlib
+import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from ..cache.cache import Cache
@@ -17,6 +18,7 @@ from exllamav3.ext import exllamav3_ext as ext
 import time
 from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+from ..tokenizer import mm_embedding
 from ..util import profile_opt
 
 
@@ -35,6 +37,55 @@ def _randomhash():
 
 tensor_hash_checksum = _tensor_blake2b_checksum
 random_hash = _randomhash
+
+
+def content_hash_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
+    """
+    Fork (content-addressed multimodal pages, Generator.mm_content_hash; FORK.md): the hash of a page of token
+    ids with every placeholder id taken as its embedding's content digest and its row in that embedding
+    (MMDigestRegistry.canonical) instead of as an id, which only means something in this process. The one helper
+    every site that hashes a page uses with the switch on, so that they all agree.
+
+    A page with no placeholder id hashes exactly as tensor_hash_checksum (same function, same bytes), and so does
+    a page with a placeholder id that has no registered digest (an embedding made without one): that page, and
+    every page chained after it, stays as process-local as upstream's (Sequence.mm_first_page keeps them off the
+    disk tier). Otherwise the input, under a blake2b personalization of its own (no text page's input can give
+    the same hash), is (whether there is a previous hash, the id count, the run count), the previous hash, the
+    ids with each placeholder as -1 minus its row (never a text id, which is >= 0), then a (count, 16-byte
+    digest) pair per run of placeholders with one digest: every field is fixed-width or counted, so the input
+    can be read back into the text ids, the placeholders' positions, rows and digests, and the previous hash.
+    Two pages with different images, or with one image at different rows or positions, never give the same
+    input.
+    """
+    a = tensor.numpy().reshape(-1)
+    if not (a >= FIRST_MM_EMBEDDING_INDEX).any():
+        return _tensor_blake2b_checksum(tensor, prev_hash)
+    c = mm_embedding.global_registry.canonical(a)
+    if c is None:
+        return _tensor_blake2b_checksum(tensor, prev_hash)
+    canon, runs = c
+    hasher = hashlib.blake2b(digest_size = 16, person = b"exl3-mm-page")
+    hasher.update(struct.pack("<BQQ", prev_hash is not None, canon.size, len(runs)))
+    if prev_hash is not None:
+        hasher.update(prev_hash)
+    hasher.update(canon.astype("<i8", copy = False).tobytes())
+    for count, digest in runs:
+        hasher.update(struct.pack("<Q", count))
+        hasher.update(digest)
+    return hasher.digest()
+
+
+def same_content(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two runs of token ids stand for the same tokens with content hashing on: equal ids, or equal once
+    each placeholder is taken as (digest, row); placeholders without a digest compare by id"""
+    if torch.equal(a, b):
+        return True
+    if a.shape != b.shape:
+        return False
+    ca = mm_embedding.global_registry.canonical(a.numpy().reshape(-1))
+    cb = mm_embedding.global_registry.canonical(b.numpy().reshape(-1))
+    return ca is not None and cb is not None and bool((ca[0] == cb[0]).all()) and ca[1] == cb[1]
+
 
 def is_content_hash(h: bytes) -> bool:
     # Random (placeholder) hashes are counter values whose top eight bytes stay zero; a blake2b content
@@ -190,7 +241,7 @@ class CachePage:
     # Update hash
     def update_hash(self, newhash = None):
         if newhash is None:
-            newhash = tensor_hash_checksum(self.sequence, self.prev_hash)
+            newhash = self.pagetable.checksum(self.sequence, self.prev_hash)
         assert self.ref_count > 0
         assert self.kv_position == PAGE_SIZE
         del self.pagetable.referenced_pages[self.phash]
@@ -231,15 +282,28 @@ class Sequence:
         # from here on, generated ones included, are not persistable across processes
         mm = (seq_ids[0] >= FIRST_MM_EMBEDDING_INDEX).nonzero()
         self.mm_first_page = int(mm[0]) // PAGE_SIZE if mm.numel() else None
+        # Fork: hashed with content_hash_checksum (Generator.mm_content_hash), set by prepare() for the life of the
+        # sequence, so that all its pages are hashed one way
+        self.content_hash = False
 
         # MTP carry hidden — last hidden state of the previous prefill chunk, used to seed
         # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
         self.mtp_carry_hidden = None
 
 
-    def prepare(self, has_prefix_token: bool, max_new_tokens: int):
+    def prepare(self, has_prefix_token: bool, max_new_tokens: int, content_hash: bool = False):
         self.page_hashes = []
         unique_hashes = set()
+
+        # Fork (Generator.mm_content_hash): a placeholder id with a content digest no longer ties the chain to this
+        # process, only one without does (content_hash_checksum hashes its page as upstream does). A prompt
+        # without placeholders hashes as upstream's, page for page, so it takes upstream's function directly
+        self.content_hash = content_hash
+        checksum = tensor_hash_checksum
+        if content_hash and self.mm_first_page is not None:
+            checksum = content_hash_checksum
+            first = mm_embedding.global_registry.first_undigested(self.sequence_ids.torch()[0].numpy())
+            self.mm_first_page = None if first is None else first // PAGE_SIZE
 
         max_len = len(self.sequence_ids) + max_new_tokens
         if has_prefix_token: max_len += 1
@@ -251,7 +315,7 @@ class Sequence:
             # TODO: profile/optimize hash function
             page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
             assert page_ids.shape[-1] == PAGE_SIZE
-            r_hash = tensor_hash_checksum(page_ids, r_hash)
+            r_hash = checksum(page_ids, r_hash)
             self.page_hashes.append(r_hash)
             unique_hashes.add(r_hash)
 
@@ -289,8 +353,11 @@ class Sequence:
             restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
+        # (fork, content hashing: pages restored from a tier take this sequence's ids, see PageTable.allocate_pages)
+        own_kw = {"own_ids": self.sequence_ids} if self.content_hash else {}
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit,
+                                     **own_kw)
 
         # A page's hash fixes its whole chain, so every sequence that claims the page computes the same flag
         for i, page in enumerate(self.allocated_pages):
@@ -369,6 +436,14 @@ class PageTable:
             "alloc_disk_pages": 0,        # of those, read from the disk tier (by the prefetch or the allocation)
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
         }
+
+
+    def checksum(self, ids: torch.Tensor, prev_hash: bytes | None) -> bytes:
+        """The hash of a page of ids as this generator's jobs compute it (content_hash_checksum with
+        Generator.mm_content_hash on, else upstream's)"""
+        if getattr(self.generator, "mm_content_hash", False):
+            return content_hash_checksum(ids, prev_hash)
+        return tensor_hash_checksum(ids, prev_hash)
 
 
     def reset_page_table(self):
@@ -556,7 +631,8 @@ class PageTable:
         new_unique_pages: int,
         recurrent_pages: list[int] | None,
         protected_hashes: set | None = None,
-        restore_limit: int | None = None
+        restore_limit: int | None = None,
+        own_ids: SeqTensor | None = None
     ):
         """
         Allocate physical cache pages for one sequence.
@@ -570,6 +646,10 @@ class PageTable:
         hybrid recurrent/KV models, recurrent_pages marks which hashed pages also have stashed recurrent
         checkpoints; the usable cached prefix is capped to the longest page prefix that has both valid K/V pages
         and the matching recurrent state.
+
+        own_ids (fork, content hashing): the sequence's ids, whose pages hash to page_hashes. A page restored from
+        a tier then takes them instead of the ids stored with it, which are those of the process that stored it:
+        with content hashing a placeholder id there can stand for another image in this one.
         """
         allocated_pages = []
         available_pages = None
@@ -621,7 +701,10 @@ class PageTable:
                             if tier.promote(h, self.access_serial, protected_hashes) is not None:
                                 entry = tier.fetch(h, op.page_index, self.access_serial)
                         if entry is not None:
-                            op.sequence.copy_(entry["tokens"])
+                            if own_ids is None:
+                                op.sequence.copy_(entry["tokens"])
+                            else:
+                                op.sequence.copy_(own_ids.torch_slice(lp * PAGE_SIZE, (lp + 1) * PAGE_SIZE))
                             op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
                             op.kv_position = PAGE_SIZE
                             self.metrics["alloc_tier_pages"] += 1
@@ -845,7 +928,7 @@ class PageTable:
         # Check individual hashes
         for page in self.all_pages:
             if page.kv_position == PAGE_SIZE and page.phash[:8] != b'\x00\x00\x00\x00\x00\x00\x00\x00':
-                h = tensor_hash_checksum(page.sequence, page.prev_hash)
+                h = self.checksum(page.sequence, page.prev_hash)
                 p_assert(page.phash == h)
 
         # Check job sequences
@@ -856,7 +939,12 @@ class PageTable:
                     i, j = j, min(j + PAGE_SIZE, seq.kv_position)
                     jobt = seq.sequence_ids.torch()[:, i : j]
                     paget = seq.allocated_pages[k].sequence[:, 0 : j - i]
-                    p_assert(torch.equal(jobt, paget))
+                    # With content hashing a page holds the ids of the job that wrote it (or restored it), and an
+                    # embedding with the same digest as this job's has other ids
+                    if getattr(seq, "content_hash", False):
+                        p_assert(same_content(jobt, paget))
+                    else:
+                        p_assert(torch.equal(jobt, paget))
                     k += 1
 
 
