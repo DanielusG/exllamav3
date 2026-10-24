@@ -135,6 +135,7 @@ def load_world(tag: str, fastpath: bool):
             backend = real("util.backend"),
             hc = real("modules.hyperconnections"),
             routing = real("modules.block_sparse_mlp_routing"),
+            moe_cpu = real("modules.block_sparse_mlp_cpu"),
         )
     finally:
         if old is None:
@@ -152,6 +153,17 @@ def test_the_switch_is_read_at_import():
     for w, on in ((OFF, False), (ON, True)):
         assert w.lane.HOST_FASTPATH is on and w.tensor.HOST_FASTPATH is on
         assert w.hc.HOST_FASTPATH is on and w.routing.HOST_FASTPATH is on
+        assert w.moe_cpu._host_fastpath is on
+    # block_sparse_mlp.py (not loadable here) reads the switch the same way, and its fused tier
+    # takes the kept view only with it
+    src = open(os.path.join(REPO, "exllamav3", "modules", "block_sparse_mlp.py")).read()
+    assert 'HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")' in src
+    assert '''            if HOST_FASTPATH:
+                final_hidden_states = self._fast_out_bszn(bsz, eshape)
+            else:
+                final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)''' in src
+    assert '''        if HOST_FASTPATH:
+            self.__dict__.pop("_fast_out", None)''' in src
     # Off: the plain functions are the only ones; on: the plain ones are kept beside the fast ones
     GR0, GR1 = OFF.hc.GatedResidual, ON.hc.GatedResidual
     assert not hasattr(GR0, "_mix_fast") and not hasattr(GR0, "_apply_plain")
@@ -788,3 +800,79 @@ def test_an_entry_made_again_by_another_thread():
     xw_new = params["gr_weighted"][2]
     assert xw_new is not xw_old
     assert xw_new.data_ptr() == gtc.cache[[k for k in gtc.cache if k.endswith("/gr_apply_xw")][0]][1].data_ptr()
+
+
+
+# --------------------------------------------------------------------------------------------
+#   The fused MoE tier's routed sum and the CPU split's collect
+# --------------------------------------------------------------------------------------------
+
+def moe_tail(world, m, bsz, eshape, pending):
+    """What BlockSparseMLP.forward does from its fused decode tier's launch to the CPU split's
+    collect (the branch is read off its source in test_the_switch_is_read_at_import)."""
+    if world.fastpath:
+        fhs = m._fast_out_bszn(bsz, eshape)
+    else:
+        fhs = m.experts_cfg.out_bszn[:bsz].view(eshape)
+    return m.cpu_split_combine(fhs, None, pending, eshape)
+
+
+def make_moe(world, H = 64):
+    class Host:
+        def submit_collect_fused(self, handle, final_2d):
+            world.ext.exl3_moe_split_collect_fused(final_2d, handle)
+
+        def submit_collect(self, pending):
+            world.ext.exl3_moe_split_collect(pending)
+            return torch.zeros(pending[1])
+
+    class FakeMoE(world.moe_cpu.BlockSparseMLP_CPU):
+        pass
+
+    m = FakeMoE()
+    m.cpu_host = Host()
+    m.cpu_layer_idx = 0
+    m.experts_cfg = types.SimpleNamespace(out_bszn = world.tensor.g_tensor_cache.get("cpu", (8, H), torch.float, "moe1_out_bszn"))
+    return m
+
+
+def test_the_routed_sum_and_its_collect():
+    def scenario(world, rec):
+        layers = [make_moe(world), make_moe(world)]
+        for n, (b, s) in enumerate(SHAPES[:9] + [(1, 1), (2, 3), (4, 2)]):
+            for i, m in enumerate(layers):
+                bsz = b * s
+                if bsz > 8:
+                    continue
+                for eshape in (torch.Size((b, s, 64)), (bsz, 64)):
+                    out = moe_tail(world, m, bsz, eshape, ("fused", ("job", n, i)))
+                    world.ext.consume(out)
+                    out = moe_tail(world, m, bsz, eshape, ("copy", (bsz, 64)))
+                    world.ext.consume(out)
+                    out = moe_tail(world, m, bsz, eshape, None)
+                    world.ext.consume(out)
+                # A view of the routed sum of another shape reaches the collect (not the kept one)
+                other = m.experts_cfg.out_bszn[:bsz].view(bsz, 1, 64)
+                world.ext.consume(m.cpu_split_combine(other, None, ("fused", ("x", n)), (bsz, 1, 64)))
+            if n == 4:
+                # a reload: out_bszn is another tensor
+                layers[1].experts_cfg.out_bszn = torch.zeros((8, 64))
+                rec.name({"reloaded_out_bszn": layers[1].experts_cfg.out_bszn})
+    compare(scenario)
+
+
+def test_the_kept_routed_sum_views_are_the_plain_ones():
+    m = make_moe(ON)
+    ob = m.experts_cfg.out_bszn
+    for bsz, eshape in ((1, (1, 1, 64)), (4, torch.Size((2, 2, 64))), (4, (4, 64)), (8, (1, 8, 64)), (4, (2, 2, 64))):
+        v = m._fast_out_bszn(bsz, eshape)
+        p = ob[:bsz].view(eshape)
+        assert (v.data_ptr(), v.shape, v.stride()) == (p.data_ptr(), p.shape, p.stride())
+        assert m._fast_out_bszn(bsz, eshape) is v
+        r = m._fast_rows_view(v)
+        q = p.view(-1, p.shape[-1])
+        assert (r.data_ptr(), r.shape, r.stride()) == (q.data_ptr(), q.shape, q.stride())
+        assert m._fast_rows_view(p) is not r and m._fast_rows_view(p).shape == q.shape
+    m.experts_cfg.out_bszn = torch.zeros((8, 64))
+    v2 = m._fast_out_bszn(1, (1, 1, 64))
+    assert v2.data_ptr() == m.experts_cfg.out_bszn.data_ptr()
