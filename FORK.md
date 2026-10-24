@@ -1988,7 +1988,8 @@ call (the function and, per argument, its value or, for a tensor, the buffer it 
 it is, its offset, shape, strides and dtype), together with every torch operation that is not a view,
 in order. Scenarios: the sites in the order a pass meets them in a three-block toy with the final
 mixer, batch shapes changing from pass to pass, rows past the fused pair, stacks the plain path
-converts, the weighted-copy handoff and a successor on another device, sublayer outputs of every dtype
+converts, the weighted-copy handoff and a successor on another device, two passes of other shapes
+interleaved block by block (the staggered decode's two groups), sublayer outputs of every dtype
 and layout, the conversion and capture passes, entries made between a mix and its apply, the cache
 emptied between passes, a table rebuilt, passes on lanes 1 and 2, two threads issuing at once, an
 entry made again by another thread, the routing buffers at every row count up to past the kept ones,

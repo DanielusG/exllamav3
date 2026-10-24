@@ -16,7 +16,8 @@ kept: those are the only operations the two sequences may differ in, and they ar
 What the scenarios cover: gated residual sites in the order a pass meets them (attention and MLP
 site of each block, the final mixer), batch shapes changing from pass to pass, rows past the fused
 decode pair, stream stacks the plain path converts first, the weighted-copy handoff (to the next
-site, and broken by a successor on another device), sublayer outputs of every dtype the plain path
+site, and broken by a successor on another device), two passes of other shapes interleaved block by
+block (the staggered decode's two groups), sublayer outputs of every dtype the plain path
 casts and non-contiguous ones it copies, the conversion and capture passes, entries added to the
 workspace cache between a mix and its apply, the cache emptied between passes, passes from threads
 on lanes 1 and 2 (their own workspaces), two threads issuing at the same time, the MoE routing
@@ -432,6 +433,38 @@ def test_a_pass_issues_the_same_calls_through_every_batch_shape():
     # matmuls, whose ops are in the same sequence too): the fast path left them alone
     assert {e[1] for e in calls} == {"gr_mix", "hc_apply", "rms_norm"}
     assert any(e[0] == "op" and e[1].startswith("aten.mm") for e in on["MainThread"])
+
+
+def pass_in_steps(model, b, s, kinds = ("float", "half")):
+    """run_pass one block at a time (a generator), with a params dict of its own: two of these
+    advanced in turn issue two passes interleaved block by block, as the staggered decode issues
+    the halves of two groups' passes"""
+    params = {}
+    x = torch.full((b, s, H, D), 0.25, dtype = torch.float)
+    for i, (attn_hc, mlp_hc) in enumerate(model.blocks):
+        for j, site in enumerate((attn_hc, mlp_hc)):
+            post, comb, y, normed = site.mix_norm(x, params, None)
+            out = sublayer(y.half(), kinds[(i + j) % len(kinds)])
+            x = site.apply_(x, out, post, comb, params)
+        yield
+    model.mixer.forward(x, params)
+
+
+def test_two_groups_interleaved_as_the_staggered_decode_issues_them():
+    def scenario(world, rec):
+        model = ToyModel(world)
+        rec.name(model.named())
+        for a, b in (((1, 2), (2, 2)), ((1, 1), (1, 1)), ((2, 1), (1, 3)), ((1, 4), (1, 2)), ((3, 2), (1, 1))):
+            ga, gb = pass_in_steps(model, *a), pass_in_steps(model, *b)
+            next(ga)                     # group A's first half, then the two in turn
+            live = [gb, ga]
+            while live:
+                for g in list(live):
+                    try:
+                        next(g)
+                    except StopIteration:
+                        live.remove(g)
+    compare(scenario)
 
 
 def test_every_sublayer_dtype_and_layout():
