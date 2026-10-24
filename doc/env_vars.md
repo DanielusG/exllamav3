@@ -927,6 +927,20 @@ file is kept as without the switch. Read when the tier is created. POSIX only: w
 `os.posix_fadvise` (Windows, macOS) the switch does nothing. Tensor-parallel transfers, which
 the ranks write and read themselves, are left as they are.
 
+### `EXL3_MM_CONTENT_HASH` (default: `0`)
+
+Content-addressed multimodal pages, for callers that do not pass `Generator(mm_content_hash = ...)`.
+Placeholder token ids of image embeddings are handed out per process, so a page that holds them is
+hashed over ids that can stand for another image in another process, and the disk tier keeps such
+pages, the pages chained after them and their recurrent checkpoints in the in-process tiers only.
+With `1`, every `MMEmbedding` made from then on gets a 16-byte blake2b digest of its embedding
+tensors and MRoPE/alignment fields (computed once, when it is made: a pass over its tensors, about
+130 ms for 9000 rows of 2048 fp16 values with Python 3.14's blake2b on a laptop core), and the page
+table hashes a placeholder as (digest, row) instead of as its id: such pages go to the disk tier
+like text pages and are found again after a restart. Text pages hash as without it. An embedding
+made with the switch off has no digest and its pages are hashed and kept as upstream does. The
+disk format is unchanged.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

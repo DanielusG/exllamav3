@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, content_hash_checksum, random_hash
 from .filter import Filter
 import random
 import time
@@ -688,7 +688,11 @@ class Job:
             last_hash = None
 
         page_ids = seq.sequence_ids.torch_slice(page_idx * PAGE_SIZE, (page_idx + 1) * PAGE_SIZE)
-        new_hash = tensor_hash_checksum(page_ids, last_hash)
+        # Fork: hashed the way the sequence's prompt pages were (Sequence.prepare, Generator.mm_content_hash)
+        if getattr(seq, "content_hash", False):
+            new_hash = content_hash_checksum(page_ids, last_hash)
+        else:
+            new_hash = tensor_hash_checksum(page_ids, last_hash)
 
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
@@ -1347,8 +1351,13 @@ class Job:
         # Hash full pages of input IDs
         all_unique_hashes = set()
         all_unique_pages = 0
+        # Fork: content-addressed multimodal pages (Generator.mm_content_hash), fixed per sequence here; the call
+        # is upstream's with the switch off
+        content_kw = {"content_hash": True} if getattr(generator, "mm_content_hash", False) else {}
         for seq in self.sequences:
-            unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom)
+            unique_hashes, unique_pages = seq.prepare(
+                self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom, **content_kw
+            )
             if self.generator.mtp_draft:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
