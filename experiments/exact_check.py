@@ -34,6 +34,10 @@ Scenarios (--scenarios):
      runs in a process with the full raw plane and one with the ring (a document past the sparse
      threshold, the same beside three jobs generating, the next turn from VRAM and from the disk
      tier), and the memory each load leaves on the cards
+  9  (on request) the production combination: the MTP head with several drafts, the batched verify
+     and head update, the cost window, the raw-key ring
+ 10  (on request) the decode step's host fast path (EXL3_HOST_FASTPATH, read at import): scenario 9's
+     production generator and the fixed window in two processes that differ in the switch only
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -111,6 +115,7 @@ FORK_ENV_SWITCHES = (
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
     "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
     "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
+    "EXL3_HOST_FASTPATH",
 )
 
 PROMPTS = [
@@ -472,6 +477,7 @@ SCENARIO_TITLES = {
     7: "Stress: blocchi",
     8: "Chiavi grezze del QSA solo per il blocco in costruzione",
     9: "La combinazione di produzione: MTP a più bozze, verifica e aggiornamento in un colpo, finestra a costo, anello",
+    10: "Il lavoro dell'host del passo di decode tenuto fra le chiamate (EXL3_HOST_FASTPATH)",
 }
 
 
@@ -980,6 +986,10 @@ def build_plan(args) -> dict:
     if 9 in sc:
         s9_plan(args, procs, comps)
 
+    # ---------------------------------------------------------------- scenario 10
+    if 10 in sc:
+        s10_plan(args, procs, comps)
+
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
 
 
@@ -1156,6 +1166,101 @@ def s9_plan(args, procs: list, comps: list):
                   "label": "(e) l'anello nei due processi e la memoria libera per scheda"})
     comps.append({"kind": "same_placement", "scenario": 9, "id": "s9.placement", "procs": [PF, PR]})
     comps.append({"kind": "library", "scenario": 9, "id": "s9.library", "procs": {PF: "fork", PR: "fork"}})
+
+
+def s10_plan(args, procs: list, comps: list):
+    """
+    Scenario 10, the decode step's host fast path (EXL3_HOST_FASTPATH=1, read once at import, so a
+    process of its own): two processes of the fork that differ in that variable only, both with
+    production's layout (the raw-key ring) and generators: scenario 9's `s3` (every switch production
+    runs, W from the test schedule) and `off` (the same without the MTP decode switches, W fixed: the
+    serial verify and a head pass per job). The workload of scenario 9 (a job alone, a staggered batch
+    of three, a document ingested beside two jobs generating, the next turn from VRAM). The switch
+    changes no kernel, no argument and no order, only the Python around them: identical everywhere,
+    free and forced runs, against the plain process repeated.
+    """
+    PP, PH = "s10-fork-plain", "s10-fork-hostfast"
+    W9 = args.s9_window
+    T9 = args.s9_tokens
+    R9 = args.s9_reader
+    rdoc = doc("s10r", args.s9_prompt, 1)
+    turn_key = "turn/s10"
+    src = "s10.s3.free1"           # the free runs every forced run takes its tokens from
+    turn_spec = {"kind": "turn", "base": rdoc, "answer": ref(PP, f"{src}.doc", "r"), "suffix": TURN_SUFFIX}
+    gens = s9_generators(args)
+    after = {"after": "a", "tokens": args.lead}
+
+    def workload(g: str, kind: str, k: int) -> list:
+        pre = f"s10.{g}.{kind}{k}"
+        if kind == "free":
+            return [
+                run_step(f"{pre}.a", 10, [jobspec("a", q(0), T9)]),
+                run_step(f"{pre}.abc", 10, [jobspec(x, q(i), T9) for i, x in enumerate("abc")]),
+                run_step(f"{pre}.doc", 10, [jobspec("a", q(0), 6000), jobspec("b", q(1), 6000),
+                                            jobspec("r", rdoc, R9, start = after)], until = {"job": "r"}),
+                run_step(f"{pre}.turn", 10, [jobspec("t", turn_key, 32)], forget = False),
+            ]
+        return [
+            run_step(f"{pre}.a", 10, [jobspec("a", q(0), forced = ref(PP, f"{src}.a", "a"))]),
+            run_step(f"{pre}.abc", 10, [jobspec(x, q(i), forced = ref(PP, f"{src}.abc", x)) for i, x in enumerate("abc")]),
+            run_step(f"{pre}.doc", 10, [jobspec("a", q(0), forced = ref(PP, f"{src}.doc", "a")),
+                                        jobspec("b", q(1), forced = ref(PP, f"{src}.doc", "b")),
+                                        jobspec("r", rdoc, forced = ref(PP, f"{src}.doc", "r"), start = after)],
+                     until = {"job": "r"}),
+            run_step(f"{pre}.turn", 10, [jobspec("t", turn_key, forced = ref(PP, f"{src}.turn", "t"))], forget = False),
+        ]
+
+    def process(name: str, env: dict, order: list) -> Proc:
+        p = Proc(name, "fork", [10], env = env, server_args = ["--draft-num-tokens", str(W9)])
+        for i, (g, sets) in enumerate(order):
+            p.add(gen_step(f"g.{g}", 10, switches = gens[g]))
+            if i == 0:
+                # As in scenario 9: the graphs and the first rounds of the prefill thread and of the
+                # pipeline before anything compared
+                p.add(run_step("s10.warm.a", 10, [jobspec("a", q(0), args.warmup_tokens)], warmup = True))
+                p.add(run_step("s10.warm.abc", 10, [jobspec(x, q(i), args.warmup_tokens) for i, x in enumerate("abc")],
+                               warmup = True))
+                p.add(run_step("s10.warm.doc", 10, [jobspec("a", q(0), 6000),
+                                                    jobspec("r", doc("s10w", doc_length(64, 8), 2), 8,
+                                                            start = {"after": "a", "tokens": 16})],
+                               until = {"job": "r"}, warmup = True))
+            for kind, k in sets:
+                p.add(*workload(g, kind, k))
+        p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+        return p
+
+    ring = {"EXL3_QSA_RAW_TAIL": "1"}
+    procs.append(process(PP, dict(ring), [("s3", [("free", 1), ("free", 2), ("forced", 1), ("forced", 2)]),
+                                          ("off", [("forced", 1), ("forced", 2)])]))
+    procs.append(process(PH, dict(ring, EXL3_HOST_FASTPATH = "1"), [("s3", [("free", 1), ("forced", 1)]),
+                                                                    ("off", [("forced", 1)])]))
+
+    jobs = [("a", "a", "`a` da solo", None, {}, {})]
+    jobs += [("abc", x, f"`{x}` nel batch di tre (decode sfalsato)", None, {"stagger_calls": True}, {}) for x in "abc"]
+    jobs += [("doc", x, f"`{x}` durante l'ingestione di `r` accanto (thread, pezzi in volo)",
+              {"window": "r", "both": True}, {"thread": "on", "pipeline": "on", "beside": True}, {"piped": True}) for x in "ab"]
+    jobs += [("doc", "r", f"`r` (documento di {args.s9_prompt} token) ingerito accanto ad `a` e `b`, poi nel batch",
+              None, {"thread": "on", "pipeline": "on"}, {"piped": True}),
+             ("turn", "t", "turno dopo ripreso dalla VRAM", None, {"resumed": True}, {})]
+
+    def rows(group: str, label: str, run: str, floor: tuple, *, free: bool = False, need: dict | None = None):
+        for wl, job, what, upto, req, soft in jobs:
+            comps.append(cmp(10, f"s10.{group}.{run}.{wl}.{job}", f"({group}) {label}: {what}" + (", token liberi" if free else ""),
+                             ref(PH, f"s10.{run}.{wl}", job), ref(PP, f"s10.{run}.{wl}", job),
+                             floor = (ref(PP, f"s10.{floor[0]}.{wl}", job), ref(PP, f"s10.{floor[1]}.{wl}", job)),
+                             upto = upto, requires = dict(req, **(need or {})), soft = soft, free = free, group = group))
+
+    sched = {"scheduled": True}
+    rows("a", "produzione (`s3`), via veloce dell'host accesa contro spenta", "s3.free1", ("s3.free1", "s3.free2"),
+         free = True, need = dict(sched, verify_windows = True))
+    rows("b", "produzione (`s3`), via veloce dell'host accesa contro spenta, imposti", "s3.forced1",
+         ("s3.forced1", "s3.forced2"), need = sched)
+    rows("c", f"W={W9} fisso senza gli interruttori MTP (`off`), via veloce accesa contro spenta, imposti", "off.forced1",
+         ("off.forced1", "off.forced2"))
+    comps.append({"kind": "switch_state", "scenario": 10, "id": "s10.switch", "name": "host_fastpath",
+                  "expect": {PP: False, PH: True}})
+    comps.append({"kind": "same_placement", "scenario": 10, "id": "s10.placement", "procs": [PP, PH]})
+    comps.append({"kind": "library", "scenario": 10, "id": "s10.library", "procs": {PP: "fork", PH: "fork"}})
 
 
 # --------------------------------------------------------------------------------------------
@@ -1930,6 +2035,8 @@ SWITCHES_OFF = {
     # Content-addressed multimodal pages: the generator's switch, and the embeddings' digests, which it
     # turns on for the whole process (tokenizer.mm_embedding.content_digests)
     "mm_content_hash": False, "mm_content_digests": False,
+    # The decode step's host fast path (EXL3_HOST_FASTPATH, read at import by the modules that have one)
+    "host_fastpath": False,
 }
 
 
@@ -2015,6 +2122,17 @@ def capture_checks(plan: dict, res: Results) -> dict:
                 if on:
                     note(c["scenario"], f"nel fork del confronto con stock non tutti gli interruttori sono spenti "
                                         f"(`{rid}`): {', '.join(on)}")
+        elif kind == "switch_state":
+            for pname, want in c["expect"].items():
+                for rid, rec in sorted(res.records.get(pname, {}).items()):
+                    if rec.get("op") != "generator":
+                        continue
+                    state = rec.get("switches_state") or {}
+                    if c["name"] not in state:
+                        note(c["scenario"], f"`{pname}` (`{rid}`) non dice `{c['name']}`: la libreria non ha l'interruttore?")
+                    elif bool(state[c["name"]]) is not bool(want):
+                        note(c["scenario"], f"`{pname}` (`{rid}`) ha `{c['name']}` = {state[c['name']]!r}, "
+                                            f"doveva essere {want!r}: il confronto non è quello detto")
         elif kind == "library":
             for pname, want in c["procs"].items():
                 meta = res.meta.get(pname)
@@ -2162,6 +2280,17 @@ SCENARIO_TEXT = {
        "accanto al documento si confrontano fino al passo in cui `r` entra nel batch in uno dei due giri: quel passo "
        "dipende dal tempo (un pezzo accanto al decode si registra quando ha finito). Il tier su disco non c'è: lo "
        "scenario 8 confronta l'anello col disco, e gli interruttori MTP non toccano le immagini delle pagine.",
+    10: "La via veloce dell'host (`EXL3_HOST_FASTPATH=1`, letta all'import: un processo a sé) tiene fra una chiamata e "
+        "l'altra quello che il passo di decode rifaceva in Python a ogni chiamata: le chiavi della cache dei tensori, le "
+        "viste dei workspace dei siti del gated residual, del routing e della somma del MoE, il record della forma del "
+        "passaggio speculativo del GDN. Gli stessi kernel, con gli stessi argomenti, sugli stessi stream, nello stesso "
+        "ordine. Due processi del fork con l'anello delle chiavi grezze, che differiscono solo per la variabile: "
+        "`s10-fork-plain` e `s10-fork-hostfast`. In ciascuno il generatore di produzione dello scenario 9 (`s3`: decode "
+        "sfalsato, thread di prefill, pezzi in volo, checkpoint di coda, verifica e aggiornamento in un colpo, finestra a "
+        "costo col programma «W») e `off` (gli stessi senza gli interruttori MTP nuovi, W fisso: la verifica seriale e "
+        "un passaggio della testa per job). Il carico dello scenario 9; i giri imposti prendono i token da `s3` libero "
+        "del processo senza la via veloce. Atteso **identico** dappertutto, giri liberi e imposti. Il metro è il processo "
+        "senza la via veloce ripetuto.",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -2410,7 +2539,7 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
     # Memory and timing per run, for the scenarios where they are asked for
     if s in (3, 4, 5):
         out += runs_table(s, plan, res)
-    if s == 9:
+    if s in (9, 10):
         out += mtp_runs_table(s, plan, res)
     hangs = []
     for proc in plan["procs"]:
