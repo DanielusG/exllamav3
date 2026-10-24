@@ -415,6 +415,24 @@ class Job:
         return input_ids_list
 
 
+    def forget_revert(self, seq: Sequence, start: int, end: int):
+        """
+        The pages of seq a pass is about to write, positions start to end, give up the identity the page
+        table kept for them. A page taken as a unique page (CachePage.add_ref_unique) keeps the identity of
+        the page it was before, often a complete page of another sequence, and gets it back when its last
+        reference goes while can_revert is still set (sub_ref). From the moment a pass that writes into the
+        page is issued, its K/V (the target's, and the draft cache's, which has the same page indices) may
+        no longer be what that identity says. The decode step gives the identity up when it stages its
+        tokens (get_input_ids_list, add_to_cache). A prompt chunk does it here, when it is planned, and not
+        only in its record after the passes: a chunk whose pass fails, or that is abandoned for a cancel, is
+        released without its record (Generator.reap_failed_job, _side_drop, _pipe_drop).
+        """
+        # (a sequence with no pages has nothing to give up: upstream's tests plan chunks without any)
+        pages = seq.allocated_pages or ()
+        for page in pages[start // PAGE_SIZE : (end + PAGE_SIZE - 1) // PAGE_SIZE]:
+            page.can_revert = False
+
+
     def prepare_logit_mask(self):
 
         logit_mask = None
@@ -1710,6 +1728,10 @@ class Job:
                 run.halves = (first, rest, after) if self.generator.mtp_draft else None
                 # (set by whoever plans the next chunk before this one is recorded)
                 run.followed = False
+                # From here the passes may be issued, on this thread or another one, and a chunk whose
+                # passes fail or are abandoned is released without its record: the pages they write give
+                # up their previous identity now, not at the record (forget_revert)
+                self.forget_revert(seq, prefill_start, prefill_start + prefill_ids.shape[-1])
                 sent = yield run
                 if sent is not None:
                     results = sent
