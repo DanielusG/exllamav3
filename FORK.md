@@ -2008,20 +2008,33 @@ cards is the GPU check below), a real model's full forward (the toy has three bl
 parallelism (the ranks import the library in their own processes and read the switch from the
 environment they inherit), ROCm, a free-threaded Python.
 
-**The GPU check** (on the workstation, production stopped, this branch checked out in
-`~/Desktop/exllamav3`; fish, one line each). Scenario 11 of the exact check (about 10 minutes by the
-estimate: two loads): the same runs in a process with `EXL3_HOST_FASTPATH=1` and one without, both
-with the raw-key ring, with scenario 9's production generator (`s3`) and its fixed-window one
-(`off`), expected identical everywhere against the plain process repeated:
+**The GPU check** (on the workstation, production stopped; fish, one line each). The branch in a
+checkout of its own, `~/exl3-host-fastpath`, so production's `~/Desktop/exllamav3` stays as it is (the
+exact check uses the fork it is run from; the night's boots put it ahead on `PYTHONPATH`). Scenario 11
+of the exact check, about 10 minutes by the estimate (two loads): the same runs in a process with
+`EXL3_HOST_FASTPATH=1` and one without, both with the raw-key ring, with scenario 9's production
+generator (`s3`) and its fixed-window one (`off`), expected identical everywhere against the plain
+process repeated:
 
-    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --dry-run --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
-    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --dry-run --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
 
-Then the issue time, with the night's method (`digest_issue.py`: py-spy at 200 Hz over the generator
-thread, issue ms a step = (1 - share in the host wait) x window / steps), in two boots that differ in
-`EXL3_HOST_FASTPATH` only, with the same frozen placement, a fixed window of 1 (as the night's P11c and
-P12d) for one request at 60k and the three-request staggered case, and **without** `EXL3_SPLIT_PROF`
-and `EXL3_MOE_CPU_PROF` (the counters mode sets them, and the first is 10-15% of the issue time).
+Then the issue time, with the night's method and tools (`~/exl3-prof-20261024`: `boot.sh` in counters
+mode, which is the one that runs py-spy, at 200 Hz over the generator thread; `digest_issue.py`: issue
+ms a step = (1 - share in the host wait) x window / steps), in two boots that differ in
+`EXL3_HOST_FASTPATH` only: the same starting placement (`boot.sh` copies `placement-base`), sweeps out
+of reach, the window held at 1 (as P11c and P12d), one request at 60k and then three staggered, and
+the split profiler and the CPU pool's profiler off. Both read their variable as `bool(value)`, so they
+are set empty, not `0`:
+
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=0" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF0 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=1" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF1 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF0
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF1
+
+The switch leaves no line in the log: in `HF1`'s captures the sites' stacks go through `_mix_fast`, in
+`HF0`'s never. The tok/s of the same windows are in each run's `summary.jsonl`; whether the cards then
+become the limit is what the three-request windows say.
 
 Tests: `tests/test_host_fastpath.py` (no GPU, no extension; marked `nogpu`, run with
 `--noconftest`), the scenario's plan and report in `tests/test_exact_check.py`.
