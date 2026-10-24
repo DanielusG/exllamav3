@@ -15,6 +15,14 @@ import math
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once at
+# import. A gated residual site of a decode-size pass keeps the views of its workspaces and of its own
+# projection table instead of slicing and reshaping them again at every call; the kernels, their
+# arguments and their order are the same
+HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
+if HOST_FASTPATH:
+    from ..util.lane import _tls as _lane_tls
+
 # Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
 # residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
 # finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
@@ -432,6 +440,8 @@ class GatedResidual(Module):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
+        if HOST_FASTPATH:
+            self.__dict__.pop("_fast_proj", None)   # the kept view of proj_h
 
     @override
     def get_tensors(self):
@@ -600,6 +610,76 @@ class GatedResidual(Module):
         post, mixed = self._mix(streams, params = params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
 
+    if HOST_FASTPATH:
+
+        def _proj_rows(self):
+            """proj_h[: proj_m], the view the fused decode pair reads, kept while proj_h is the
+            same tensor and proj_m the same count (_prepare and tp_import build a new proj_h,
+            unload drops it)"""
+            ph = self.proj_h
+            c = self.__dict__.get("_fast_proj")
+            if c is None or c[0] is not ph or c[1] != self.proj_m:
+                c = self._fast_proj = (ph, self.proj_m, ph[: self.proj_m])
+            return c[2]
+
+        def _mix_fast(self, streams: torch.Tensor, params: dict | None):
+            """_mix of a decode-size pass (the fused pair, cached workspaces) with the workspace
+            views kept: issues the same ext.gr_mix with the same arguments and returns the kept
+            entry (fast_gen, dots, post, mixed, post (b, s, H), mixed (b, s, D)), or None, having
+            done nothing, for a call _mix itself has to make (more rows, a stack that is not fp32
+            or not contiguous: _mix converts those into a new tensor).
+
+            The views are those _mix takes: get_bucketed of the same sizes, dtypes and tags, in
+            the same order, viewed to the same shapes. They are kept in g_tensor_cache.fast_views
+            under the device, the batch shape, the table and stream sizes and the lane (the
+            backings are per lane, util/lane.py), with the cache's fast_gen: a new entry anywhere
+            in the cache, or drop_all, and they are taken again. Entries are never replaced
+            otherwise, so a kept view is a view of the backing get_bucketed would return now."""
+            shape = streams.shape
+            b, s = shape[0], shape[1]
+            R = b * s
+            if R > self.FUSED_MAX_R or streams.dtype != torch.float or not streams.is_contiguous():
+                return None
+            H, Dh = self.hc_mult, self.hidden_size
+            s3 = streams.reshape(R, H, Dh)
+            dev = s3.device
+            xw = self._weighted_copy(s3, params)
+            M = self.proj_m + 1
+            gtc = g_tensor_cache
+            key = ("gr_mix", dev, b, s, M, H, Dh, self.use_combine, _lane_tls.__dict__.get("lane", 0))
+            w = gtc.fast_views.get(key)
+            if w is None or w[0] != gtc.fast_gen:
+                gen = gtc.fast_gen
+                dots = gtc.get_bucketed(dev, R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
+                post = gtc.get_bucketed(dev, R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+                mixed = gtc.get_bucketed(dev, R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
+                w = (gen, dots, post, mixed, None if post is None else post.view(b, s, H), mixed.view(b, s, Dh))
+                gtc.fast_views[key] = w
+            ext.gr_mix(s3, xw, self._proj_rows(), self.upx_h, self.w_h, self.rms_eps, w[1], w[2], w[3])
+            return w
+
+        _mix_plain = _mix
+
+        def _mix(self, streams: torch.Tensor, cached: bool = True, params: dict | None = None):
+            if cached:
+                w = self._mix_fast(streams, params)
+                if w is not None:
+                    return w[2], w[3]
+            return self._mix_plain(streams, cached, params)
+
+        _mix.__doc__ = _mix_plain.__doc__
+
+        def mix(self, streams: torch.Tensor, params: dict):
+            """(b, s, H, D) fp32 -> (inject gates (b, s, H) fp32, None, collapsed (b, s, D) half).
+            Host fast path: the (b, s, ...) views of a decode-size call are the kept ones."""
+            if self.use_combine:
+                w = self._mix_fast(streams, params)
+                if w is not None:
+                    return w[4], None, w[5]
+            b, s = streams.shape[:2]
+            post, mixed = self._mix_plain(streams, params = params)
+            return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
+
     def mix_norm(self, streams: torch.Tensor, params: dict, norm):
         """HyperConnection.mix_norm interface: the norm is never folded here (normed False)"""
         post, comb, y = self.mix(streams, params)
@@ -642,6 +722,59 @@ class GatedResidual(Module):
         if xw is not None:
             params["gr_weighted"] = (nxt, x3.data_ptr(), xw)
         return x
+
+    if HOST_FASTPATH:
+
+        _apply_plain = apply_
+
+        def apply_(
+            self,
+            x: torch.Tensor,
+            y: torch.Tensor,
+            post: torch.Tensor,
+            comb: torch.Tensor | None,
+            params: dict
+        ):
+            """apply_ with the host fast path: the successor's weighted-copy workspace is the kept
+            view (g_tensor_cache.fast_views, as in _mix_fast), and post, when it is the (b, s, H)
+            view this site's _mix_fast returned, is passed as the (R, H) view kept beside it, which
+            is what post.reshape(R, H).contiguous() gives for it. Everything else, and the order
+            of every tensor operation and of the call, is apply_'s."""
+            if "quant_preserve" in params or "capture" in params:
+                return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
+            shape = x.shape
+            b, s = shape[0], shape[1]
+            R = b * s
+            H, Dh = self.hc_mult, self.hidden_size
+            y2 = y.reshape(R, Dh)
+            if y2.dtype not in (torch.half, torch.float):
+                y2 = y2.half()
+            x3 = x.view(R, H, Dh)
+            nxt = self.next_site
+            xw = None
+            gtc = g_tensor_cache
+            lane = _lane_tls.__dict__.get("lane", 0)
+            if nxt is not None and R <= self.FUSED_MAX_R and nxt.w_h is not None and nxt.w_h.device == x.device:
+                dev = x.device
+                key = ("gr_apply_xw", dev, R, H, Dh, lane)
+                e = gtc.fast_views.get(key)
+                if e is None or e[0] != gtc.fast_gen:
+                    gen = gtc.fast_gen
+                    e = (gen, gtc.get_bucketed(dev, x3.numel(), torch.float, "gr_apply_xw").view(x3.shape))
+                    gtc.fast_views[key] = e
+                xw = e[1]
+            y2c = y2.contiguous()
+            pr = None
+            if R <= self.FUSED_MAX_R:
+                w = gtc.fast_views.get(("gr_mix", x.device, b, s, self.proj_m + 1, H, Dh, self.use_combine, lane))
+                if post is not None and w is not None and w[4] is post:
+                    pr = w[2]
+            if pr is None:
+                pr = post.reshape(R, H).contiguous()
+            ext.hc_apply(x3, y2c, pr, None, nxt.w_h if xw is not None else None, xw)
+            if xw is not None:
+                params["gr_weighted"] = (nxt, x3.data_ptr(), xw)
+            return x
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):

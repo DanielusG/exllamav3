@@ -59,16 +59,34 @@ _busy = 0
 # wrong number is
 _HOST_WAITS = os.environ.get("EXL3_LANE_HOST_WAITS", "1") != "0"
 
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import. A thread that never entered a lane has no attribute on the thread-local, and getattr
+# with a default then raises and catches an AttributeError inside, at every workspace lookup of
+# every pass. With the switch the two reads go to the thread's own dict of the thread-local
+# (local.__dict__), which holds what Lane.enter set and nothing else: the same values, no exception
+HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 
-def current_lane() -> int:
-    """Lane of the calling thread, 0 unless it entered one."""
-    return getattr(_tls, "lane", 0)
+if HOST_FASTPATH:
 
+    def current_lane() -> int:
+        """Lane of the calling thread, 0 unless it entered one."""
+        return _tls.__dict__.get("lane", 0)
 
-def host_waits() -> bool:
-    """Whether the calling thread must keep its waits for the CPU expert worker off the
-    stream (it shares the stream with another lane, whose kernels a stream wait would stop)."""
-    return getattr(_tls, "host_waits", False)
+    def host_waits() -> bool:
+        """Whether the calling thread must keep its waits for the CPU expert worker off the
+        stream (it shares the stream with another lane, whose kernels a stream wait would stop)."""
+        return _tls.__dict__.get("host_waits", False)
+
+else:
+
+    def current_lane() -> int:
+        """Lane of the calling thread, 0 unless it entered one."""
+        return getattr(_tls, "lane", 0)
+
+    def host_waits() -> bool:
+        """Whether the calling thread must keep its waits for the CPU expert worker off the
+        stream (it shares the stream with another lane, whose kernels a stream wait would stop)."""
+        return getattr(_tls, "host_waits", False)
 
 
 def lanes_busy() -> bool:
