@@ -340,7 +340,7 @@ def all_refs(plan):
     return out
 
 
-@pytest.mark.parametrize("scenarios", [None, "8", "9", "10"])
+@pytest.mark.parametrize("scenarios", [None, "8", "9", "11"])
 def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
     plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
@@ -591,13 +591,13 @@ def test_scenario_9_reports_each_group_with_what_it_expects():
     assert r["verdict"] == EC.ERR and "mtp_batched_verify non esercitato" in r["why"]
 
 
-def test_scenario_10_runs_the_same_generators_in_two_processes_that_differ_in_the_host_fast_path_only():
-    assert 10 not in args_for().scenarios
-    args = args_for("--scenarios", "10")
+def test_scenario_11_runs_the_same_generators_in_two_processes_that_differ_in_the_host_fast_path_only():
+    assert 11 not in args_for().scenarios
+    args = args_for("--scenarios", "11")
     plan = EC.build_plan(args)
     procs = [(p["name"], p["library"], p["env"], p["server_args"]) for p in plan["procs"]]
-    assert procs == [("s10-fork-plain", "fork", {"EXL3_QSA_RAW_TAIL": "1"}, ["--draft-num-tokens", "3"]),
-                     ("s10-fork-hostfast", "fork", {"EXL3_QSA_RAW_TAIL": "1", "EXL3_HOST_FASTPATH": "1"},
+    assert procs == [("s11-fork-plain", "fork", {"EXL3_QSA_RAW_TAIL": "1"}, ["--draft-num-tokens", "3"]),
+                     ("s11-fork-hostfast", "fork", {"EXL3_QSA_RAW_TAIL": "1", "EXL3_HOST_FASTPATH": "1"},
                       ["--draft-num-tokens", "3"])]
     assert "EXL3_HOST_FASTPATH" in EC.FORK_ENV_SWITCHES
     plain, fast = plan["procs"]
@@ -606,23 +606,23 @@ def test_scenario_10_runs_the_same_generators_in_two_processes_that_differ_in_th
         gens = {st["id"]: st["switches"] for st in p["steps"] if st["op"] == "generator"}
         assert gens == {"g.s3": gens9["s3"], "g.off": gens9["off"]}
         ids = [st["id"] for st in p["steps"] if st["op"] == "run"]
-        assert ids[:3] == ["s10.warm.a", "s10.warm.abc", "s10.warm.doc"]
+        assert ids[:3] == ["s11.warm.a", "s11.warm.abc", "s11.warm.doc"]
         # Every forced token is a free run of `s3` in the process without the fast path
         for st in p["steps"]:
             for j in st.get("jobs", []) if st["op"] == "run" else []:
                 if "forced" in j:
-                    assert j["forced"]["proc"] == "s10-fork-plain" and j["forced"]["run"].startswith("s10.s3.free1.")
+                    assert j["forced"]["proc"] == "s11-fork-plain" and j["forced"]["run"].startswith("s11.s3.free1.")
     runs = lambda p, pre: [st["id"] for st in p["steps"] if st["op"] == "run" and st["id"].startswith(pre)]
-    for pre in ("s10.s3.free1", "s10.s3.forced1", "s10.off.forced1"):
+    for pre in ("s11.s3.free1", "s11.s3.forced1", "s11.off.forced1"):
         assert runs(fast, pre) == runs(plain, pre) and len(runs(plain, pre)) == 4
     # The plain process repeats each set it is compared on, for the floor
-    assert runs(plain, "s10.s3.free2") and runs(plain, "s10.s3.forced2") and runs(plain, "s10.off.forced2")
-    assert not runs(fast, "s10.s3.free2") and not runs(fast, "s10.off.free")
-    assert plain["prompts"]["turn/s10"]["answer"] == EC.ref("s10-fork-plain", "s10.s3.free1.doc", "r")
+    assert runs(plain, "s11.s3.free2") and runs(plain, "s11.s3.forced2") and runs(plain, "s11.off.forced2")
+    assert not runs(fast, "s11.s3.free2") and not runs(fast, "s11.off.free")
+    assert plain["prompts"]["turn/s11"]["answer"] == EC.ref("s11-fork-plain", "s11.s3.free1.doc", "r")
 
 
-def test_scenario_10_expects_identical_everywhere_against_the_plain_process_repeated():
-    plan = EC.build_plan(args_for("--scenarios", "10"))
+def test_scenario_11_expects_identical_everywhere_against_the_plain_process_repeated():
+    plan = EC.build_plan(args_for("--scenarios", "11"))
     probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
     by = {}
     for c in probs:
@@ -630,9 +630,9 @@ def test_scenario_10_expects_identical_everywhere_against_the_plain_process_repe
     assert {g: len(v) for g, v in by.items()} == {"a": 8, "b": 8, "c": 8}
     for c in probs:
         assert c["expect"] == "identical"
-        assert c["test"]["proc"] == "s10-fork-hostfast" and c["ref"]["proc"] == "s10-fork-plain"
+        assert c["test"]["proc"] == "s11-fork-hostfast" and c["ref"]["proc"] == "s11-fork-plain"
         assert c["test"]["run"] == c["ref"]["run"] and c["test"]["job"] == c["ref"]["job"]
-        assert {r["proc"] for r in c["floor"]} == {"s10-fork-plain"}
+        assert {r["proc"] for r in c["floor"]} == {"s11-fork-plain"}
         assert [r["run"].rsplit(".", 1)[0] for r in c["floor"]] == [c["ref"]["run"].rsplit(".", 1)[0],
                                                                     c["ref"]["run"].rsplit(".", 1)[0][:-1] + "2"]
     assert all(c["free"] and c["requires"].get("verify_windows") and c["requires"].get("scheduled") for c in by["a"])
@@ -643,37 +643,37 @@ def test_scenario_10_expects_identical_everywhere_against_the_plain_process_repe
             assert c["upto"] == {"window": "r", "both": True}
             assert c["requires"]["beside"] and c["requires"]["pipeline"] == "on" and c["soft"] == {"piped": True}
     state = next(c for c in plan["comparisons"] if c["kind"] == "switch_state")
-    assert state["name"] == "host_fastpath" and state["expect"] == {"s10-fork-plain": False, "s10-fork-hostfast": True}
+    assert state["name"] == "host_fastpath" and state["expect"] == {"s11-fork-plain": False, "s11-fork-hostfast": True}
     assert {"same_placement", "library"} <= {c["kind"] for c in plan["comparisons"]}
-    est = EC.estimate_plan(plan, args_for("--scenarios", "10"))
+    est = EC.estimate_plan(plan, args_for("--scenarios", "11"))
     assert 5 * 60 <= est["total"] <= 15 * 60, est["total"] / 60
 
 
-def test_scenario_10_says_when_a_process_did_not_run_the_fast_path_it_was_meant_to():
-    plan = EC.build_plan(args_for("--scenarios", "10"))
+def test_scenario_11_says_when_a_process_did_not_run_the_fast_path_it_was_meant_to():
+    plan = EC.build_plan(args_for("--scenarios", "11"))
     res = fake_results(plan)
     for p in plan["procs"]:
         for rec in res.records[p["name"]].values():
             if rec["op"] == "generator":
-                rec["switches_state"]["host_fastpath"] = p["name"] == "s10-fork-hostfast"
+                rec["switches_state"]["host_fastpath"] = p["name"] == "s11-fork-hostfast"
     report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
     assert summary_cells(report)[0][1] == EC.IDENT, summary_cells(report)
-    assert f"## 10. {EC.SCENARIO_TITLES[10]}" in report and "| `s10-fork-hostfast` / `s10.s3.free1.a` |" in report
+    assert f"## 11. {EC.SCENARIO_TITLES[11]}" in report and "| `s11-fork-hostfast` / `s11.s3.free1.a` |" in report
     assert "host_fastpath" not in report
     # The variable not taken (a library without the switch, or one that read it otherwise): said
     # under the scenario, as every problem of the capture itself
-    res.records["s10-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"] = False
+    res.records["s11-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"] = False
     report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
-    assert "**Attenzione**: `s10-fork-hostfast` (`g.s3`) ha `host_fastpath` = False, doveva essere True" in report
-    del res.records["s10-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"]
+    assert "**Attenzione**: `s11-fork-hostfast` (`g.s3`) ha `host_fastpath` = False, doveva essere True" in report
+    del res.records["s11-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"]
     assert "non dice `host_fastpath`" in EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
     # A run of the fast path that differs from the plain one is a difference, not noise
     res = fake_results(plan)
-    other = fake_results(plan, differ = ("s10.s3.forced1.abc",))
-    res.records["s10-fork-hostfast"]["s10.s3.forced1.abc"] = other.records["s10-fork-hostfast"]["s10.s3.forced1.abc"]
+    other = fake_results(plan, differ = ("s11.s3.forced1.abc",))
+    res.records["s11-fork-hostfast"]["s11.s3.forced1.abc"] = other.records["s11-fork-hostfast"]["s11.s3.forced1.abc"]
     rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
-    assert rows["s10.b.s3.forced1.abc.a"]["verdict"] == EC.DIFF
-    assert rows["s10.b.s3.forced1.a.a"]["verdict"] == EC.IDENT
+    assert rows["s11.b.s3.forced1.abc.a"]["verdict"] == EC.DIFF
+    assert rows["s11.b.s3.forced1.a.a"]["verdict"] == EC.IDENT
 
 
 def test_the_exact_environment_of_the_children():
@@ -739,7 +739,7 @@ def test_the_estimate_and_the_dry_run():
 
 def test_the_cli_refuses_what_it_cannot_do():
     with pytest.raises(SystemExit):
-        EC.parse_cli(["--scenarios", "1,11"])
+        EC.parse_cli(["--scenarios", "1,10,12"])
     with pytest.raises(SystemExit):
         EC.parse_cli(["--chunk", "1000"])
     a = EC.parse_cli(["--scenarios", "3,1,3", "--out", "/tmp/x"])
@@ -1789,7 +1789,7 @@ def test_the_child_says_whether_the_library_runs_the_host_fast_path(tmp_path, mo
         monkeypatch.delenv("EXL3_HOST_FASTPATH", raising = False)
     else:
         monkeypatch.setenv("EXL3_HOST_FASTPATH", value)
-    out, recs = run_child(tmp_path, "fork", [EC.gen_step("g0", 10)])
+    out, recs = run_child(tmp_path, "fork", [EC.gen_step("g0", 11)])
     assert out.returncode == 0, out.stdout + out.stderr
     assert recs["g0"]["switches_state"]["host_fastpath"] is want
     assert EC.switch_is_off("host_fastpath", recs["g0"]["switches_state"]["host_fastpath"]) is not want

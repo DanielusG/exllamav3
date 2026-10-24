@@ -19,8 +19,10 @@ decode pair, stream stacks the plain path converts first, the weighted-copy hand
 site, and broken by a successor on another device), sublayer outputs of every dtype the plain path
 casts and non-contiguous ones it copies, the conversion and capture passes, entries added to the
 workspace cache between a mix and its apply, the cache emptied between passes, passes from threads
-on lanes 1 and 2 (their own workspaces), two threads issuing at the same time, and the MoE routing
-buffers at every row count up to past the kept ones.
+on lanes 1 and 2 (their own workspaces), two threads issuing at the same time, the MoE routing
+buffers at every row count up to past the kept ones, the fused MoE decode tier's routed sum and the
+(rows, H) view its CPU collect is handed, and the fused GDN decode path's record of a speculative
+pass for the rewind (GDNLayerState.staged_shape against staged_views, and the call site's branch).
 
 No GPU or extension is required: the extension is a recorder.
 """
