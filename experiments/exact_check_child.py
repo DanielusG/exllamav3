@@ -149,6 +149,15 @@ class Digester:
         sampled: host integers, so the MTP head's drafts can be compared position by position
         over a part of a run, not only as the job's totals.
 
+    A speculative window sampled in one call (Generator.mtp_batched_verify: Job.sample_window,
+    no receive_logits for its positions) is recorded the same way: every row of the window's
+    logits is digested before the sampler sees them (the sampler masks the padding in place),
+    and each position the generator then takes from the window (Job.receive_sample, called once
+    per emitted position in every path) takes its row's entry, with the emitted token and the
+    draft counters as they stand there. Rows past the end of the window are left unread, so a
+    run that samples windows at once has the same records, position for position, as one that
+    samples them serially.
+
     Everything is queued on the logits' stream as small kernels and read back after iterate()
     (resolve), where the generator has synchronized anyway: no host wait is added to the step.
     """
@@ -175,14 +184,21 @@ class Digester:
     def wrap(self, job, name: str):
         orig = job.receive_logits
         dig = self
+        # The window of this job sampled at once in the current step: its rows' digests and the
+        # next row to hand out (empty when the positions go through receive_logits)
+        window = {}
+
+        def drafts():
+            return (int(getattr(job, "accepted_draft_tokens", 0) or 0), int(getattr(job, "rejected_draft_tokens", 0) or 0))
 
         def receive_logits(logits, *args, **kwargs):
+            window.clear()
             pre = None
             try:
                 pre = dig._pre(logits)
             except Exception as e:
                 dig._error(e)
-            drafts = (int(getattr(job, "accepted_draft_tokens", 0) or 0), int(getattr(job, "rejected_draft_tokens", 0) or 0))
+            counters = drafts()
             out = orig(logits, *args, **kwargs)
             entry = None
             if pre is not None:
@@ -190,10 +206,47 @@ class Digester:
                     entry = dig._post(pre, out[0])
                 except Exception as e:
                     dig._error(e)
-            dig.pending.setdefault(name, []).append((entry, drafts))
+            dig.pending.setdefault(name, []).append((entry, counters))
             return out
 
         job.receive_logits = receive_logits
+
+        orig_window = getattr(job, "sample_window", None)
+        orig_sample = getattr(job, "receive_sample", None)
+        if orig_window is None or orig_sample is None:
+            return
+
+        def sample_window(logits, *args, **kwargs):
+            window.clear()
+            pres = None
+            try:
+                pres = dig._pre_rows(logits)
+            except Exception as e:
+                dig._error(e)
+            out = orig_window(logits, *args, **kwargs)
+            if out is not None:
+                # (None: the job takes the serial path this step, through receive_logits)
+                window.update(pres = pres, next = 0)
+            return out
+
+        def receive_sample(logits, next_token, *args, **kwargs):
+            if "pres" in window:
+                i = window["next"]
+                window["next"] = i + 1
+                pres = window["pres"]
+                entry = None
+                if pres is not None and i < len(pres):
+                    try:
+                        entry = dig._post(pres[i], next_token)
+                    except Exception as e:
+                        dig._error(e)
+                elif pres is not None:
+                    dig._error(RuntimeError(f"position {i} taken from a window of {len(pres)} rows"))
+                dig.pending.setdefault(name, []).append((entry, drafts()))
+            return orig_sample(logits, next_token, *args, **kwargs)
+
+        job.sample_window = sample_window
+        job.receive_sample = receive_sample
 
     def _error(self, e):
         if len(self.errors) < 10:
@@ -216,10 +269,34 @@ class Digester:
         tv, ti = torch.topk(real, k)
         return lf, digest, lse, tv, ti
 
+    def _pre_rows(self, logits) -> list:
+        """_pre for every row of a speculative window's logits (1, R, vocab), in one set of
+        kernels: a list of R tuples of views"""
+        torch = self.torch
+        rows = logits.reshape(-1, logits.shape[-1]).contiguous()
+        if rows.dtype == torch.float32:
+            bits = rows.view(torch.int32)
+        elif rows.dtype in (torch.float16, torch.bfloat16):
+            bits = rows.view(torch.int16)
+        else:
+            bits = rows.float().view(torch.int32)
+        digest = (bits.to(torch.int64) * self.weights(rows.shape[-1], rows.device)).sum(dim = -1)
+        lf = rows.float()
+        real = lf[:, : self.vocab] if self.vocab and self.vocab < lf.shape[-1] else lf
+        lse = torch.logsumexp(real, -1)
+        k = min(self.k, real.shape[-1])
+        tv, ti = torch.topk(real, k, dim = -1)
+        return [(lf[r], digest[r], lse[r], tv[r], ti[r]) for r in range(rows.shape[0])]
+
     def _post(self, pre, next_token):
         torch = self.torch
         lf, digest, lse, tv, ti = pre
-        tok = next_token.reshape(-1)[:1].to(device = lf.device, dtype = torch.long)
+        if next_token.device == lf.device:
+            tok = next_token.reshape(-1)[:1].to(dtype = torch.long)
+        else:
+            # A token already on the host (a window's, read back with the others): filled on the
+            # device, no copy
+            tok = torch.full((1,), int(next_token.reshape(-1)[0]), dtype = torch.long, device = lf.device)
         tl = lf.gather(0, tok)
         ints = torch.cat([digest.view(1), tok, ti.to(torch.int64)])
         floats = torch.cat([lse.view(1), tl.view(1), tv])
@@ -934,14 +1011,29 @@ class Child:
         sw = step.get("switches") or {}
         params = inspect.signature(Generator.__init__).parameters
         for key, arg in (("stagger", "stagger_decode"), ("thread", "prefill_thread"), ("pipeline", "prefill_pipeline"),
-                         ("tail", "recurrent_tail_checkpoint")):
+                         ("tail", "recurrent_tail_checkpoint"), ("verify", "mtp_batched_verify"),
+                         ("update", "mtp_batched_update"), ("window", "draft_window")):
             if sw.get(key):
                 if arg not in params:
                     raise RunError(f"questa libreria non ha Generator({arg})")
                 kw[arg] = sw[key]
+        # Another window than the process's --draft-num-tokens, within what the caches were made
+        # for (their max_history): the shape meter's fixed W=1 beside W=3
+        if sw.get("draft_tokens"):
+            if c.draft_model is None:
+                raise RunError("draft_tokens senza testa MTP")
+            if int(sw["draft_tokens"]) > int(cfg.draft_num_tokens):
+                raise RunError(f"draft_tokens {sw['draft_tokens']} oltre le cache fatte per {cfg.draft_num_tokens}")
+            kw["num_draft_tokens"] = int(sw["draft_tokens"])
+        if sw.get("schedule") is not None and not hasattr(Generator, "draft_window_schedule"):
+            raise RunError("questa libreria non ha il programma delle finestre (draft_window_schedule)")
         t0 = time.time()
         with self.watch.guard("generator"):
             gen = Generator(**kw)
+        # The test hook's window schedule (draft_window.py), set on the generator rather than read
+        # from the environment, so that nothing of it outlives this generator
+        if sw.get("schedule") is not None:
+            gen.draft_window_schedule = list(sw["schedule"]) if not isinstance(sw["schedule"], str) else sw["schedule"]
         self.gen = gen
         self.broken = None
         warnings = []
@@ -963,7 +1055,7 @@ class Child:
                          "stagger_min_jobs": getattr(gen, "stagger_min_jobs", None)}
         state = {}
         for name in ("stagger_decode", "prefill_thread", "prefill_pipeline", "tail_checkpoint_interval",
-                     "mtp_batched_verify", "mtp_batched_update"):
+                     "mtp_batched_verify", "mtp_batched_update", "draft_window", "draft_window_schedule"):
             if hasattr(gen, name):
                 state[name] = getattr(gen, name)
         if hasattr(self.bsm, "hist_prefill_weight"):
@@ -974,7 +1066,7 @@ class Child:
             state["disk_uncache"] = getattr(gen.disk_page_cache, "uncache", None)
         return {"op": "generator", "id": step["id"], "scenario": step.get("scenario"), "ok": True,
                 "seconds": time.time() - t0, "switches_state": state, "disk": disk, "kwargs": sorted(kw),
-                "tier_attached": attached, "warnings": warnings}
+                "num_draft_tokens": getattr(gen, "num_draft_tokens", None), "tier_attached": attached, "warnings": warnings}
 
     def close_generator(self, why: str):
         gen, self.gen = self.gen, None
@@ -1047,6 +1139,20 @@ class Child:
         pt = getattr(gen, "pagetable", None)
         if pt is not None and isinstance(getattr(pt, "metrics", None), dict):
             out["pagetable"] = dict(pt.metrics)
+        # The MTP decode's counters (the fork's): windows sampled at once, the head's folded
+        # updates, readbacks, the cost window's steps; the windows taken one key each, every
+        # window counted from 0 so that a run's difference has them all
+        for key, attr in (("verify", "mtp_verify_stats"), ("update", "mtp_update_stats"), ("readbacks", "readback_stats")):
+            v = getattr(gen, attr, None)
+            if isinstance(v, dict):
+                out[key] = {k: x for k, x in v.items() if isinstance(x, (int, float)) and not isinstance(x, bool)}
+        dws = getattr(gen, "draft_window_stats", None)
+        if isinstance(dws, dict):
+            d = {k: x for k, x in dws.items() if isinstance(x, (int, float)) and not isinstance(x, bool)}
+            chosen = dws.get("chosen") or {}
+            for w in range(int(getattr(gen, "num_draft_tokens", 0) or 0) + 1):
+                d[f"w{w}"] = int(chosen.get(w, 0))
+            out["window"] = d
         return out
 
     def disk_metrics(self):
