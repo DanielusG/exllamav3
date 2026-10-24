@@ -28,6 +28,19 @@ samples is taken), and a window it no longer takes is timed again after REFRESH 
 twice as many each time it is still not taken, up to MAX_BACKOFF times REFRESH: a window past a
 cliff of the cost curve (more rows than the decode paths' fast kernels serve) is tried at most
 once in REFRESH x MAX_BACKOFF steps once it is known.
+
+A test hook, not for production: a window schedule (EXL3_DRAFT_WINDOW_SCHEDULE="3" or "0,1,2,3",
+Generator.draft_window_schedule) makes every step take the next window of the schedule, cycled per
+decode step (a staggered decode's draft step of each group is a step) and clipped to what the step
+allows (the largest allowed window not above it, the cap of a prompt chunk beside the decode
+included), in place of the policy's choice. The policy chooses from measured wall times and
+explores, so two processes choose differently; under a schedule the windows depend on the steps
+alone, and runs of the cost path can be compared bit for bit with each other and with a fixed
+window. Everything else of the cost path is unchanged: the head drafts position by position with
+its confidences exported, the round drafts exactly the scheduled window (a window of 0 its first
+position, as a window of 0 the policy takes), the steps are timed and labelled. The cycle starts
+again when the generator is given a job while it has none, or when the schedule changes. Unset
+(None), begin() takes the policy's path and nothing else reads it.
 """
 
 # Samples of a window before the policy relies on its median; samples kept per window
@@ -62,6 +75,24 @@ def parse_windows(spec) -> list | None:
     return out
 
 
+def parse_schedule(spec) -> list | None:
+    """
+    The test hook's window schedule (see the module's docstring): a list of ints or a
+    comma-separated string ("0,1,2,3"), in order, repeats kept. None or an empty string: no
+    schedule.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        spec = [s for s in spec.replace(" ", "").split(",") if s]
+    out = [int(w) for w in spec]
+    if not out:
+        return None
+    if min(out) < 0:
+        raise ValueError(f"scheduled draft windows must be 0 or more: {out}")
+    return out
+
+
 def _median(values) -> float:
     s = sorted(values)
     m = len(s)
@@ -89,7 +120,7 @@ class DraftWindowRound:
     (exploration): the step drafts and verifies exactly that.
     """
 
-    def __init__(self, policy, mode, n, allowed, target, capped, times):
+    def __init__(self, policy, mode, n, allowed, target, capped, times, scheduled = False):
         self.policy = policy
         self.mode = mode
         self.n = n
@@ -97,6 +128,7 @@ class DraftWindowRound:
         self.target = target
         self.capped = capped
         self.times = times
+        self.scheduled = scheduled          # target is the test hook's schedule, not an exploration
         self.limit = target if target is not None else allowed[-1]
         self.known = any(t is not None for t in times.values())
         self.gain = [0.0]                   # gain[k]: expected accepted drafts of the batch, window k
@@ -216,8 +248,13 @@ class DraftWindowPolicy:
         self._last = None                   # (time, signature) of the last decode step's sampling
         self._switches = None
         self._allowed = {}
+        # The test hook's schedule (begin's schedule argument, as given and parsed) and the next
+        # entry to take
+        self._schedule_spec = None
+        self._schedule = None
+        self._schedule_at = 0
         self.stats = {
-            "steps": 0, "explored": 0, "capped": 0, "overridden": 0, "timed": 0,
+            "steps": 0, "explored": 0, "scheduled": 0, "capped": 0, "overridden": 0, "timed": 0,
             "chosen": {}, "drafted": 0, "verified": 0, "accepted": 0,
             "expected": 0.0, "realised": 0, "scored": 0, "labels": 0,
             "curve": {}, "calibrator": {"bins": 0, "tested": 0.0, "acceptance": None},
@@ -238,11 +275,14 @@ class DraftWindowPolicy:
         self.stats["curve"] = {}
         self._last = None
 
-    def begin(self, mode: str, n: int, w_max: int, cap: int | None, timed: bool, switches = None) -> DraftWindowRound:
+    def begin(self, mode: str, n: int, w_max: int, cap: int | None, timed: bool, switches = None,
+              schedule = None) -> DraftWindowRound:
         """
         A decode step of n jobs is about to draft. cap: the longest window the step may take (a
         prompt chunk runs beside it, see Generator._dw_begin), None for none. timed: whether the
-        step can be timed (nothing else runs in it), the condition for exploring.
+        step can be timed (nothing else runs in it), the condition for exploring. schedule: the
+        test hook's window schedule (a list, or "0,1,2,3"; see the module's docstring), None for
+        none: the step then takes its window from the policy.
         """
         if switches != self._switches:
             if self._switches is not None:
@@ -254,12 +294,39 @@ class DraftWindowPolicy:
         if cap is not None and cap < allowed[-1]:
             allowed = [w for w in allowed if w <= cap] or allowed[:1]
             capped = True
-        target = self._explore(mode, n, allowed) if timed and not capped and len(allowed) > 1 else None
+        target = None
+        if schedule is not None or self._schedule_spec is not None:
+            target = self._scheduled(schedule, allowed)
+        scheduled = target is not None
+        if not scheduled and timed and not capped and len(allowed) > 1:
+            target = self._explore(mode, n, allowed)
         times = {}
         for w in allowed:
             e = self.curve.get((mode, n, w))
             times[w] = e.ms if e is not None else None
-        return DraftWindowRound(self, mode, n, allowed, target, capped, times)
+        return DraftWindowRound(self, mode, n, allowed, target, capped, times, scheduled)
+
+    def restart_schedule(self):
+        """The test hook's schedule from its first entry at the next step (the generator was given
+        a job while it had none)"""
+        self._schedule_at = 0
+
+    def _scheduled(self, schedule, allowed) -> int | None:
+        """The test hook's window for this step: the schedule's next entry, clipped to the largest
+        allowed window not above it (the smallest allowed one when none is); None without a
+        schedule. A schedule that changes starts from its first entry."""
+        if schedule is not self._schedule_spec:
+            if schedule != self._schedule_spec:
+                self._schedule = parse_schedule(schedule)
+                self._schedule_at = 0
+            self._schedule_spec = schedule
+        sched = self._schedule
+        if not sched:
+            return None
+        w = sched[self._schedule_at % len(sched)]
+        self._schedule_at += 1
+        fit = [a for a in allowed if a <= w]
+        return fit[-1] if fit else allowed[0]
 
     def _window(self, key) -> _Window:
         e = self.curve.get(key)
@@ -344,7 +411,9 @@ class DraftWindowPolicy:
         stats["drafted"] += dw.n * len(dw.conf)
         stats["verified"] += dw.n * w
         stats["accepted"] += accepted
-        if dw.target is not None:
+        if dw.scheduled:
+            stats["scheduled"] += 1
+        elif dw.target is not None:
             stats["explored"] += 1
         if dw.capped:
             stats["capped"] += 1

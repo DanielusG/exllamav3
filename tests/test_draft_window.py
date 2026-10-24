@@ -554,3 +554,208 @@ def test_the_rows_counted_for_a_chunk_beside_the_decode():
     g.hybrid_draft_tokens = 5
     g.max_draft_tokens = 5
     assert g._decode_rows() == 18
+
+
+# --------------------------------------------------------------------------------------------
+#   The test hook: a window schedule (EXL3_DRAFT_WINDOW_SCHEDULE, Generator.draft_window_schedule)
+# --------------------------------------------------------------------------------------------
+
+def take(p, schedule, accept = 1.0, n = 1, w_max = 3, cap = None, timed = True):
+    """One decode step of the policy with a schedule: (window, positions drafted, scheduled)"""
+    dw = p.begin("r", n, w_max, cap, timed = timed, schedule = schedule)
+    for k in range(dw.draft_limit()):
+        if dw.add([accept] * n):
+            break
+    w = dw.close()
+    p.finish(dw, n, 0)
+    return w, len(dw.conf), dw.scheduled
+
+
+def test_parse_schedule_keeps_the_order_and_the_repeats():
+    assert DW.parse_schedule("0,1,2,3") == [0, 1, 2, 3]
+    assert DW.parse_schedule("3, 0,3,1") == [3, 0, 3, 1] and DW.parse_schedule([2, 2]) == [2, 2]
+    assert DW.parse_schedule(None) is None and DW.parse_schedule("") is None and DW.parse_schedule(" , ") is None
+    with pytest.raises(ValueError):
+        DW.parse_schedule("1,-1")
+
+
+def test_a_schedule_takes_its_windows_in_order_whatever_the_estimates():
+    # On a steep curve with hopeless drafts the policy verifies nothing and stops after the first
+    # position; a schedule drafts and verifies exactly its windows (a window of 0 its first position)
+    p = policy_with(lambda w: 20 + 10 * w)
+    assert choose(p, [0.05, 0.05, 0.05]) == (0, 1)
+    got = [take(p, [0, 1, 2, 3], accept = 0.05) for _ in range(9)]
+    assert got == [(w, max(1, w), True) for w in (0, 1, 2, 3, 0, 1, 2, 3, 0)]
+    assert p.stats["scheduled"] == 9 and p.stats["explored"] == 0
+    # Sure drafts on a flat curve, where the policy takes 3: the schedule still decides
+    q = policy_with(lambda w: 20 + 0.1 * w)
+    assert [take(q, "3,0,3,1", accept = 0.99)[0] for _ in range(6)] == [3, 0, 3, 1, 3, 0]
+
+
+def test_a_schedule_is_clipped_to_what_the_step_allows():
+    # The windows allowed (draft_window_set): the largest one not above the scheduled window, the
+    # smallest when none is
+    p = DW.DraftWindowPolicy([0, 2])
+    p.calibrator = FakeCalibrator()
+    assert [take(p, "3,1,0,2")[0] for _ in range(4)] == [2, 0, 0, 2]
+    q = DW.DraftWindowPolicy([2, 3])
+    q.calibrator = FakeCalibrator()
+    assert take(q, [1])[0] == 2
+    # num_draft_tokens below the schedule
+    r = DW.DraftWindowPolicy()
+    r.calibrator = FakeCalibrator()
+    assert take(r, [3], w_max = 1)[:2] == (1, 1)
+    # The cap of a prompt chunk beside the decode (Generator._dw_begin): clipped, and counted as capped
+    dw = r.begin("r", 3, 3, 1, timed = False, schedule = [3])
+    assert dw.capped and dw.scheduled and dw.target == 1 and dw.allowed == [0, 1]
+
+
+def test_the_schedule_starts_again_when_it_changes_and_when_asked():
+    p = DW.DraftWindowPolicy()
+    p.calibrator = FakeCalibrator()
+    sched = [0, 1, 2, 3]
+    assert [take(p, sched)[0] for _ in range(3)] == [0, 1, 2]
+    p.restart_schedule()
+    assert [take(p, sched)[0] for _ in range(2)] == [0, 1]
+    # The same schedule as another object: not a change
+    assert take(p, [0, 1, 2, 3])[0] == 2
+    # Another schedule: from its first entry
+    assert [take(p, "3,0")[0] for _ in range(3)] == [3, 0, 3]
+    # No schedule: the policy's own path again (no measure yet: it explores, then the longest)
+    w, _, scheduled = take(p, None)
+    assert not scheduled and p.stats["scheduled"] == 9
+
+
+def test_without_a_schedule_the_hook_is_never_entered(clock, monkeypatch):
+    """Unset, the cost path is the policy's: _scheduled never runs, and the windows taken are the
+    ones a run takes with the hook's method gone"""
+    seen = {}
+    real = DW.DraftWindowRound.close
+
+    def record(key):
+        def close(self):
+            w = real(self)
+            seen.setdefault(key, []).append((self.n, w, self.target, self.capped, len(self.conf)))
+            return w
+        return close
+
+    def boom(self, schedule, allowed):
+        raise AssertionError("the schedule's path without a schedule")
+
+    monkeypatch.setattr(DW.DraftWindowRound, "close", record("plain"))
+    ref, g0, _ = run("abc", clock, cost = cliff, update = True)
+    assert g0.draft_window_schedule is None and g0.draft_window_stats["scheduled"] == 0
+    monkeypatch.setattr(DW.DraftWindowPolicy, "_scheduled", boom)
+    monkeypatch.setattr(DW.DraftWindowRound, "close", record("guarded"))
+    clock.t = 0.0
+    out, g, _ = run("abc", clock, cost = cliff, update = True)
+    assert out == ref and seen["guarded"] == seen["plain"]
+    assert g.draft_window_stats == g0.draft_window_stats
+
+
+@pytest.fixture
+def scheduled_rounds(monkeypatch):
+    """(jobs, window, positions drafted, scheduled, capped) of every round"""
+    seen = []
+    real_close = DW.DraftWindowRound.close
+
+    def close(self):
+        w = real_close(self)
+        seen.append((self.n, w, len(self.conf), self.scheduled, self.capped))
+        return w
+
+    monkeypatch.setattr(DW.DraftWindowRound, "close", close)
+    return seen
+
+
+@pytest.mark.parametrize("schedule", ["3", "0,1,2,3", "3,0,3,1"])
+@pytest.mark.parametrize("verify,update", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("names,stagger", [("a", False), ("abc", False), ("abcd", True)])
+def test_greedy_tokens_with_a_window_schedule(clock, scheduled_rounds, schedule, verify, update, names, stagger):
+    """Under a schedule the windows vary step by step as the schedule says: the tokens are the
+    fixed window's, every step drafts exactly its window, and the recurrent states (the toy's
+    replay of the accepted prefix over the pass's staged rows) and the head's cache (with the
+    update folded) follow windows of varying length"""
+    sched = DW.parse_schedule(schedule)
+    ref, _, ref_jobs = run(names, policy = False, verify = verify, update = update, stagger = stagger)
+    out, g, jobs = run(names, clock, cost = cliff, verify = verify, update = update, stagger = stagger,
+                       setup = lambda g: setattr(g, "draft_window_schedule", sched))
+    assert out == ref
+    taken = [w for _, w, _, _, _ in scheduled_rounds]
+    assert len(taken) > 50 and taken == [sched[i % len(sched)] for i in range(len(taken))]
+    assert all(s and not c and d == max(1, w) for _, w, d, s, c in scheduled_rounds)
+    st = g.draft_window_stats
+    assert st["scheduled"] == st["steps"] == len(taken) and st["explored"] == 0
+    # The windows verified are the schedule's (0 verifies none)
+    assert {w for j in jobs.values() for _, w, _ in j.draft_stats} == set(sched) - {0}
+    if stagger:
+        assert g.stagger_stats["steps"] > 20
+    if update:
+        assert g.draft_model.poisoned == 0
+    if verify:
+        assert g.mtp_verify_stats["windows"] > 20
+    # A schedule of the fixed window is the fixed window, draft for draft
+    if schedule == "3":
+        assert drafts_of_jobs(jobs) == drafts_of_jobs(ref_jobs)
+
+
+def drafts_of_jobs(jobs):
+    return {n: (j.accepted_draft_tokens, j.rejected_draft_tokens, list(j.draft_stats)) for n, j in jobs.items()}
+
+
+def test_a_schedule_starts_again_with_each_stretch_of_work():
+    """Generator.enqueue on a generator with no job restarts the schedule; with jobs it does not"""
+    g = TOY.make_generator(num_draft_tokens = 3)
+    g.draft_window = "cost"
+    g.draft_window_schedule = [0, 1, 2, 3]
+    g.mtp_batched_verify = g.mtp_batched_update = False
+    policy = g._dw_policy()
+    policy._schedule_at = 5
+    a = TOY.ToyJob(g.model, "a", TOY.PROMPTS["a"], 10)
+    g.enqueue(a)
+    assert policy._schedule_at == 0
+    policy._schedule_at = 3
+    g.enqueue(TOY.ToyJob(g.model, "b", TOY.PROMPTS["b"], 10))
+    assert policy._schedule_at == 3
+    # Without the policy nothing is touched
+    h = TOY.make_generator(num_draft_tokens = 3)
+    h.enqueue(TOY.ToyJob(h.model, "a", TOY.PROMPTS["a"], 10))
+    assert h.draft_window_policy is None
+
+
+def test_the_schedule_beside_a_prompt_chunk_is_capped(monkeypatch, scheduled_rounds):
+    """A chunk on the prefill thread beside three jobs: the schedule's 3 is clipped to the cap
+    (n x (1 + W) within side_max_rows), the tokens are the fixed window's"""
+    monkeypatch.setattr(GEN, "Lane", PT.FakeLane)
+    plan = {
+        "a": dict(prompt = TOY.PROMPTS["a"], max_new = 200),
+        "c": dict(prompt = TOY.PROMPTS["c"], max_new = 200),
+        "d": dict(prompt = TOY.PROMPTS["d"], max_new = 200),
+        "b": dict(prompt = PT.long_prompt(3, 65), max_new = 30, at = 20, chunk = 16, steps = 4),
+    }
+
+    def setup_fixed(g):
+        g.num_draft_tokens = g.max_draft_tokens = 3
+        g.draft_ids_pinned = torch.zeros((4, 3), dtype = torch.long)
+
+    def setup_sched(g):
+        setup_fixed(g)
+        with_conf(g)
+        g.draft_window = "cost"
+        g.draft_window_schedule = [3]
+
+    ref, _, _, _ = PT.drive(True, plan, setup = setup_fixed)
+    out, g, _, _ = PT.drive(True, plan, setup = setup_sched)
+    assert out == ref
+    capped = [(n, w) for n, w, _, _, c in scheduled_rounds if c]
+    assert capped and all(n * (1 + w) <= g.side_max_rows and w == g.side_max_rows // n - 1 for n, w in capped)
+    assert all(w == 3 for n, w, _, _, c in scheduled_rounds if not c)
+
+
+def test_the_generator_reads_the_schedule_from_the_environment_only():
+    """Generator.__init__ (not run by the toy) reads EXL3_DRAFT_WINDOW_SCHEDULE into
+    draft_window_schedule with parse_schedule, and _dw_begin hands it to the policy"""
+    src = open(GEN.__file__).read()
+    assert 'self.draft_window_schedule = parse_schedule(os.environ.get("EXL3_DRAFT_WINDOW_SCHEDULE"))' in src
+    assert "schedule = self.draft_window_schedule," in src
+    assert GEN.Generator.draft_window_schedule is None

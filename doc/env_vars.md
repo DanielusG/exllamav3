@@ -365,6 +365,20 @@ samples from the same distribution. Stacks the collapse does not recognize fall 
 step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
 against the reference implementation.
 
+## Speculative decoding
+
+### `EXL3_DRAFT_WINDOW_SCHEDULE` (default: unset)
+
+A test hook of the fork's cost draft window (`Generator(draft_window = "cost")`, `EXL3_DRAFT_WINDOW=cost`;
+FORK.md, "The MTP draft window chosen from a measured cost curve"), not for production. A comma-separated
+list of windows (`3`, `0,1,2,3`): every decode step takes the next window of the list, cycled per step,
+instead of the window the policy would choose from its measured step times, so the windows a run takes
+are repeatable (the exact check's scenario 9 uses it). Each window is clipped to what the step allows
+(`EXL3_DRAFT_WINDOW_SET`, `num_draft_tokens`, the cap beside a prompt chunk); everything else is the cost
+path's. The schedule starts again when the generator gets a job while it has none. Read once, when the
+generator is made (`Generator.draft_window_schedule` changes it afterwards); no effect with the fixed
+window. Unset, the policy never reaches the hook's code.
+
 ## CPU MoE offload
 
 Experimental: `-mcl`/`--moe_cpu_offload` (main model) and `-dmcl`/`--draft_moe_cpu_layers`

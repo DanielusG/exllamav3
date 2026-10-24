@@ -17,7 +17,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .draft_window import DraftWindowPolicy, parse_windows
+from .draft_window import DraftWindowPolicy, parse_windows, parse_schedule
 from .job import Job
 from .filter import Filter
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -86,6 +86,7 @@ class Generator:
     mtp_batched_update = False
     draft_window = "fixed"
     draft_window_set = None
+    draft_window_schedule = None
     draft_window_policy = None
     draft_window_stats = None
     _dw_round = None
@@ -282,6 +283,13 @@ class Generator:
             The windows draft_window = "cost" may choose from, a list or "0,1,3" (EXL3_DRAFT_WINDOW_SET);
             None: every window from 0 to num_draft_tokens. Each window is a shape of the verification
             pass and of the head's update, with graphs of its own on the cards.
+
+            A test hook, read from the environment only: EXL3_DRAFT_WINDOW_SCHEDULE="3" or "0,1,2,3"
+            makes draft_window = "cost" take the next window of that schedule at every decode step
+            (cycled, clipped to what the step allows) instead of the policy's choice, so that runs of
+            the cost path can be compared bit for bit (the exact check). Attribute
+            draft_window_schedule (a list or such a string, None for none); see generator/
+            draft_window.py.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -656,6 +664,12 @@ class Generator:
         if draft_window_set is None:
             draft_window_set = os.environ.get("EXL3_DRAFT_WINDOW_SET")
         self.draft_window_set = parse_windows(draft_window_set)
+        # The test hook's window schedule (draft_window.py): None unless the environment asks
+        self.draft_window_schedule = parse_schedule(os.environ.get("EXL3_DRAFT_WINDOW_SCHEDULE"))
+        if self.draft_window_schedule is not None:
+            print(f" !! EXL3_DRAFT_WINDOW_SCHEDULE={os.environ.get('EXL3_DRAFT_WINDOW_SCHEDULE')}: a test hook, the "
+                  "MTP draft window follows that schedule" + (" (draft_window = \"cost\" only: no effect with "
+                  "the window fixed)" if self.draft_window != "cost" else ""), flush = True)
         self.draft_window_policy = None
         self.draft_window_stats = None
         self._dw_round = None
@@ -860,6 +874,10 @@ class Generator:
 
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
+        # The test hook's draft window schedule starts again with each stretch of work (a run of
+        # the exact check takes it from its first entry, whatever ran before)
+        if self.draft_window_policy is not None and not self.pending_jobs and not self.active_jobs:
+            self.draft_window_policy.restart_schedule()
         self.pending_jobs.append(job)
         if self.disk_page_cache is not None:
             # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
@@ -1596,6 +1614,7 @@ class Generator:
             "s" if self._step_group is not None else "r", n, self.num_draft_tokens, cap,
             timed = not self._dw_dirty and cap is None,
             switches = (bool(self.mtp_batched_verify), bool(self.mtp_batched_update)),
+            schedule = self.draft_window_schedule,
         )
 
 
