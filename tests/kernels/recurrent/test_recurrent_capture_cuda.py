@@ -35,7 +35,8 @@ def _gdn_inputs(device, seqlen, nk, nv, dk, dv, seed):
     mixed_qkv = (r(1, seqlen, qkv_dim) * 0.25).bfloat16().to(device)
     g = (r(1, seqlen, nv) * 0.5 - 1.0).float().to(device)
     beta = torch.sigmoid(r(1, seqlen, nv)).bfloat16().to(device)
-    state0 = (r(1, 1, nv, dk, dv) * 0.05).float().to(device)
+    # One pool row (GDNLayerState: (2 * max_batch_size, 1, HV, K, V))
+    state0 = (r(1, nv, dk, dv) * 0.05).float().to(device)
     return mixed_qkv, g, beta, state0
 
 
