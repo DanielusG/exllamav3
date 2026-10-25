@@ -438,6 +438,29 @@ Windows the driver drops an idle link to Gen1, so the probe keeps traffic on it 
 0.5 s and until the rate is steady. Setting this explicitly pins the threshold on every device
 and disables the bandwidth scaling.
 
+### `EXL3_MOE_STREAM_T_BESIDE` (default: unset)
+
+A second threshold, an integer of at least 1, for prompt chunks ingested beside a decode
+(`Generator(prefill_thread = True)`): a chunk's layer planned on the prefill thread (or either
+lane of `prefill_pipeline`) while the generator takes decode steps beside it streams the experts
+with at least this many assignments, on every device, as given; any other chunk keeps the
+threshold above. The CPU expert worker serves its jobs in order, so a decode step's jobs wait
+behind the tail jobs of a chunk published before them; a lower threshold leaves the worker a
+shorter tail (`1`: none). Measured with `1` for every chunk on a split Qwen3.8-Flash-Next: the
+request decoding beside a prompt +27-57%, the prompt beside it -1% to -7.5%, but a prompt alone
+-20%, which is why this applies beside a decode only. Read once, at import; unset or empty is
+off, and a value that is not an integer of at least 1 is refused at import. No memory beyond what
+the load reserves for the streamed path. A fork switch (`FORK.md`).
+
+### `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` (default: `2048`)
+
+With `EXL3_MOE_STREAM_T_BESIDE` set: a chunk beside a decode with fewer rows than this keeps the
+device's threshold. A short chunk has few assignments per expert, so the lower threshold would
+stream nearly every expert it selects for a handful of rows each (on the workstation's cards: a
+47-token prompt beside a decode took 5.0 s to its first token at `1`, 1.1 s at the device's threshold). Read once, at import;
+unset or empty is the default, a value that is not an integer of at least 1 is refused at import.
+A fork switch (`FORK.md`).
+
 ### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
 Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch

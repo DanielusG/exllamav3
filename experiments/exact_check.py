@@ -34,6 +34,12 @@ Scenarios (--scenarios):
      runs in a process with the full raw plane and one with the ring (a document past the sparse
      threshold, the same beside three jobs generating, the next turn from VRAM and from the disk
      tier), and the memory each load leaves on the cards
+  10 (on request) more of a chunk's experts streamed while a decode goes on beside it
+     (EXL3_MOE_STREAM_T_BESIDE): the jobs generating beside the prompt against the same jobs
+     alone, the prompt ingested beside them with the lower threshold against the cards' own
+     (judged against two yardsticks: the prompt joining the batch elsewhere, and the prompt
+     alone with every expert streamed), the prompt alone with the switch on against off, and a
+     long prompt beside two jobs with the switch off and on (memory per card)
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -111,6 +117,7 @@ FORK_ENV_SWITCHES = (
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
     "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
     "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
+    "EXL3_MOE_STREAM_T_BESIDE",
 )
 
 PROMPTS = [
@@ -428,8 +435,9 @@ def cmp(scenario: int, cid: str, label: str, test: dict, refr: dict, *, expect: 
     expected within the noise they are the yardstick; for one expected identical, a control that
     differs from the reference says the test cannot be identical for a reason of upstream's own
     (the row is then within that control's noise, said so). `upto`: an int, {"window": job} (the
-    positions generated during that job's ingestion; with "both", in the reference run as well),
-    or {"before_first_end": True}. `requires`: what the test run must have exercised, else the row
+    positions generated during that job's ingestion; with "both", in the reference run as well;
+    with "batch", only those before the two runs' decode batches part, same_batch_upto), or
+    {"before_first_end": True}. `requires`: what the test run must have exercised, else the row
     is an error; `soft`: the same, as a note. `free`: the two runs are free greedy runs, not forced
     (compared up to where their tokens part, see evaluate_probs). `group`: the report's sub-table.
     """
@@ -472,6 +480,7 @@ SCENARIO_TITLES = {
     7: "Stress: blocchi",
     8: "Chiavi grezze del QSA solo per il blocco in costruzione",
     9: "La combinazione di produzione: MTP a più bozze, verifica e aggiornamento in un colpo, finestra a costo, anello",
+    10: "Più esperti in streaming nei pezzi di prompt accanto al decode",
 }
 
 
@@ -980,6 +989,10 @@ def build_plan(args) -> dict:
     if 9 in sc:
         s9_plan(args, procs, comps)
 
+    # ---------------------------------------------------------------- scenario 10
+    if 10 in sc:
+        s10_plan(args, procs, comps)
+
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
 
 
@@ -1156,6 +1169,136 @@ def s9_plan(args, procs: list, comps: list):
                   "label": "(e) l'anello nei due processi e la memoria libera per scheda"})
     comps.append({"kind": "same_placement", "scenario": 9, "id": "s9.placement", "procs": [PF, PR]})
     comps.append({"kind": "library", "scenario": 9, "id": "s9.library", "procs": {PF: "fork", PR: "fork"}})
+
+
+def s10_plan(args, procs: list, comps: list):
+    """
+    Scenario 10: one fork process made with EXL3_MOE_STREAM_T_BESIDE=1 (a host copies the
+    variable when it is made), the lower threshold turned off and on per run by the child
+    (switch "beside_t"), the prompt's chunks in flight on the two cards as production runs them.
+
+    The jobs generating beside the prompt do not stream (decode-size batches never go through
+    the streamed prefill): they must come out identical to the same jobs alone. The prompt's
+    own logits move, since the experts its chunks send to the CPU worker today go to the cards:
+    judged within the noise of the bigger of two yardsticks, both differences upstream has
+    already: the prompt ingested inline beside the same jobs but queued later (it joins the
+    decode batch elsewhere, as after an ingestion beside the decode), and the same prompt alone
+    with every expert streamed against the cards' own threshold (switch "stream_t" = 1). The
+    prompt alone in flight with the switch on must be identical to inline: nobody decodes, the
+    cards' own threshold. The long prompt is there for the memory on the cards (reported per
+    run); its two runs are compared for information only.
+    """
+    P = "s10-fork"
+    p = Proc(P, "fork", [10], env = {"EXL3_MOE_STREAM_T_BESIDE": "1"})
+    D, R, L, W = args.decoder_tokens, args.reader_tokens, args.lead, args.warmup_tokens
+    pipe = {"pipeline": True, "thread": True}
+    on, off = dict(pipe, beside_t = 1), dict(pipe, beside_t = 0)
+    after = {"after": "a", "tokens": L}
+    # n jobs generating, 1 + DRAFT_TOKENS rows each, within side_max_rows: the chunks run beside
+    decs = [n for n in args.s10_decoders if 1 <= n and n * (1 + DRAFT_TOKENS) <= SIDE_MAX_ROWS]
+    if not decs:
+        raise SystemExit(f"--s10-decoders: nessun valore tra 1 e {SIDE_MAX_ROWS // (1 + DRAFT_TOKENS)}")
+    nmax = max(decs + ([2] if args.s10_long else []))
+    rdoc = doc("s10r", args.s10_prompt, 1)
+    p.add(gen_step("g0", 10))
+    p.add(run_step("s10.warm.1", 10, [jobspec("a", q(0), W)], warmup = True))
+    p.add(run_step("s10.warm.n", 10, [jobspec(x, q(i), W) for i, x in enumerate(NAMES[:nmax])], warmup = True))
+    p.add(run_step("s10.warm.r", 10, [jobspec("r", doc("s10w", doc_length(64, 8), 2), 8)], warmup = True))
+    for i, x in enumerate(NAMES[:nmax]):
+        p.add(run_step(f"s10.free.{x}", 10, [jobspec(x, q(i), D)]))
+    for n in decs:
+        for k in (1, 2):
+            p.add(run_step(f"s10.dec{n}.ref{k}", 10, [jobspec(x, q(i), forced = ref(P, f"s10.free.{x}", x))
+                                                       for i, x in enumerate(NAMES[:n])]))
+
+    def free_dec(n):
+        return [jobspec(x, q(i), 6000) for i, x in enumerate(NAMES[:n])]
+
+    def forced_dec(n):
+        return [jobspec(x, q(i), forced = ref(P, f"s10.free.{x}", x)) for i, x in enumerate(NAMES[:n])]
+
+    # Inline, as upstream (lane 0: the cards' own threshold whatever the switch)
+    for n in decs:
+        R0 = ref(P, f"s10.n{n}.free", "r")
+        p.add(run_step(f"s10.n{n}.free", 10, free_dec(n) + [jobspec("r", rdoc, R, start = after)], until = {"job": "r"}))
+        for k in (1, 2):
+            p.add(run_step(f"s10.n{n}.ref{k}", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                           until = {"job": "r"}))
+        p.add(run_step(f"s10.n{n}.shift", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0,
+                                                                      start = {"after": "a", "tokens": L + args.shift})],
+                       until = {"job": "r"}))
+        p.add(run_step(f"s10.n{n}.alone", 10, [jobspec("r", rdoc, forced = R0)]))
+        p.add(run_step(f"s10.n{n}.alone.all", 10, [jobspec("r", rdoc, forced = R0)], switches = {"stream_t": 1}))
+    # From here on the prompt's chunks in flight; the first such round sets the prefill thread up
+    # with the hosts the variable made (Generator._side_plan), switch as made (on)
+    p.add(run_step("s10.warm.pipe", 10, [jobspec("a", q(0), 6000), jobspec("r", doc("s10w", doc_length(64, 8), 2), 8,
+                                                                         start = {"after": "a", "tokens": 16})],
+                   until = {"job": "r"}, switches = pipe, warmup = True))
+    for n in decs:
+        R0 = ref(P, f"s10.n{n}.free", "r")
+        p.add(run_step(f"s10.n{n}.off", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                       until = {"job": "r"}, switches = off))
+        p.add(run_step(f"s10.n{n}.on", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                       until = {"job": "r"}, switches = on))
+        p.add(run_step(f"s10.n{n}.off.dec", 10, forced_dec(n) + [jobspec("r", rdoc, R, start = after)],
+                       until = {"job": "r"}, switches = off))
+        p.add(run_step(f"s10.n{n}.on.dec", 10, forced_dec(n) + [jobspec("r", rdoc, R, start = after)],
+                       until = {"job": "r"}, switches = on))
+    n0 = decs[0]
+    p.add(run_step("s10.alone.on", 10, [jobspec("r", rdoc, forced = ref(P, f"s10.n{n0}.free", "r"))], switches = on))
+    if args.s10_long:
+        rl = doc("s10l", args.s10_long, 1)
+        p.add(run_step("s10.long.off", 10, free_dec(2) + [jobspec("r", rl, 32, start = after)], until = {"job": "r"}, switches = off))
+        p.add(run_step("s10.long.on", 10, free_dec(2) + [jobspec("r", rl, forced = ref(P, "s10.long.off", "r"), start = after)],
+                       until = {"job": "r"}, switches = on))
+    p.prompts = prompt_specs(p.steps, {})
+    procs.append(p)
+
+    need_on = {"pipeline": "on", "beside": True, "streamed_beside": True}
+    for n in decs:
+        what = f"{n} job che generano"
+        comps.append(cmp(10, f"s10.n{n}.reader", f"{what}: `r` in volo accanto con la soglia bassa contro con la soglia delle schede",
+                         ref(P, f"s10.n{n}.on", "r"), ref(P, f"s10.n{n}.off", "r"), expect = "noise",
+                         yards = [(ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.shift", "r")),
+                                  (ref(P, f"s10.n{n}.alone", "r"), ref(P, f"s10.n{n}.alone.all", "r"))],
+                         requires = need_on))
+        comps.append(cmp(10, f"s10.n{n}.reader.off", f"{what}: `r` in volo accanto, interruttore spento, contro in linea come upstream",
+                         ref(P, f"s10.n{n}.off", "r"), ref(P, f"s10.n{n}.ref1", "r"),
+                         floor = (ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.ref2", "r")),
+                         yards = [(ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.shift", "r"))],
+                         requires = {"pipeline": "on", "no_beside": True}))
+        comps.append(cmp(10, f"s10.n{n}.yard.all", f"{what}: metro, `r` da solo con ogni esperto in streaming contro la soglia delle schede",
+                         ref(P, f"s10.n{n}.alone.all", "r"), ref(P, f"s10.n{n}.alone", "r"), expect = "info"))
+        for i, x in enumerate(NAMES[:n]):
+            # Against the same jobs beside `r` with the switch off: their prompts go in the same
+            # way. Against the jobs alone only for information: with two jobs and the chunks in
+            # flight the second prompt goes in after the first job has started generating, where
+            # the reference ingests both in one inline pass, and which experts a prefill chunk
+            # streams depends on the counts over the whole chunk (2026-10-25: different from the
+            # first position whatever the switch).
+            # Up to where the two runs' batches part (2026-10-25, on the cards: exact mode ingests
+            # `r` some 30% faster with the switch off, so it joins the decode earlier there; and
+            # the second job's prompt joins the first job's decode one or two steps apart in two
+            # runs, by wall time, before `r` is even queued). So only the job that joins last is
+            # judged: the earlier ones' batch changes at a point that moves with wall time
+            last = i == n - 1
+            comps.append(cmp(10, f"s10.n{n}.{x}", f"{what}: `{x}` accanto a `r` con la soglia bassa contro con la soglia delle schede"
+                             + ("" if last else f" (per informazione: `{NAMES[n - 1]}` entra nel suo batch in un punto che "
+                                                "dipende dal tempo, prima che `r` sia accodato)"),
+                             ref(P, f"s10.n{n}.on.dec", x), ref(P, f"s10.n{n}.off.dec", x),
+                             floor = (ref(P, f"s10.dec{n}.ref1", x), ref(P, f"s10.dec{n}.ref2", x)),
+                             upto = {"window": "r", "both": True, "batch": True} if last else {"window": "r", "both": True},
+                             drafts = False, expect = "identical" if last else "info", requires = need_on))
+            comps.append(cmp(10, f"s10.n{n}.{x}.alone", f"{what}: `{x}` accanto a `r` con la soglia bassa contro gli stessi job senza prompt accanto",
+                             ref(P, f"s10.n{n}.on.dec", x), ref(P, f"s10.dec{n}.ref1", x), expect = "info",
+                             upto = {"window": "r"}, drafts = False))
+    comps.append(cmp(10, "s10.alone", "`r` da solo in volo con l'interruttore acceso contro in linea (nessuno genera: soglia delle schede)",
+                     ref(P, "s10.alone.on", "r"), ref(P, f"s10.n{n0}.alone", "r"),
+                     requires = {"pipeline": "on", "no_beside": True}))
+    if args.s10_long:
+        comps.append(cmp(10, "s10.long", f"`r` di {args.s10_long} token accanto a 2 job, soglia bassa contro soglia delle schede "
+                                         "(per informazione: il giro c'è per la memoria)",
+                         ref(P, "s10.long.on", "r"), ref(P, "s10.long.off", "r"), expect = "info"))
 
 
 # --------------------------------------------------------------------------------------------
@@ -1360,6 +1503,31 @@ def ingestion_window(rec: dict, reader: str):
     return j["enqueued"], end
 
 
+def same_batch_upto(t_rec: dict, r_rec: dict, t_job: str, r_job: str) -> int:
+    """How far two runs of the same jobs keep the same decode batch for one of them: the job's
+    positions before another job joins the batch (its first sampled token) or leaves it (ended)
+    at a different position of this job in the two runs. Where the others join depends on wall
+    time once prompts go in beside the decode (the prefill thread, the pipeline), and a batch of
+    another composition is other kernels' shapes, so past that point the two runs part by
+    design, whatever is under test."""
+    bound = None
+    others = [k for k in (t_rec.get("order") or []) if k != t_job]
+    others += [k for k in (r_rec.get("order") or []) if k != r_job and k not in others]
+    for k in others:
+        for when in (first_sample_time, lambda rec, name: (job_view(rec, name) or {}).get("ended")):
+            tt, tr = when(t_rec, k), when(r_rec, k)
+            pt = None if tt is None else tokens_before(t_rec, t_job, tt)
+            pr = None if tr is None else tokens_before(r_rec, r_job, tr)
+            if pt == pr:
+                continue
+            for x in (pt, pr):
+                if x is not None and (bound is None or x < bound):
+                    bound = x
+    n = max(len((job_view(t_rec, t_job) or {}).get("digest") or []),
+            len((job_view(r_rec, r_job) or {}).get("digest") or []))
+    return n if bound is None else bound
+
+
 def first_end_time(rec: dict):
     """End time of the iteration in which the first job of a run ended (eos), None if none did."""
     ends = [j.get("ended") for j in (rec.get("jobs") or {}).values() if j.get("ended") is not None]
@@ -1518,6 +1686,15 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
                        "EXL3_PREFILL_PIPELINE_HEAD=second")
     if req.get("stagger_calls") and not (stats.get("stagger") or {}).get("steps"):
         out.append("nessuna chiamata sfalsata")
+    # The streamed layers planned at the lower threshold beside a decode (scenario 10)
+    stream = stats.get("stream")
+    if req.get("streamed_beside") and not (stream or {}).get("beside"):
+        out.append("nessun layer a streaming pianificato con la soglia bassa accanto al decode"
+                   + ("" if stream is not None else " (nessun host fatto con EXL3_MOE_STREAM_T_BESIDE)")
+                   + f" (host avvisati dal generatore: {state.get('beside_hosts', '-')})")
+    if req.get("no_beside") and (stream or {}).get("beside"):
+        out.append(f"{stream['beside']} layer a streaming pianificati con la soglia bassa: l'interruttore doveva essere spento "
+                   "o nessuno doveva generare accanto")
     if req.get("tail_stashes") and not (stats.get("tail") or {}).get("stashes"):
         out.append("nessun checkpoint di coda preso")
     # The MTP decode's switches (the fork's counters, the run's difference)
@@ -1574,6 +1751,8 @@ def evaluate_probs(c: dict, res: Results) -> dict:
                 row.update(verdict = ERR, why = f"`{upto['window']}` non ha dato token nel giro di riferimento")
                 return row
             inside = min(inside, tokens_before(r_rec, c["ref"]["job"], wr[1]))
+        if upto.get("batch"):
+            inside = min(inside, same_batch_upto(t_rec, r_rec, c["test"]["job"], c["ref"]["job"]))
         window = (started, inside)
         if inside <= started:
             row.update(verdict = ERR, why = "nessuna posizione generata durante l'ingestione", window = window)
@@ -1609,9 +1788,16 @@ def evaluate_probs(c: dict, res: Results) -> dict:
         if isinstance(spec, dict) and spec.get("window") and spec.get("both"):
             # The positions before the reader joined the batch in this pair's own two runs
             wa, wb = ingestion_window(a, spec["window"]), ingestion_window(b, spec["window"])
-            if wa is None or wb is None:
+            if wa is None and wb is None and not job_view(a, spec["window"]) and not job_view(b, spec["window"]):
+                # A pair without the reader (the jobs alone, repeated): the positions the comparison
+                # itself was bounded to
+                bound = upto
+            elif wa is None or wb is None:
                 return None
-            bound = min(tokens_before(a, p[0]["job"], wa[1]), tokens_before(b, p[1]["job"], wb[1]))
+            else:
+                bound = min(tokens_before(a, p[0]["job"], wa[1]), tokens_before(b, p[1]["job"], wb[1]))
+                if spec.get("batch"):
+                    bound = min(bound, same_batch_upto(a, b, p[0]["job"], p[1]["job"]))
         if free:
             # A floor of free runs too: up to where its own two runs part
             pa = parting(va, vb)
@@ -2162,6 +2348,22 @@ SCENARIO_TEXT = {
        "accanto al documento si confrontano fino al passo in cui `r` entra nel batch in uno dei due giri: quel passo "
        "dipende dal tempo (un pezzo accanto al decode si registra quando ha finito). Il tier su disco non c'è: lo "
        "scenario 8 confronta l'anello col disco, e gli interruttori MTP non toccano le immagini delle pagine.",
+    10: "Un processo del fork fatto con `EXL3_MOE_STREAM_T_BESIDE=1` (l'host degli esperti CPU legge la variabile quando "
+        "nasce); il figlio spegne e accende la soglia bassa giro per giro (`beside_t`), con i pezzi del prompt in volo sulle "
+        "due schede come in produzione. Un documento `r` ingerito accanto a 1 e 2 job che generano. I job accanto non "
+        "passano dal prefill a streaming (lotti da decode): attesi identici agli stessi job da soli, fino al passo in cui `r` "
+        "entra nel batch. Il documento invece cambia negli ultimi bit, perché gli esperti che i suoi pezzi mandano oggi al "
+        "worker CPU vanno sulle schede: giudicato entro il rumore del più grande di due metri, tutti e due differenze che "
+        "upstream ha già, cioè `r` in linea accodato più tardi (entra nel batch in un altro punto, come dopo un'ingestione "
+        "accanto al decode) e `r` da solo con ogni esperto in streaming contro la soglia delle schede (`stream_t` = 1). "
+        "`r` da solo in volo con l'interruttore acceso deve uscire identico a in linea: nessuno genera, vale la soglia "
+        "delle schede. Il prompt lungo accanto a 2 job, spento e acceso, c'è per la memoria per scheda (tabella dei giri); "
+        "il suo confronto è solo informativo. I job accanto si confrontano con gli stessi job accanto a `r` a interruttore "
+        "spento: con due job e i pezzi in volo il secondo prompt entra quando il primo job genera già, mentre i job da soli "
+        "entrano insieme in un passaggio in linea, e quali esperti un pezzo di prefill porta sulle schede dipende dai "
+        "conteggi di tutto il pezzo (il confronto coi job da soli resta informativo). Un pezzo accanto al decode più corto "
+        "di `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` (2048) tiene la soglia delle schede. Il decode sfalsato è spento (con 2 job la produzione lo accende: la soglia non "
+        "dipende da come il decode è diviso, solo da quante righe ha).",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -2408,7 +2610,7 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
                 if st.get("slowest"):
                     out += ["Chiamate più lunghe: " + ", ".join(f"{fmt(t, 2)} s ({op})" for t, op in st["slowest"][:8]), ""]
     # Memory and timing per run, for the scenarios where they are asked for
-    if s in (3, 4, 5):
+    if s in (3, 4, 5, 10):
         out += runs_table(s, plan, res)
     if s == 9:
         out += mtp_runs_table(s, plan, res)
@@ -3185,7 +3387,8 @@ def parse_cli(argv: list | None = None):
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
     ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7",
                     help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; a richiesta l'8, l'anello delle chiavi grezze "
-                           "del QSA, e il 9, la combinazione di produzione con la decodifica MTP nuova)")
+                           "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, e il 10, più esperti "
+                           "in streaming nei pezzi di prompt accanto al decode)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -3245,6 +3448,11 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--s9-mixed", type = lambda v: [parse_windows_list(x) for x in v.split("/") if x.strip()],
                     default = [[0, 1, 2, 3], [3, 0, 3, 1]],
                     help = "programmi di finestre misti dello scenario 9, separati da / (default 0,1,2,3/3,0,3,1)")
+    ap.add_argument("--s10-prompt", type = int, default = doc_length(64, 64),
+                    help = "token del documento dello scenario 10 (default 16449: quattro pezzi da 4096 e un ultimo di 64)")
+    ap.add_argument("--s10-decoders", type = int_list, default = [1, 2], help = "job che generano accanto al documento nello scenario 10")
+    ap.add_argument("--s10-long", type = int, default = 131073,
+                    help = "token del prompt lungo dello scenario 10, accanto a 2 job (0 = niente: il giro c'è per la memoria)")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)

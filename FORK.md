@@ -1856,6 +1856,176 @@ the card where CUDA is available: on the workstation they are the first GPU chec
 on for the session when it is the first to import triton (the switch is read at the import); the
 compile checks run in a process of their own.
 
+### More of a chunk's experts streamed while a decode goes on beside it (`EXL3_MOE_STREAM_T_BESIDE`)
+
+Off by default: unset, every prompt chunk streams the experts its card's threshold streams, as
+upstream, and the generator writes nothing. For a model with CPU split experts whose prompt chunks
+run beside the decode (`Generator(prefill_thread = True)`, with or without the pipeline). The
+variable is read once, at import, with the other knobs of the CPU expert host; in the server it
+goes in the environment of the process (the wrapper), as `EXL3_STAGGER_DECODE` does. Also in
+`doc/env_vars.md`.
+
+**Why.** On a split layer a prompt chunk of at least `stream_min_rows` rows (32) goes through
+`MoeCpuHost.submit_prefill`: the experts with at least `stream_t` of the chunk's assignments have
+their weights streamed to the card and run there, the rest (the tail) go to the CPU expert worker
+as jobs on its ring. `stream_t` is per card, from the link's bandwidth measured at load
+(`_ensure_stream_state`): about 23 on the workstation's first card (chipset slot, gen3 x4) and 11
+on the second. The worker serves its ring in publication order (`cpu/moe_handoff.cu`), so a decode
+step beside the chunk has each layer's job wait behind the tail jobs the chunk published before it.
+Measured on the workstation on 2026-10-24 (production's flags, the draft window fixed at 1, the
+placement frozen; the server repo's `docs/REPORT-profiling-20261024.md`, 3.2-3.3 and 4.4): beside a
+prompt the decode step's wait for the worker had maxima of 33-90 ms (1-2 ms alone), with the worker
+busy 40-53% of the time, a wait for its turn more than for capacity. With `EXL3_MOE_STREAM_T=1`
+(every expert a chunk selects streamed, no tail):
+
+| | card's threshold (production) | `EXL3_MOE_STREAM_T=1` | |
+|---|---|---|---|
+| decode beside an 11.7k-token turn | 23.9 tok/s, 80.5 ms a step | 30.3 tok/s, 59.3 ms | +27% |
+| that turn's ingestion | 572 tok/s | 566 tok/s | -1% |
+| decode beside a cold 60k prompt | 15.4 tok/s, 111.6 ms a step | 24.2 tok/s, 77.3 ms | +57% |
+| that prompt's ingestion | 923 tok/s | 854 tok/s | -7.5% |
+| a cold 32k prompt alone | 1329 tok/s | 1062 tok/s | -20% |
+| worker busy beside the prompt | 40-41% | 12-21% | |
+
+For prompts alone no threshold beat the card's own: 12 on both cards -5% (32k) and -10% (128k), 24
+on both -11% and -14%, 40 -37% and -42%, the first card alone at 32 -4.5%, at 48 -21%. Hence the
+card's threshold for a chunk with nobody decoding beside it and a lower one for a chunk beside a
+decode.
+
+**What the switch does.** `EXL3_MOE_STREAM_T_BESIDE=<n>`, an integer of at least 1: a streamed
+layer of a chunk planned on a lane other than 0 while the generator takes decode steps beside the
+chunks under way streams the experts with at least n assignments (1: every expert the chunk
+selects), on every card, as given: not scaled by the link, not capped by the card's threshold.
+A chunk of fewer than `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` rows (default 2048) keeps the card's
+threshold beside a decode too (*Short chunks* below). The rest of the streamed path is as it was,
+more batches through the same tiers and buffers.
+
+- `exllamav3/model/moe_cpu_host.py`: `MoeCpuTuning.stream_t_beside`, 0 when the variable is unset
+  or empty; anything but an integer of at least 1 raises a ValueError at import (0 would stream
+  experts that no token selected). `MoeCpuTuning.stream_t_beside_min_rows` from
+  `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS`, 2048 when unset or empty, an integer of at least 1 or a
+  ValueError at import. A host copies both when it is made (`MoeCpuHost.stream_t_beside`,
+  `stream_t_beside_min_rows`, the tuning object's rule for a same-process sweep), with
+  `decode_beside` (False) beside them. `_stream_threshold` gives `submit_prefill` the layer's
+  threshold: the card's, unless the value is set, the calling thread is on a lane other than 0,
+  `decode_beside` holds and the chunk has at least `stream_t_beside_min_rows` rows. `beside_stats`
+  counts the streamed layers planned at each threshold, per lane (`{"normal": [lane 0, 1, 2],
+  "beside": [...], "small": [...]}`, `small` the layers of a chunk beside a decode kept at the
+  card's threshold for its rows; each lane's entry written by its own thread), None with the switch
+  off. A host made without `__init__` has the switch off (class attributes).
+- `exllamav3/generator/generator.py`: `_side_plan`, which sets the prefill thread up, keeps the hosts
+  that have a value (`_beside_hosts`), tells them False (whatever an earlier generator over the same
+  model left) and adds the threshold to its start-up line; `_prefill_round`
+  tells them at its top, before any chunk is handed over or waited for, whether this round's decode
+  step goes on beside the chunks under way (`_note_beside`): the prefill thread is at work, somebody
+  is generating, and the decode batch is one a chunk may overlap (at most `side_max_rows`, 8 rows x
+  tokens). Otherwise the round waits for its chunks, and a chunk waited for is best at the card's
+  threshold. The bool is written only when it changes.
+
+Rules:
+
+- *Who knows.* The generator knows every round whether it steps the decode beside the chunks: it
+  is the condition `_prefill_round` and `_pipe_round` decide on. The host could only guess it, from
+  when lane 0 last published a decode-size job. Lane 0 never takes the lower threshold: a chunk
+  there is the generator's own thread inline (the prefill thread off, unavailable or switched off at
+  run time), and the decode step after it waits for the whole chunk anyway, so a slower chunk is a
+  longer wait. Without the prefill thread `_side_plan` never runs and nothing is written.
+- *Per layer, no lock.* `decode_beside` is read at every streamed layer as it stands: one bool the
+  generator's thread writes and the lanes read, no lock and no wait (the layer's counts readback
+  before it is upstream's). A change takes effect from the next layer planned: the decode ending in
+  the middle of a chunk (the round that finds nobody generating says so before it waits for the
+  chunk), the thread switched off.
+- *What a round cannot know at its top.* In flight on two cards, a round that records a job's last
+  chunk lets that job decode in the same iteration, beside the chunk started meanwhile: that chunk
+  hears of it at the next round, one decode step later. A chunk too short to run beside a decode
+  (`side_min_tokens`) and waited for in a round with somebody generating is told True: it streams
+  at all only with 32 rows or more, so this is a chunk of exactly 32 tokens, or one shorter than
+  `EXL3_SIDE_MIN_TOKENS` with that raised.
+- *Short chunks.* A chunk below `stream_t_beside_min_rows` rows (2048) beside a decode keeps the
+  card's threshold. Found on the cards on 2026-10-25 (exact check scenario 10, two jobs decoding):
+  the second job's own short prompt, ingested on the prefill thread beside the first job's decode,
+  streamed every expert it selected at 1 and took 5.0 s to its first token instead of 1.1 (a
+  47-token prompt, exact mode, which runs the streamed experts without the fused tier): a short chunk
+  has few assignments per expert, so at 1 nearly every expert it selects is one more weight DMA
+  for a handful of rows, while its tail on the worker is short anyway. A chunk of the production
+  size (4096) is above the floor; the last chunk of a prompt usually is not.
+- *Memory.* No VRAM beyond what the load reserves for the streamed path, whatever the threshold.
+  The autosplit's worst case for a split layer (`_autosplit_worst_case`) takes every split of the
+  chunk's assignments between the card's experts and the worker's, and the host's part
+  (`prefill_worst_case_parts`) sizes the streamed path for all of the worker's share going through
+  it: the outputs, the input copy, the sorted lists, and the larger of every row on one expert and
+  the batched tier's largest group; it never reads the threshold. The weight-staging ring
+  (`EXL3_MOE_CPU_WSLOTS` x `EXL3_MOE_CPU_WSLOT_MB`, and its native-order twin for packed layouts),
+  the fused tier's buffers and the batched tier's statics are allocated in the measured load and do
+  not grow. A lower threshold streams more experts, in more batches through the same ring; those it
+  adds are cool (fewer assignments than the card's threshold, so below `EXL3_MOE_STREAM_FUSED_T`)
+  and take the fused tier where the layer has one (per-batch tables of a few bytes per assignment),
+  the per-expert path otherwise, which the bound covers; the tail it removes takes its compressed
+  copies with it. Production ran `EXL3_MOE_STREAM_T=1` through the night's A/B without an OOM.
+- *Numerics.* An expert computed on the card instead of the worker agrees to the last bits only
+  (other kernels), as with any change of `EXL3_MOE_STREAM_T`: with the switch on, a chunk beside a
+  decode is not bit for bit the same chunk alone, and the exact check's comparison of an ingestion
+  beside a decode with one alone (the prefill thread's third session) differs by design. The
+  decode's own computation is untouched (decode-size batches never stream). Which layers take which
+  threshold follows the scheduling: the same plan gives the same layers unless a decode starts or
+  ends during a chunk.
+- *With the other switches.* Promote-on-miss rules the prefill thread out, so the switch too. The
+  placement weight counts a chunk's selections before `submit_prefill`, whatever is streamed. The
+  staggered decode is never on while a job ingests. An MTP head with split experts of its own has a
+  host of its own, told like the model's.
+
+What it costs when it runs: on the generator's thread a count of the decode rows per round (a loop
+over the active jobs) and a bool written when it changes; on a lane a thread-local read and a
+counter per streamed layer. Beside a decode, the DMA of the experts it adds (1.26 MB each on
+Flash-Next; the first card's link carried 3.1 GB/s in the night's trace) and their compute on the
+card instead of the worker: the -1% and -7.5% of the ingestions above, at 1. Nothing written
+anywhere.
+
+On the cards (2026-10-25, exact check scenario 10: production's split, cache 430k with the raw-key
+ring, checkpoints every 8192, 11 worker threads, a 16,449-token document ingested in flight beside 1
+and then 2 jobs generating, the switch turned off and on per run):
+- the jobs generating beside it came out identical with the switch on and off, over every position
+  both runs decoded in the same batch (447 positions of the one job, 399 of them during the
+  ingestion; 365 of the second of two, 340 during it), and the one job identical to the same job
+  alone over all its 640 positions, 592 of them beside the document streaming every expert;
+- the document's own logits moved within the noise of upstream's own differences (max |Δ log p|
+  0.066 against a yardstick of 0.128, the same document alone with every expert streamed; no top-1
+  token changed);
+- the document alone with the switch on came out identical to inline (nobody decoding: the cards'
+  threshold);
+- memory: a 131,073-token prompt beside two jobs, off then on, left the same lowest free memory in
+  one run of the check (710 MiB on cuda:0, 528 on cuda:1) and 32 MiB less on cuda:0 with the
+  switch in the other (678 against 710; cuda:1 464 both); peaks 14.24 / 14.40 GiB either way.
+The comparison of the jobs beside is bounded where the two runs' batches part: exact mode ingests
+the document some 30% faster with the switch off (the fused tier is off, so the experts the switch
+adds run through the slower per-expert path), so it joins the decode earlier there; and the second
+job's prompt joins the first job's decode one or two steps apart in two runs, by wall time, so only
+the job that joins last is judged. The first run of the check, before the floor of 2048 rows, found
+the short-chunk cost above. Speeds there are exact mode's and say nothing of production's (the
+ingestion beside a decode 975 tok/s off against 682 on in exact mode; the night's A/B with the fused
+tier on measured -1% and -7.5%).
+
+Not measured: production's speed with the switch (the decode and the ingestion beside each other, a
+prompt alone, which should not move); only 1 has been tried, values between 1 and the cards'
+thresholds have not.
+
+Tests: `tests/test_stream_beside.py` (no GPU, no extension). The variable: read as an integer of at
+least 1 or off, anything else refused, read once by the tuning object (the sources say so) and
+taken by a host when it is made. The host loaded on its own as in `test_moe_host_lanes.py`, its
+streamed and plain paths recording what they are handed: off, every lane gets the card's experts
+whether told or not; on, the lower threshold for lanes 1 and 2 told that a decode goes on beside,
+never for lane 0; a chunk that streams nothing at the card's threshold; decode-size batches; the
+counters; the load's worst case that never reads the threshold (the sources). The real
+`submit_prefill` and streamed path on lane 1 against that file's model of the streams and the
+worker's ring: at the card's threshold the chunk publishes a tail job, beside a decode none. The
+generator's real round over the toy model of `test_prefill_thread.py`, every chunk recording what
+its host was told as its passes start: nothing written without the variable; a's prompt alone
+False and b's four chunks beside a's decode True, also on a host an earlier generator left True;
+a decode batch too wide to overlap, False; the
+decode ending in the middle of b's prompt, True then False and never back; inline, never told;
+switched off at run time; in flight on two cards, both halves of every chunk. Marked `nogpu`; run
+with `--noconftest`. The fork's own tests: 596 passed, 35 skipped (549 before).
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
