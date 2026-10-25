@@ -9,7 +9,11 @@ v1.6.3, then what 1.6.3 asked of them ("The move to 1.6.3", below). It has run i
 followed through its release tags. On 2026-10-24 the fix of "A page a prompt chunk has written is
 not handed back" and "Content-addressed multimodal pages" (branches `fix-page-revert` and
 `mm-content-hash`, run in production together as `prova-oom-mm` from 10:51 that day) were merged
-into it. The tuning of the earliest fork branches (`flash-next` and
+into it. On 2026-10-25 so was `night-20261025`: "More of a chunk's experts streamed while a decode
+goes on beside it", "The decode step's host work, kept between calls", the decode MoE bench and
+scenarios 10-12 of the exact check. Production had run that branch since 08:51 that day, and from
+09:39 with `EXL3_HOST_FASTPATH=1` and `EXL3_MOE_STREAM_T_BESIDE=1` (`EXL3_MOE_COOP_WIDE` left off:
+"A routed expert is read once per decode step"). The tuning of the earliest fork branches (`flash-next` and
 `flash-next-placement`, on v1.5.4) was ported onto `flash-next-1.6.2` one feature at a time. Every
 feature stays behind a switch of its own, off by default: with every switch off this branch
 behaves as upstream v1.6.3, but for the fixes of upstream's own code, which have no switch and
@@ -2005,9 +2009,20 @@ the short-chunk cost above. Speeds there are exact mode's and say nothing of pro
 ingestion beside a decode 975 tok/s off against 682 on in exact mode; the night's A/B with the fused
 tier on measured -1% and -7.5%).
 
-Not measured: production's speed with the switch (the decode and the ingestion beside each other, a
-prompt alone, which should not move); only 1 has been tried, values between 1 and the cards'
-thresholds have not.
+In production since 2026-10-25 09:39, with `EXL3_HOST_FASTPATH=1` beside it (the server's cache log:
+every job's decode rate fitted by least squares over what ran beside it, 208 jobs in 2.7 h, the same
+fit over the periods before; 10-90% of 300 resamples in brackets):
+- one job generating beside a prompt being ingested: 38.6 tok/s [34.4-42.6], against 22.4-31.4 in
+  the four periods before;
+- two jobs generating beside a prompt: 44.5, against 43.4-47.8, unchanged;
+- prompts of 4-16k tokens ingested with a decode beside them most of the time: 519 tok/s (median of
+  9), against 415-471 (50 prompts in four periods); of 64k or more, 908 (2) against 710-731 (4);
+  prompts alone not slower (4-16k: 932 against 767-897 in three periods and 429 in the fourth; 64k
+  or more: 1372 against 971-1401).
+Real traffic: other prompts and contexts in every period, and the two switches were not run apart.
+The host fast path left a job generating alone where it was (69.1 tok/s against 68.3-68.8), so the
+change beside a prompt is most likely this switch's. Only 1 has been tried; values between 1 and
+the cards' thresholds have not.
 
 Tests: `tests/test_stream_beside.py` (no GPU, no extension). The variable: read as an integer of at
 least 1 or off, anything else refused, read once by the tuning object (the sources say so) and
@@ -2172,8 +2187,8 @@ Thirty mutations of the fast path (a count check dropped, the lane, the batch sh
 out of a key, an identity check dropped, a conversion let through, another shape recorded, ...) each
 make a test fail, but one that cannot: the identity check in `_fast_rows_view` is redundant while the
 kept view is held in the same dict. The whole suite passes with the switch off and with it on.
-Not checked: anything on the cards (no CUDA tensor has gone through the fast path; equality on the
-cards is the GPU check below), a real model's full forward (the toy has three blocks), mHC models
+Not checked here: the cards (the GPU check and what it found are below), a real model's full
+forward (the toy has three blocks), mHC models
 (their `HyperConnection` is untouched, the workspace cache's change applies to them), tensor
 parallelism (the ranks import the library in their own processes and read the switch from the
 environment they inherit), ROCm, a free-threaded Python.
@@ -2205,6 +2220,30 @@ are set empty, not `0`:
 The switch leaves no line in the log: in `HF1`'s captures the sites' stacks go through `_mix_fast`, in
 `HF0`'s never. The tok/s of the same windows are in each run's `summary.jsonl`; whether the cards then
 become the limit is what the three-request windows say.
+
+**On the cards** (2026-10-25, production stopped). Scenario 11 identical over 3,076 positions in its
+three configurations (production's generator with the window policy free, with it held, and a fixed
+window without the MTP switches), compared while the two processes' decode batches are the same
+(a6444a85: every difference of the first report came after a job joined a batch at another step, by
+wall time). Issue time without the profilers (boots HF0, HF1, HF0b, HF1b: two a side, alternated,
+60k, the window held at 1, the placement frozen):
+
+| | issue a step, off -> on | step | share waiting for the cards, off -> on |
+|---|---|---|---|
+| 1 request | 18.1 -> 13.9 ms (-23%) | ~29 -> ~31 ms | 32-41% -> 52-57% |
+| 3 requests | 22.9 -> 17.8 ms (-22%) | ~27 -> ~26 ms | 6-29% -> 25-40% |
+
+The time the host saves goes into waiting for the cards: at these conditions the step is the cards'
+and the CPU expert worker's work, and it moves by ±10% from boot to boot, so no gain within that
+noise. The estimate above (+12-20% with three requests) did not hold there.
+
+**In production** since 2026-10-25 09:39, with `EXL3_MOE_STREAM_T_BESIDE=1` (the same fit as in that
+section): one job generating alone 69.1 tok/s [68.6-69.6] against 68.3-68.8 the day before; two
+together 100 [95-107] against 90.5 [86.5-94.5] the night before (the staggered decode from 2
+requests already on); three 134 [127-147] against 120 [113-125] the afternoon before. The stream
+beside the decode does not act with no prompt beside, so these classes are the ones only this switch
+can move; but on real traffic (two together: 53k of context and 0.63 of drafts accepted, against 156k
+and 0.58; three: 39k and 0.60 against 51k and 0.60) they are a direction, not the switch's figure.
 
 Tests: `tests/test_host_fastpath.py` (no GPU, no extension; marked `nogpu`, run with
 `--noconftest`), the scenario's plan and report in `tests/test_exact_check.py`.
@@ -2309,6 +2348,10 @@ On the cards (2026-10-25, the integration branch `night-20261025`, cuda:0 for th
   stage of every MoE layer moves, where the yardstick (W=3 against W=1) moves one stage's tile
   from 4 rows up. With `EXL3_MOE_COOP_KSPLIT=2`: within the noise in all 6.
 Whether that difference is acceptable is a decision for production, not a verdict of the check.
+Production's (2026-10-25): left off, because it moves the outputs beyond the yardstick. In the 26
+minutes production ran with it and the host fast path (08:52-09:17), two jobs generating together
+went at 120 tok/s [116-124], against 100 with the fast path and the stream beside the decode from
+09:39, on other prompts: a direction, not the switch's figure.
 
 Command lines for the GPU window (fish, production stopped; the dry run touches no card):
 
