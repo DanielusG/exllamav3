@@ -1006,6 +1006,24 @@ from it, an incomplete capture, the conditions, the modules that declare the cap
 `tests/kernels/recurrent/test_recurrent_capture_cuda.py` (on the card: the scan's state and output
 rows, the conv window on each conv path, the PLE stream), the exact check's scenario 13.
 
+**On the cards** (2026-10-25, a GPU window with production stopped, the branch on a82deecf from a
+files-only copy, production's device split, cache size and checkpoint interval, the raw-key ring).
+The kernel tests: 22 passed (the scan's state at the split equal bit for bit to the row a pass
+ending there stores, fp16 and fp32 pools, Flash-Next's heads included; the conv window on the
+Triton and CUDA paths; the PLE stream fresh and carried). Scenario 13, in exact mode: the capture
+against the cut within the noise, below its meter, for both documents (12900 tokens: max |Δ log p|
+0.212 against 0.257 for chunks of 2048, one top-1 changed as in the meter; 16329 tokens: 0.135
+against 0.342), and the next turn resumed from the captured checkpoint against upstream's 0.469
+against 0.467 (one top-1 each); identical bit for bit, logits and checkpoints: the capture
+repeated, on the prefill thread, with two chunks in flight, with the disk tier on, and the next
+turn resumed from the disk in a new process against the same from RAM; the disk tier's page files
+and checkpoints intact. One prefill pass fewer per document (4 against 5). The captured checkpoint
+against upstream's keeps the position, the layers, the shapes, the dtypes and the PLE token ids;
+it differs by up to 0.073 in the GDN states (fp16, values up to 7.9), 1.91 in the conv windows
+(bf16, up to 34.5) and 0.0078 in the PLE conv state. The next turn's first token (365 tokens to
+read, itself ingested with the capture: one pass instead of two) came in 1.21 s against 1.89, one
+sample of each in exact mode, not a speed measure.
+
 ### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
 
 Off by default: at the default weight, 1, nothing of it runs and the placement is upstream's,
