@@ -25,6 +25,18 @@ The tensors are taken on the device the pass runs on, in the issuing thread's st
 the record copies them to the host after the chunk's passes have run (on the prefill thread
 and in the pipeline the chunk's lane is synchronized before its record), as a regular stash
 copies the live state.
+
+A capture can also sit at the end of the pass (offset = the chunk's length): a checkpoint due
+where a chunk ends, which the two-card pipeline wants to plan the job's next chunk across
+(Generator._pipe_ahead) while the next chunk's first half would move the first card's layers
+past it before the record. The module then copies the rows its pass leaves, right after the
+pass and on its stream, i.e. before the next chunk's pass can reach them:
+
+    if cap is not None and cap.wants_end(bsz, seqlen):
+        ...  # the pass
+        cap.take(layer_state, (rows.clone(), ...))   # what layer_state.stash(slot) reads, on the device
+
+The same bytes the regular stash reads after the chunk.
 """
 
 from __future__ import annotations
@@ -46,6 +58,12 @@ class RecurrentCapture:
         """Whether a pass of this shape takes a copy: one sequence, with the boundary strictly inside
         the pass (a boundary at the end of a pass is what the regular stash covers)"""
         return bsz == 1 and 0 < self.offset < seqlen
+
+
+    def wants_end(self, bsz: int, seqlen: int) -> bool:
+        """Whether a pass of this shape copies the rows it leaves: one sequence, the boundary at the
+        pass's end (the next chunk may run before the record)"""
+        return bsz == 1 and 0 < self.offset == seqlen
 
 
     def take(self, layer_state, tensors: tuple):
