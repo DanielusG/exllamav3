@@ -422,16 +422,17 @@ def jobspec(name: str, prompt: str, max_new: int | None = None, forced: dict | N
 
 def run_step(rid: str, scenario: int, jobs: list, *, forget: bool = True, switches: dict | None = None,
              until: dict | None = None, cancel: list | None = None, after_cancel: dict | None = None,
-             warmup: bool = False, disk_at_first_token: bool = False, keep_ckpt: dict | None = None) -> dict:
+             warmup: bool = False, disk_at_first_token: bool = False, keep_ckpt: dict | list | None = None) -> dict:
     """keep_ckpt: {"tag", "job"}, the child keeps a host copy of the checkpoint at the last page boundary
-    of that job's prompt after the run, for a later ckpt_cmp step"""
+    of that job's prompt after the run, for a later ckpt_cmp step; {"tag", "job", "position"} the one at that
+    position; a list of them, each"""
     st = {
         "op": "run", "id": rid, "scenario": scenario, "jobs": jobs, "forget": forget,
         "switches": switches or {}, "until": until, "cancel": cancel or [], "after_cancel": after_cancel,
         "warmup": warmup, "disk_at_first_token": disk_at_first_token,
     }
     if keep_ckpt:
-        st["keep_ckpt"] = dict(keep_ckpt)
+        st["keep_ckpt"] = [dict(k) for k in keep_ckpt] if isinstance(keep_ckpt, list) else dict(keep_ckpt)
     return st
 
 
@@ -499,6 +500,7 @@ SCENARIO_TITLES = {
     11: "Il lavoro dell'host del passo di decode tenuto fra le chiamate (EXL3_HOST_FASTPATH)",
     12: "Il kernel MoE del decode con un'altra variabile d'ambiente",
     13: "Checkpoint ricorrente dell'ultima pagina preso dentro la passata",
+    14: "Checkpoint a fine pezzo copiato dalla passata: i pezzi in volo lo attraversano",
 }
 
 
@@ -1019,6 +1021,9 @@ def build_plan(args) -> dict:
     # ---------------------------------------------------------------- scenario 13
     if 13 in sc:
         s13_plan(args, procs, comps)
+    # ---------------------------------------------------------------- scenario 14
+    if 14 in sc:
+        s14_plan(args, procs, comps)
 
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
 
@@ -1240,6 +1245,83 @@ def s13_plan(args, procs: list, comps: list):
                   ("ripreso come upstream", ref(PA, "s13.t2.off", "y")),
                   ("da capo", ref(PA, "s13.t2.full.free", "y"))]},
         {"kind": "library", "scenario": 13, "id": "s13.library", "procs": {PA: "fork", PB: "fork"}},
+    ]
+
+
+# The library's prompt-prefill checkpoint interval (Generator's recurrent_checkpoint_interval_pp, rounded up to
+# a whole number of chunks), which the server leaves alone unless --recurrent-checkpoint-interval-pp
+S14_INTERVAL_PP = 32768
+
+
+def s14_positions(n_prompt: int, chunk: int, interval: int, interval_pp: int = S14_INTERVAL_PP) -> list:
+    """The interval checkpoints of a prompt of n_prompt tokens ingested from its start, at the chunk ends
+    before its last chunk (Job.is_checkpoint_boundary with no cached pages: the prompt-prefill interval, the
+    regular one from 2 chunks before the end on)"""
+    pp = (interval_pp + chunk - 1) // chunk * chunk
+    out = []
+    for end in range(chunk, n_prompt, chunk):
+        near = end >= n_prompt - 2 * chunk
+        if end % (interval if near else pp) == 0:
+            out.append(end)
+    return out
+
+
+def s14_plan(args, procs: list, comps: list):
+    """
+    Scenario 14: a checkpoint due where a prompt chunk ends (the prompt-prefill interval, the regular one in the
+    last two chunks), copied by the modules at the end of the chunk's passes, so that the two-card pipeline plans
+    the job's next chunk across it (Generator._pipe_ahead with recurrent_checkpoint_in_pass) instead of waiting
+    for the chunk's record. One document whose interval checkpoints fall at chunk ends and whose last page
+    boundary falls inside its last chunk, its forced answer: with the capture in line (no copies at chunk ends:
+    the regular stash, twice: the floor), in the pipeline (the copies), and without the capture in line and in
+    the pipeline (upstream's pipeline against upstream's line: what the pipeline already guarantees). The
+    checkpoints at every interval position and at the last page, kept and compared tensor by tensor.
+    """
+    P = "s14-fork"
+    W = args.warmup_tokens
+    p14 = doc("s14", doc_length(args.s14_last, args.s14_pages), 2)
+    n = doc_length(args.s14_last, args.s14_pages) - 1
+    positions = s14_positions(n, args.chunk, args.ckpt_interval) + [n // 256 * 256]
+    A = ref(P, "s14.free", "x")
+    fx = lambda: jobspec("x", p14, forced = A)
+    keep = lambda tag: [{"tag": f"{tag}@{pos}", "job": "x", "position": pos} for pos in positions]
+    on, pipe_on = {"ckpt": True}, {"ckpt": True, "pipeline": True}
+    p = Proc(P, "fork", [14])
+    p.add(gen_step("g0", 14))
+    p.add(run_step("s14.warm.1", 14, [jobspec("a", q(0), W)], warmup = True))
+    p.add(run_step("s14.warm.r", 14, [jobspec("x", doc("s14w", doc_length(64, 24), 2), 8)], warmup = True,
+                   switches = pipe_on))
+    p.add(run_step("s14.free", 14, [jobspec("x", p14, args.s14_answer)], switches = on))
+    for k in (1, 2):
+        p.add(run_step(f"s14.line{k}", 14, [fx()], switches = on, keep_ckpt = keep(f"line{k}")))
+    p.add(run_step("s14.pipe", 14, [fx()], switches = pipe_on, keep_ckpt = keep("pipe")))
+    p.add(run_step("s14.line.off", 14, [fx()], keep_ckpt = keep("line_off")))
+    p.add(run_step("s14.pipe.off", 14, [fx()], switches = {"pipeline": True}, keep_ckpt = keep("pipe_off")))
+    pairs = [[f"line2@{pos}", f"line1@{pos}"] for pos in positions] + \
+            [[f"pipe@{pos}", f"line1@{pos}"] for pos in positions] + \
+            [[f"pipe_off@{pos}", f"line_off@{pos}"] for pos in positions]
+    p.add({"op": "ckpt_cmp", "id": "s14.ckpt", "scenario": 14, "pairs": pairs})
+    p.prompts = prompt_specs(p.steps, {})
+    procs.append(p)
+
+    floor = (ref(P, "s14.line1", "x"), ref(P, "s14.line2", "x"))
+    length = prompt_spec_of(p14)["length"]
+    comps += [
+        cmp(14, "s14.line.rep", "con la cattura in linea, ripetuta", ref(P, "s14.line2", "x"), ref(P, "s14.line1", "x"),
+            floor = None, requires = {"captured": True}),
+        cmp(14, "s14.pipe", f"risposta imposta ({args.s14_answer} token) al documento di {length} token, con la cattura: "
+            f"pezzi in volo, i checkpoint a fine pezzo ({', '.join(str(x) for x in positions[:-1])}) copiati dalla "
+            "passata, contro in linea",
+            ref(P, "s14.pipe", "x"), ref(P, "s14.line1", "x"), floor = floor,
+            requires = {"captured": True, "captured_end": True, "pipeline": "on", "ahead": True}),
+        cmp(14, "s14.pipe.off", "senza la cattura: pezzi in volo contro in linea (ciò che la pipeline garantisce già)",
+            ref(P, "s14.pipe.off", "x"), ref(P, "s14.line.off", "x"), floor = None, requires = {"pipeline": "on"}),
+        {"kind": "ckpt", "scenario": 14, "id": "s14.ckpt", "rec": ref(P, "s14.ckpt", ""),
+         "label": "i checkpoint a ogni posizione d'intervallo e all'ultima pagina: ripetuti in linea, coi pezzi in "
+                  "volo contro in linea con la cattura, e senza la cattura",
+         "pairs": pairs, "expect": "identical",
+         "ahead": [(ref(P, "s14.pipe", "x"), ref(P, "s14.pipe.off", "x"))]},
+        {"kind": "library", "scenario": 14, "id": "s14.library", "procs": {P: "fork"}},
     ]
 
 
@@ -2058,6 +2140,8 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
         if not cap.get("captured"):
             out.append("nessun checkpoint preso dentro la passata" +
                        (f" ({cap['incomplete']} catture incomplete)" if cap.get("incomplete") else ""))
+    if req.get("captured_end") and not (stats.get("capture") or {}).get("at_end"):
+        out.append("nessun checkpoint a fine pezzo copiato dalla passata")
     # The MTP decode's switches (the fork's counters, the run's difference)
     verify, update, window = (stats.get(k) or {} for k in ("verify", "update", "window"))
     if req.get("verify_windows") and not verify.get("windows"):
@@ -2469,6 +2553,24 @@ def evaluate_ckpt(c: dict, res: Results) -> dict:
             problems.append(f"passate di prefill di `{test['run']}` {nt}, di `{refr['run']}` {nr}: attesa una in meno")
     if passes:
         row["notes"].append("Passate di prefill registrate per il documento (una per pezzo): " + "; ".join(passes) + ".")
+    # `ahead`: (test run, reference run) pairs whose test must have planned more chunks ahead of the record of
+    # the chunk before them (Generator._pipe_ahead), with checkpoints copied at a chunk's end (scenario 14)
+    aheads = []
+    for test, refr in c.get("ahead") or []:
+        st = ((res.rec(test) or {}).get("stats") or {})
+        sr = ((res.rec(refr) or {}).get("stats") or {})
+        at, ar = (st.get("side") or {}).get("ahead"), (sr.get("side") or {}).get("ahead")
+        pt, pr_ = (st.get("side") or {}).get("piped"), (sr.get("side") or {}).get("piped")
+        ends = (st.get("capture") or {}).get("at_end")
+        aheads.append(f"`{test['run']}` {at if at is not None else '-'} pianificati in anticipo ({pt if pt is not None else '-'} "
+                      f"in volo con un altro, {ends if ends is not None else '-'} checkpoint copiati a fine pezzo) contro "
+                      f"`{refr['run']}` {ar if ar is not None else '-'} ({pr_ if pr_ is not None else '-'})")
+        if at is None or ar is None:
+            problems.append(f"mancano i contatori dei pezzi in volo tra {test['run']} e {refr['run']}")
+        elif at <= ar:
+            problems.append(f"`{test['run']}` non ha pianificato più pezzi in anticipo di `{refr['run']}` ({at} contro {ar})")
+    if aheads:
+        row["notes"].append("Pezzi del documento pianificati prima che il precedente fosse registrato: " + "; ".join(aheads) + ".")
     if problems:
         row.update(verdict = FAIL if c.get("expect") == "info" else DIFF, why = "; ".join(problems))
     else:
@@ -2859,6 +2961,19 @@ SCENARIO_TEXT = {
         "bit: le copie prese su un altro thread arrivano intere al record), e il turno ripreso dal disco contro "
         "quello ripreso dalla RAM. Il confronto dei checkpoint catturati con quelli di upstream è informativo, "
         "ma deve tenere posizione, pagina, strati, forme, tipi e id dei token, con una passata di prefill in meno.",
+    14: "Lo stesso checkpoint ricorrente, ma dove è dovuto alla fine di un pezzo del prompt (l'intervallo del prefill, "
+        "ogni 32768 token, e quello normale, `--ckpt-interval`, negli ultimi due pezzi): con la cattura accesa e i "
+        "pezzi in volo sulle due schede, ogni strato con stato ricorrente copia le righe che la sua passata lascia "
+        "subito dopo la passata, così il pezzo dopo dello stesso job si pianifica prima che il precedente sia "
+        "registrato, dove senza la copia aspetta il record (la sua prima metà sposterebbe gli strati della prima "
+        "scheda oltre il checkpoint). Un processo del fork, un documento i cui checkpoint d'intervallo cadono alla "
+        "fine di un pezzo e l'ultimo confine di pagina dentro l'ultimo pezzo, la risposta imposta: con la cattura in "
+        "linea (nessuna copia a fine pezzo, il checkpoint normale; due volte, il pavimento) e coi pezzi in volo, e "
+        "senza la cattura in linea e coi pezzi in volo. Atteso **identico**: coi pezzi in volo contro in linea, con "
+        "la cattura (gli stessi pezzi, e a fine pezzo le stesse righe che lo stash normale legge) e senza (ciò che "
+        "la pipeline garantisce già); i checkpoint a ogni posizione d'intervallo e all'ultima pagina, tensore per "
+        "tensore. Errore se il giro coi pezzi in volo e la cattura non ha copiato checkpoint a fine pezzo o non ha "
+        "pianificato più pezzi in anticipo del giro senza la cattura.",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -3891,7 +4006,8 @@ def parse_cli(argv: list | None = None):
                            "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, il 10, più esperti "
                            "in streaming nei pezzi di prompt accanto al decode, l'11, il lavoro dell'host del passo di "
                            "decode tenuto fra le chiamate, il 12, i kernel MoE del decode con le variabili di --s12-env, "
-                           "e il 13, il checkpoint ricorrente preso dentro la passata)")
+                           "il 13, il checkpoint ricorrente preso dentro la passata, e il 14, lo stesso a fine pezzo "
+                           "coi pezzi in volo)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -3970,6 +4086,11 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--s13-answer", type = int, default = 256, help = "token della risposta imposta al primo documento")
     ap.add_argument("--s13-long-answer", type = int, default = 64, help = "token della risposta imposta al secondo documento")
     ap.add_argument("--s13-next", type = int, default = 32, help = "token del turno dopo nello scenario 13")
+    ap.add_argument("--s14-pages", type = int, default = 161,
+                    help = "pagine intere del documento dello scenario 14 (default 161: con pezzi da 4096 e checkpoint "
+                           "ogni 8192 i checkpoint d'intervallo a 32768 e 40960, l'ultimo confine dentro l'ultimo pezzo)")
+    ap.add_argument("--s14-last", type = int, default = 44, help = "token dopo l'ultimo confine di pagina nel documento")
+    ap.add_argument("--s14-answer", type = int, default = 64, help = "token della risposta imposta nello scenario 14")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)
@@ -4020,6 +4141,10 @@ def parse_cli(argv: list | None = None):
         # multiples of it from the prompt's start): at a chunk's end there is nothing to capture
         if not 1 <= last <= 255 or pages < 1 or (pages * 256) % args.chunk == 0:
             ap.error(f"{name}: il confine di pagina deve cadere dentro un pezzo di --chunk, e da 1 a 255 token dopo")
+    if not 1 <= args.s14_last <= 255 or args.s14_pages < 1 or (args.s14_pages * 256) % args.chunk == 0 or \
+            not s14_positions(doc_length(args.s14_last, args.s14_pages) - 1, args.chunk, args.ckpt_interval):
+        ap.error("--s14-pages/--s14-last: servono un checkpoint d'intervallo alla fine di un pezzo prima dell'ultimo, e "
+                 "l'ultimo confine di pagina dentro un pezzo di --chunk, da 1 a 255 token prima della fine")
     return args
 
 

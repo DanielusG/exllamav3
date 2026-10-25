@@ -393,7 +393,7 @@ def all_refs(plan):
     return out
 
 
-@pytest.mark.parametrize("scenarios", [None, "8", "9", "10", "11", "12", "13"])
+@pytest.mark.parametrize("scenarios", [None, "8", "9", "10", "11", "12", "13", "14"])
 def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
     plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
@@ -995,6 +995,53 @@ def test_scenario_13_judges_the_checkpoints_and_the_pass_saved():
     assert rows["s13.on.rep"]["verdict"] == EC.ERR and "2 catture incomplete" in rows["s13.on.rep"]["why"]
 
 
+def test_scenario_14_keeps_the_checkpoints_at_every_interval_position_and_judges_the_pipeline():
+    assert 14 not in args_for().scenarios
+    args = args_for("--scenarios", "14", "--ckpt-interval", "8192")
+    plan = EC.build_plan(args)
+    (p,) = plan["procs"]
+    assert p["name"] == "s14-fork" and p["library"] == "fork"
+    assert {st["scenario"] for st in p["steps"] if "scenario" in st} == {14}
+    assert {c["scenario"] for c in plan["comparisons"]} == {14}
+    runs = {st["id"]: st for st in p["steps"] if st["op"] == "run"}
+    # The document's interval checkpoints fall at chunk ends, the last page boundary inside its last chunk
+    n = EC.doc_length(44, 161) - 1
+    assert EC.s14_positions(n, 4096, 8192) == [32768, 40960]
+    assert EC.s14_positions(n, 4096, 4096) == [32768, 36864, 40960]
+    assert [k["position"] for k in runs["s14.pipe"]["keep_ckpt"]] == [32768, 40960, 41216]
+    assert runs["s14.pipe"]["switches"] == {"ckpt": True, "pipeline": True}
+    assert runs["s14.line1"]["switches"] == {"ckpt": True} and runs["s14.pipe.off"]["switches"] == {"pipeline": True}
+    assert runs["s14.line.off"]["switches"] == {}
+    cmp_step = next(st for st in p["steps"] if st["op"] == "ckpt_cmp")
+    assert ["pipe@32768", "line1@32768"] in cmp_step["pairs"] and ["pipe_off@41216", "line_off@41216"] in cmp_step["pairs"]
+
+    res = fake_results(plan)
+    recs = res.records["s14-fork"]
+    for rid, rec in recs.items():
+        if rec.get("op") == "run":
+            on = rid in ("s14.line1", "s14.line2", "s14.pipe", "s14.free")
+            rec["stats"]["capture"] = {"captured": (3 if rid == "s14.pipe" else 1) if on else 0, "incomplete": 0,
+                                       "at_end": 2 if rid == "s14.pipe" else 0}
+            rec["stats"]["side"]["ahead"] = 9 if rid == "s14.pipe" else 7
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s14.pipe"]["verdict"] == EC.IDENT and rows["s14.ckpt"]["verdict"] == EC.IDENT
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert "## 14. " in report and "`s14.pipe` 9 pianificati in anticipo" in report
+    # no copy at a chunk's end, or no more chunks planned ahead than without the capture
+    recs["s14.pipe"]["stats"]["capture"]["at_end"] = 0
+    recs["s14.pipe"]["stats"]["side"]["ahead"] = 7
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s14.pipe"]["verdict"] == EC.ERR and "nessun checkpoint a fine pezzo" in rows["s14.pipe"]["why"]
+    assert rows["s14.ckpt"]["verdict"] == EC.DIFF and "non ha pianificato più pezzi in anticipo" in rows["s14.ckpt"]["why"]
+
+
+def test_the_cli_refuses_a_scenario_14_document_without_an_interval_checkpoint():
+    with pytest.raises(SystemExit):
+        EC.parse_cli(["--scenarios", "14", "--s14-pages", "10", "--s14-last", "10"])
+    with pytest.raises(SystemExit):
+        EC.parse_cli(["--scenarios", "14", "--s14-pages", "160"])
+
+
 def test_the_child_keeps_the_last_page_checkpoint_and_compares_two():
     from collections import OrderedDict
 
@@ -1024,6 +1071,10 @@ def test_the_child_keeps_the_last_page_checkpoint_and_compares_two():
     rc[b"\x01" * 16] = stash(12288, 0.5, [1, 2, 3])
     rc[b"\x02" * 16] = stash(12800, 0.25, [4, 5, 6])
     rc[b"\x03" * 16] = stash(13056, 0.125, [7, 8, 9])
+    # (at a given position: an interval checkpoint, scenario 14)
+    out = child.keep_checkpoint({"tag": "iv", "job": "x", "position": 12288}, rec)
+    assert out["found"] and out["position"] == 12288 and out["key"] == "01" * 8
+    assert float(child.kept["iv"]["layers"][(0, 0)][0].max()) == 0.5
     out = child.keep_checkpoint({"tag": "off", "job": "x"}, rec)
     assert out["found"] and out["position"] == 12800 and out["layers"] == 2 and out["key"] == "02" * 8
     # the kept copy is the child's own: the cache may let its stash go

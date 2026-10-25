@@ -932,9 +932,10 @@ offer beside a group in flight and a chunk under way; the switch). Marked `nogpu
 
 ### The prompt's last-page checkpoint taken inside the pass (`Generator(recurrent_checkpoint_in_pass = True)`, `EXL3_RECURRENT_CHECKPOINT_IN_PASS=1`)
 
-Off by default; with it off the generator behaves as upstream. Branch `ckpt-in-pass`, not merged:
-this is the first case of a piece of work (the prompt's last page only), to be judged before the
-same is done for the interval checkpoints and for the pipeline's planning (below).
+Off by default; with it off the generator behaves as upstream. The prompt's last page (branch
+`ckpt-in-pass`, the first case) is in `master` and in production since 2026-10-25; the same copy at
+the end of a chunk's passes, which lets the pipeline plan across the interval checkpoints (branch
+`ckpt-intervals`, below), is not merged.
 
 **What upstream does.** A recurrent checkpoint is a copy of the state at a page boundary, and a
 layer's state is whole only where a pass ends. So `Job._prefill_co` ends a chunk at the prompt's
@@ -988,23 +989,49 @@ taken by a pass with a capture (never the case: such a pass is longer than a pag
 the thread that issues the layer, in the stream order of its passes; the record runs after the
 chunk's lane is synchronized (in the pipeline, after the chunk's last piece, which the first card's
 half precedes by an event), so the host copies read complete tensors, and the capture's buffers are
-released only after them. The pipeline still treats the prompt's last page as a position where a
-chunk has to end for the state to be whole (`_pipe_ahead` does not plan a chunk past it): the
-prompt's last two chunks still go one at a time. Taking the interval checkpoints
-(`recurrent_checkpoint_interval`, `_pp`) inside the passes too, and letting the pipeline plan across
-them, is the next step.
+released only after them.
+
+**The interval checkpoints in the pipeline** (branch `ckpt-intervals`). The interval checkpoints
+(`recurrent_checkpoint_interval_pp` while the prompt is far from its end, `recurrent_checkpoint_interval`
+in its last two chunks) cut no chunk: they are measured from the resume point in whole chunks, so they
+fall where a chunk ends, and the generator stashes them after the chunk's record
+(`Generator.recurrent_checkpoint`). What they cost is the pipeline: `_pipe_ahead` does not plan a job's
+next chunk while the chunk that ends at a checkpoint is under way, since the next chunk's first half
+would move the first card's layers past the checkpoint before the record; the next chunk then starts
+in the round after the record, and the two cards go one at a time there (on production's flags at
+every 32768 tokens and once in a prompt's last two chunks). With the switch on and the pipeline on,
+`_prefill_co` puts a capture at the chunk's end in such a chunk's params (`RecurrentCapture.wants_end`:
+offset = the chunk's length), and every recurrent layer copies, right after its pass and on its
+stream, the rows the pass leaves, the very tensors its `stash` reads (GDN: the pool row of the slot
+and its parity and the conv window; PLE: the conv window and the token-id context), so before any
+later pass of the job can reach them. The record stashes the copies (`stash_captured` with the
+interval rule of `maybe_stash_recurrent`), the run says so (`checkpoint_in_pass`), and `_pipe_ahead`
+plans the next chunk across the checkpoint. The chunks are the same as without it and the checkpoint
+is the same bytes, so the result is expected identical bit for bit, the pipeline's own guarantee
+(`recurrent_capture_stats["at_end"]` counts these checkpoints). In line and on the prefill thread
+without the pipeline nothing changes (nothing is planned ahead there, and the regular stash after the
+record is the same). A copy a recurrent layer did not take loses that checkpoint when the next chunk
+was planned across it (`incomplete`); with GDN and PLE it does not happen (the copy does not depend on
+the pass's path). The prompt's last page is still a position the pipeline does not plan past when a
+chunk ends exactly there (the tokens after it are then a pass of under a page).
 
 **Cost.** Per prompt: the copies, on the cards, held from each layer's pass to the record: the
 checkpoint's size, 57 MiB on Flash-Next in fp16, spread over the cards by layer (with production's
 split 18 of the 36 GDN layers are on each card: about 28 MiB each), on top of the last chunk's
 activations; the record's host copies are the regular stash's. The pass saved: not measured on the cards yet.
+With the pipeline, a checkpoint at a chunk's end costs the same copy, held from the chunk's passes to its
+record, i.e. through the next chunk's first half: at most two of them at once for a job (one at a chunk's
+end, the last page's in the next chunk), about 57 MiB per card at the peak with production's split.
 
 Tests: `tests/test_recurrent_capture.py` (no GPU, no extension: the scan split on the torch
 reference; stand-in recurrent modules in the real generator and job, in line, on the prefill
 thread and in the pipeline: one pass instead of two and the same checkpoint, the next turn resumed
-from it, an incomplete capture, the conditions, the modules that declare the capture),
+from it, an incomplete capture, the conditions, the modules that declare the capture; in the pipeline
+a prompt of five chunks with interval checkpoints at two chunk ends: every chunk but the first planned
+ahead against two without the copies, the checkpoints bit for bit the regular ones, none copied at a
+chunk's end without the pipeline, an incomplete copy),
 `tests/kernels/recurrent/test_recurrent_capture_cuda.py` (on the card: the scan's state and output
-rows, the conv window on each conv path, the PLE stream), the exact check's scenario 13.
+rows, the conv window on each conv path, the PLE stream), the exact check's scenarios 13 and 14.
 
 **On the cards** (2026-10-25, a GPU window with production stopped, the branch on a82deecf from a
 files-only copy, production's device split, cache size and checkpoint interval, the raw-key ring).
@@ -2502,7 +2529,8 @@ request (`--scenarios 10`): (10) more of a chunk's experts streamed while a deco
 workload, expected identical everywhere (about 10 minutes, two loads; "The decode step's host work,
 kept between calls", above). On request (`--scenarios 12`): (12) the decode MoE kernels under the
 environment of `--s12-env`, below.
-On request (`--scenarios 13`): (13) the prompt's last-page checkpoint taken inside the pass, below.
+On request (`--scenarios 13`): (13) the prompt's last-page checkpoint taken inside the pass, below; (14)
+the same at a chunk's end in the pipeline, below.
 
 **Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
 loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
@@ -2594,6 +2622,21 @@ the record whole), and the next turn from the disk against the one from RAM. The
 against upstream's are reported per kind of layer state (the largest difference, against the largest
 value), and must keep the position, the page, the layers, the shapes, the dtypes and the token ids
 (PLE), with one prefill pass fewer for the document.
+
+**Scenario 14, a checkpoint at a chunk's end in the pipeline** (`--scenarios 14`, branch
+`ckpt-intervals`, about 8 minutes by the estimate: one load, 8 runs). One document (`--s14-pages`/
+`--s14-last`: 41261 tokens) whose interval checkpoints fall at the ends of chunks (with chunks of 4096
+and `--ckpt-interval 8192`, production's: the prompt-prefill one at 32768 and the regular one at 40960)
+and whose last page boundary falls inside its last chunk, its forced answer: with the switch on in line
+(no copies at a chunk's end, the regular stash; twice, the floor) and with two chunks in flight (the
+copies, the next chunk planned across each checkpoint), and with the switch off in line and in flight.
+After each run the child keeps the checkpoints at every interval position and at the last page
+(`keep_ckpt` with positions) and compares them tensor by tensor. Expected identical: in flight against
+in line with the switch on (the same chunks, and at a chunk's end the very rows the regular stash
+reads), and with it off (what the pipeline already guarantees), logits and checkpoints. An error when
+the run in flight copied no checkpoint at a chunk's end, or planned no more chunks ahead of the record
+of the chunk before them than the run without the switch (the side counters `ahead` and `piped` are in
+the report).
 
 **The switches.** A switch of this branch left off in a process with every switch off must read as
 off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches

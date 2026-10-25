@@ -1800,6 +1800,21 @@ class Job:
                         prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
                     break
 
+            # Fork (Generator.recurrent_checkpoint_in_pass, with the prefill pipeline): a checkpoint due where
+            # this chunk ends (Job.is_checkpoint_boundary: the prompt-prefill interval, the regular one in the
+            # last two chunks) is copied by the modules at the end of their passes, so the job's next chunk
+            # may be planned before this one is recorded (Generator._pipe_ahead) and run on the first card
+            # while this one is on the second; the record stashes the copies. The same bytes the regular
+            # stash reads after the chunk, which ends where it did
+            capture_end = False
+            if capture is None and not recurrent_last_page and self.generator.recurrent_cache is not None \
+                    and getattr(self.generator, "prefill_pipeline", False) and self.new_tokens <= 0 \
+                    and prefill_start < prefill_end < len(seq.sequence_ids) - 1 \
+                    and self.can_capture_recurrent() and self.is_checkpoint_boundary(at = prefill_end):
+                from ..cache.recurrent_capture import RecurrentCapture
+                capture = RecurrentCapture(prefill_end - prefill_start, prefill_end)
+                capture_end = True
+
             # Inference
             if prefill_end > prefill_start:
 
@@ -1935,6 +1950,8 @@ class Job:
                 run.tokens = prefill_ids.shape[-1]
                 run.end = prefill_end
                 run.checkpoint = recurrent_last_page
+                # (the checkpoint due where the chunk ends is copied by its passes: Generator._pipe_ahead)
+                run.checkpoint_in_pass = capture_end
                 run.halves = (first, rest, after) if self.generator.mtp_draft else None
                 # (set by whoever plans the next chunk before this one is recorded)
                 run.followed = False
@@ -1996,6 +2013,10 @@ class Job:
                         self.stash_captured(self.generator.recurrent_cache, capture)
                     else:
                         self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+                elif capture_end:
+                    # (what Generator.recurrent_checkpoint would stash after this record, which passes over a
+                    # job whose next chunk is under way by then)
+                    self.stash_captured(self.generator.recurrent_cache, capture, interval = None)
 
 
         if progress:
@@ -2191,7 +2212,7 @@ class Job:
             rs is not None and rs.target is not None and rs.draft is None
 
 
-    def stash_captured(self, cache, capture):
+    def stash_captured(self, cache, capture, interval = PAGE_SIZE):
         """
         maybe_stash_recurrent for the prompt's last page when the chunk's modules copied their state there
         (RecurrentCapture) instead of the chunk ending there: the checkpoint at capture.position, under that
@@ -2199,6 +2220,9 @@ class Job:
         recurrent layer is missing from is not stashed: the conversation's next turn then resumes from an
         earlier checkpoint, as when the checkpoint cache has let this one go (counted in
         Generator.recurrent_capture_stats["incomplete"])
+
+        interval: maybe_stash_recurrent's, PAGE_SIZE for the prompt's last page; None for a checkpoint due
+        where the chunk ends (an interval one), whose copies the passes took at their end
         """
         seq = self.sequences[0]
         gen = self.generator
@@ -2221,10 +2245,12 @@ class Job:
         assert page.kv_position == PAGE_SIZE
         self.last_recurrent_checkpoint_pos = pos
         if getattr(gen, "tail_checkpoint_interval", 0) or getattr(self, "tail_checkpoint_key", None):
-            self._stash_with_tail(cache, page.phash, PAGE_SIZE, state = state)
+            self._stash_with_tail(cache, page.phash, interval, state = state)
         else:
             cache.put(page.phash, state)
         stats["captured"] += 1
+        if interval is None:
+            stats["at_end"] = stats.get("at_end", 0) + 1
 
 
     def _stash_with_tail(self, cache, key, interval, state = None):

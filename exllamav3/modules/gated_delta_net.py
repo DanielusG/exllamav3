@@ -1296,7 +1296,11 @@ class GatedDeltaNet(Module):
         # page boundary inside a prompt chunk, copied while the pass goes on. Not in a speculative
         # pass, and not in a tensor-parallel rank (the generator does not ask for it there)
         cap = params.get("recurrent_capture") if save_state and not save_history and not rsg[0].exported else None
-        if cap is not None and not (cap.wants(bsz, seqlen) and cap.offset >= self.conv_kernel_size):
+        # (at the pass's end: the rows the pass leaves, copied right after it)
+        cap_end = None
+        if cap is not None and cap.wants_end(bsz, seqlen):
+            cap, cap_end = None, cap
+        elif cap is not None and not (cap.wants(bsz, seqlen) and cap.offset >= self.conv_kernel_size):
             cap = None
 
         def stage(bsz, seqlen):
@@ -1334,7 +1338,7 @@ class GatedDeltaNet(Module):
             self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
-            not spec_step and cap is None
+            not spec_step and cap is None and cap_end is None
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
@@ -1515,6 +1519,12 @@ class GatedDeltaNet(Module):
         # the layer is then missing from the capture, and the record takes no checkpoint)
         if cap is not None and cap_scan:
             cap.take(rsl, (cap_scan[0], cap_conv))
+        # A capture at the pass's end: the pool row and the conv window this pass leaves, as GDNLayerState.stash
+        # reads them, copied on this stream before a later pass of the job can reach them
+        if cap_end is not None:
+            row = 2 * rsg[0].slot + getattr(rsg[0], "parity", 0)
+            cap_end.take(rsl, (recurrent_state[row : row + 1].clone(),
+                               conv_state[rsg[0].slot, :, :self.conv_kernel_size].clone()))
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)

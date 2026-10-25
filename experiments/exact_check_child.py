@@ -1394,9 +1394,9 @@ class Child:
         """
         After a run: a host copy of the recurrent checkpoint at the last page boundary of a job's prompt
         (the one Job._prefill_co takes after the prompt's last pass, or inside it with
-        recurrent_checkpoint_in_pass), from the generator's checkpoint cache in RAM, kept under keep["tag"]
-        for a later ckpt_cmp. The run forgot every earlier checkpoint first (forget), so the most recent
-        one at that position is this run's.
+        recurrent_checkpoint_in_pass), or at keep["position"], from the generator's checkpoint cache in RAM,
+        kept under keep["tag"] for a later ckpt_cmp. The run forgot every earlier checkpoint first (forget), so
+        the most recent one at that position is this run's.
         """
         torch = self.torch
         gen = self.gen
@@ -1408,7 +1408,7 @@ class Child:
         if not n or rc is None:
             out["why"] = "nessun prompt o nessuna cache dei checkpoint"
             return out
-        pos = (int(n) - 1) // 256 * 256
+        pos = int(keep["position"]) if keep.get("position") is not None else (int(n) - 1) // 256 * 256
         out["position"] = pos
         hits = [(k, v) for k, v in rc.items() if isinstance(v, dict) and v.get("position") == pos]
         out["candidates"] = len(hits)
@@ -1493,7 +1493,9 @@ class Child:
             if rec.get("fatal"):
                 self.broken = rec.get("error")
             elif rec.get("ok") and st.get("keep_ckpt"):
-                rec["ckpt"] = self.keep_checkpoint(st["keep_ckpt"], rec)
+                keeps = st["keep_ckpt"]
+                rec["ckpt"] = [self.keep_checkpoint(k, rec) for k in keeps] if isinstance(keeps, list) \
+                    else self.keep_checkpoint(keeps, rec)
             return rec
         if op == "stress":
             rec = run_stress(x, st)

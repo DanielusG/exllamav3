@@ -396,10 +396,14 @@ class Generator:
             and one more stop of the GDN scan and of a PLE layer's row slabs. Not with tensor parallelism,
             a recurrent draft model or a recurrent module that does not copy its state
             (captures_recurrent_state); a job with embeddings ends its chunk there as before.
+            With the prefill pipeline the same copy, at the end of a chunk's passes, takes a checkpoint
+            due where the chunk ends (the prompt-prefill interval, the regular one in the last two
+            chunks), so the job's next chunk is planned across it instead of waiting for the record
+            (_pipe_ahead): the same checkpoint, the same chunks.
             recurrent_checkpoint_in_pass_reason says why it is off, recurrent_capture_stats counts the
-            checkpoints taken this way ("captured") and the captures a layer was missing from, which take
-            none ("incomplete"). EXL3_RECURRENT_CHECKPOINT_IN_PASS=1 in the environment turns it on for
-            callers that do not pass the argument. Default False
+            checkpoints taken this way ("captured", of which "at_end" at a chunk's end) and the captures a
+            layer was missing from, which take none ("incomplete"). EXL3_RECURRENT_CHECKPOINT_IN_PASS=1 in
+            the environment turns it on for callers that do not pass the argument. Default False
 
         :param kwargs:
         """
@@ -692,7 +696,7 @@ class Generator:
                 os.environ.get("EXL3_RECURRENT_CHECKPOINT_IN_PASS", "0").strip() not in ("", "0")
         self.recurrent_checkpoint_in_pass = False
         self.recurrent_checkpoint_in_pass_reason = None
-        self.recurrent_capture_stats = {"captured": 0, "incomplete": 0}
+        self.recurrent_capture_stats = {"captured": 0, "incomplete": 0, "at_end": 0}
         self._capture_warned = False
         if recurrent_checkpoint_in_pass:
             why = self._capture_unavailable()
@@ -2425,7 +2429,8 @@ class Generator:
             whole there, and the first half of the next chunk would have moved the first
             card's layers past it. The chunk before a checkpoint is therefore recorded with
             nothing else of its job under way, and the next one starts in the round after the
-            checkpoint. Chunks are recorded in the order they were started, so a job's
+            checkpoint. Fork: not with the recurrent checkpoint in pass, where the chunk's
+            modules copy their state at the end of its passes (Job._prefill_co); Chunks are recorded in the order they were started, so a job's
             sequence position (what the disk tier's write-behind reads) is the start of its
             oldest chunk under way until that chunk is recorded;
           - a chunk too short to run beside a decode step (side_min_tokens) waits, while
@@ -2606,7 +2611,9 @@ class Generator:
             the cache at the head of a chunk, which the plan would have to skip;
           - no checkpoint at the position between the two chunks, whether the record of the
             first takes it (the prompt's last page) or the generator would after it
-            (Job.is_checkpoint_boundary): see _pipe_round;
+            (Job.is_checkpoint_boundary): see _pipe_round. Fork: with the recurrent checkpoint
+            in pass the modules copy a checkpoint due there at the end of the first chunk's
+            passes (checkpoint_in_pass), and its record stashes the copies;
           - a record of `last` that leaves the block table alone: it gives the pages the chunk
             completes their content hashes, and a page that does not have it yet (allocated
             under a random one) may be swapped for another job's page of the same hash, the
@@ -2624,7 +2631,8 @@ class Generator:
         seq = job.sequences[0]
         if end >= len(seq.sequence_ids) - 1:
             return None
-        if job.is_checkpoint_boundary(at = end):
+        # (unless the chunk's passes copy that checkpoint at their end, Job._prefill_co: checkpoint_in_pass)
+        if job.is_checkpoint_boundary(at = end) and not getattr(run, "checkpoint_in_pass", False):
             return None
         hashes = getattr(seq, "page_hashes", None) or ()
         start = max(0, end - getattr(run, "tokens", 0)) // PAGE_SIZE

@@ -262,7 +262,10 @@ class RecModule(PR.Module):
             layer = params["cache"].recurrent_layers[(self.idx, 0)]
             ids = params["input_ids"][0].tolist()
             cap = params.get("recurrent_capture") if self.captures else None
-            if cap is not None and not cap.wants(1, len(ids)):
+            cap_end = None
+            if cap is not None and cap.wants_end(1, len(ids)):
+                cap, cap_end = None, cap
+            elif cap is not None and not cap.wants(1, len(ids)):
                 cap = None
             scan, win = layer.scan[st.slot].clone(), layer.win[st.slot].clone()
             for i, t in enumerate(ids):
@@ -271,6 +274,8 @@ class RecModule(PR.Module):
                 scan, win = step(scan, win, t)
             layer.scan[st.slot] = scan
             layer.win[st.slot] = win
+            if cap_end is not None:
+                cap_end.take(layer, (layer.scan[st.slot].clone(), layer.win[st.slot].clone()))
         return x
 
 
@@ -316,7 +321,7 @@ def make_generator(capture: bool, n_pages = 12, max_chunk_size = 2048, all_layer
     g.tail_stats = {"stashes": 0, "replaced": 0, "t_stash": 0.0,
                     "disk_withdrawn": 0, "disk_dropped": 0, "disk_left": 0}
     g.recurrent_checkpoint_in_pass = capture
-    g.recurrent_capture_stats = {"captured": 0, "incomplete": 0}
+    g.recurrent_capture_stats = {"captured": 0, "incomplete": 0, "at_end": 0}
     g._capture_warned = False
     return g
 
@@ -383,7 +388,7 @@ def test_switched_off_the_chunk_ends_at_the_last_page_boundary(generators):
     key, stashed = checkpoint(g, job, lpb)
     assert stashed["position"] == lpb
     assert_holds(stashed, PROMPT[:lpb])
-    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 0}
+    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 0, "at_end": 0}
 
 
 @pytest.mark.parametrize("where", WHERE)
@@ -408,7 +413,7 @@ def test_switched_on_one_pass_and_the_checkpoint_of_the_shorter_pass(generators,
             assert stashed["target"][k] == ref_stash["target"][k]
             continue
         assert all(torch.equal(a, b) for a, b in zip(stashed["target"][k], ref_stash["target"][k]))
-    assert g.recurrent_capture_stats == {"captured": 1, "incomplete": 0}
+    assert g.recurrent_capture_stats == {"captured": 1, "incomplete": 0, "at_end": 0}
     assert job.last_recurrent_checkpoint_pos == lpb
     # The live state goes on past the boundary: after the whole prompt but its last token
     layer = g.cache.recurrent_layers[(REC_MODULES[0], 0)]
@@ -442,7 +447,7 @@ def test_a_chunk_that_ends_at_the_boundary_needs_no_capture(generators):
     assert g.model.passes == [3 * PAGE]
     _, stashed = checkpoint(g, job, 3 * PAGE)
     assert_holds(stashed, ids[:3 * PAGE])
-    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 0}
+    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 0, "at_end": 0}
 
 
 def test_the_boundary_in_a_later_chunk(generators):
@@ -462,12 +467,77 @@ def test_a_capture_a_layer_is_missing_from_takes_no_checkpoint(generators, capsy
     assert g.model.passes == [len(PROMPT) - 1]
     _, stashed = checkpoint(g, job, lpb)
     assert stashed is None
-    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 1}
+    assert g.recurrent_capture_stats == {"captured": 0, "incomplete": 1, "at_end": 0}
     assert "lacks a recurrent layer" in capsys.readouterr().out
     # The next turn finds no checkpoint there and ingests from the start
     g.cancel(job)
     job2 = ingest(g, PROMPT + [7] * 10)
     assert job2.cached_pages == 0
+
+
+# A prompt of five chunks of two pages: interval checkpoints where the second and the fourth chunk end
+# (the prompt-prefill interval at 1024, the regular one at 2048 in the last two chunks), and the last page
+# boundary inside the last chunk
+LONG = [100 + (i * 13) % 900 for i in range(9 * PAGE + 96)]
+LONG_CHECKPOINTS = (4 * PAGE, 8 * PAGE)
+
+
+def interval_generator(generators, capture, where):
+    g = generators(capture = capture, n_pages = 16, max_chunk_size = 2 * PAGE)
+    g.recurrent_checkpoint_interval = 4 * PAGE
+    g.recurrent_checkpoint_interval_pp = 4 * PAGE
+    PR.switch(g, where)
+    return g
+
+
+def test_in_the_pipeline_the_next_chunk_is_planned_across_an_interval_checkpoint(generators):
+    ref = interval_generator(generators, False, "pipeline")
+    ref_job = ingest(ref, LONG)
+    g = interval_generator(generators, True, "pipeline")
+    job = ingest(g, LONG)
+
+    # The same chunks but the last one, which the capture of the last page leaves whole
+    lpb = (len(LONG) - 1) // PAGE * PAGE
+    assert ref.model.passes == [2 * PAGE] * 4 + [lpb - 8 * PAGE, len(LONG) - 1 - lpb]
+    assert g.model.passes == [2 * PAGE] * 4 + [len(LONG) - 1 - 8 * PAGE]
+    # Without the copies the chunks after a checkpoint wait for its record; with them every chunk but the
+    # first is planned while the one before it is under way
+    assert ref.side_stats["ahead"] == 2
+    assert g.side_stats["ahead"] == 4
+    assert g.recurrent_capture_stats == {"captured": 3, "incomplete": 0, "at_end": 2}
+
+    # The interval checkpoints are the regular ones, bit for bit, though the next chunk's passes were
+    # issued before they were recorded
+    for pos in LONG_CHECKPOINTS + (lpb,):
+        ref_key, ref_stash = checkpoint(ref, ref_job, pos)
+        key, stashed = checkpoint(g, job, pos)
+        assert key == ref_key and stashed is not None, pos
+        assert stashed["position"] == pos and structure(stashed) == structure(ref_stash)
+        assert_holds(stashed, LONG[:pos])
+        for k in ((i, 0) for i in REC_MODULES):
+            assert all(torch.equal(a, b) for a, b in zip(stashed["target"][k], ref_stash["target"][k])), (pos, k)
+    assert job.last_recurrent_checkpoint_pos == lpb
+
+
+@pytest.mark.parametrize("where", ["inline", "thread"])
+def test_without_the_pipeline_a_checkpoint_at_a_chunk_s_end_is_the_regular_one(generators, where):
+    g = interval_generator(generators, True, where)
+    job = ingest(g, LONG)
+    assert g.recurrent_capture_stats == {"captured": 1, "incomplete": 0, "at_end": 0}
+    for pos in LONG_CHECKPOINTS:
+        _, stashed = checkpoint(g, job, pos)
+        assert_holds(stashed, LONG[:pos])
+
+
+def test_an_end_capture_a_layer_is_missing_from_holds_the_next_chunk_back_and_takes_no_checkpoint(generators, capsys):
+    g = interval_generator(generators, True, "pipeline")
+    g.model.modules[REC_MODULES[1]].captures = False
+    job = ingest(g, LONG)
+    assert g.recurrent_capture_stats["incomplete"] == 3 and g.recurrent_capture_stats["captured"] == 0
+    assert "lacks a recurrent layer" in capsys.readouterr().out
+    for pos in LONG_CHECKPOINTS:
+        _, stashed = checkpoint(g, job, pos)
+        assert stashed is None, pos
 
 
 def test_only_a_plain_job_takes_its_checkpoint_in_the_pass():

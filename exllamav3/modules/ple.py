@@ -539,7 +539,11 @@ class PLELayer(Module):
             # Fork: the recurrent checkpoint in pass (cache/recurrent_capture.py): this layer's state
             # at a page boundary inside a prompt chunk, the conv window and the token-id context there
             cap = params.get("recurrent_capture") if not save_history else None
-            if cap is not None and not cap.wants(bsz, seq):
+            # (at the pass's end: the rows the pass leaves, copied once they are written below)
+            cap_end = None
+            if cap is not None and cap.wants_end(bsz, seq):
+                cap, cap_end = None, cap
+            elif cap is not None and not cap.wants(bsz, seq):
                 cap = None
             cap_conv = []
             delta, conv_stream = self.forward_streams(
@@ -561,6 +565,9 @@ class PLELayer(Module):
                 else:
                     conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
+            if cap_end is not None:
+                # As PLELayerState.stash reads them, before a later pass of the job can reach them
+                cap_end.take(rsl, (conv_state[slots[0], :, :win].clone(), id_state[slots[0], :ctx].clone()))
         else:
             delta, _ = self.forward_streams(x, history, params)
         out = x if delta is None else x + delta
