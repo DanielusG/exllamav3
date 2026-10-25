@@ -12,8 +12,15 @@ from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+import os
 
 ROUTING_CACHE_ROWS = 128
+
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import: _routing_buffers keeps the three views of a decode-size call
+HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
+if HOST_FASTPATH:
+    from ..util.lane import _tls as _lane_tls
 
 
 def _routing_buffers(cfg, bsz, device):
@@ -35,6 +42,26 @@ def _routing_buffers(cfg, bsz, device):
         ws(bsz * K, torch.long, "moe_route_sel").view(bsz, K),
         ws(bsz * K, torch.half, "moe_route_w").view(bsz, K),
     )
+
+if HOST_FASTPATH:
+
+    _routing_buffers_plain = _routing_buffers
+
+    def _routing_buffers(cfg, bsz, device):
+        """_routing_buffers with the views of a decode-size call kept (host fast path): the same
+        three get_bucketed lookups in the same order, viewed to the same shapes, taken once per
+        (device, rows, experts, top-k, lane) and again whenever the workspace cache made or
+        dropped an entry (g_tensor_cache.fast_views, fast_gen; util/tensor.py)"""
+        if bsz > ROUTING_CACHE_ROWS:
+            return _routing_buffers_plain(cfg, bsz, device)
+        gtc = g_tensor_cache
+        key = ("moe_route", device, bsz, cfg.num_experts, cfg.num_experts_per_tok, _lane_tls.__dict__.get("lane", 0))
+        e = gtc.fast_views.get(key)
+        if e is None or e[0] != gtc.fast_gen:
+            gen = gtc.fast_gen
+            e = (gen,) + _routing_buffers_plain(cfg, bsz, device)
+            gtc.fast_views[key] = e
+        return e[1], e[2], e[3]
 
 # Score activations for the nogroup routing kernels (must match routing.cu)
 ROUTING_ACT_SIGMOID = 0

@@ -14,6 +14,11 @@ _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 # bracket is the true exposed stall: it runs after the GPU's own expert work, so any time
 # there is worker lateness the GPU could not hide.
 _split_prof = bool(os.environ.get("EXL3_SPLIT_PROF"))
+
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import: cpu_split_combine takes the kept (rows, H) view of the fused tier's routed sum
+# (BlockSparseMLP._fast_out_bszn) instead of viewing it again
+_host_fastpath = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 _sprof = {"issue": [], "wait": []}
 
 def _sprof_wrap(kind, layer, fn):
@@ -724,7 +729,10 @@ class BlockSparseMLP_CPU:
         (or skip the readback entirely for a job with no CPU-resident picks)."""
         if cpu_pending is not None:
             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
-                f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
+                if _host_fastpath:
+                    f2 = self._fast_rows_view(final_hidden_states)
+                else:
+                    f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
                 if _split_prof:
                     _sprof_wrap("wait", self.cpu_layer_idx,
                                 lambda: self.cpu_host.submit_collect_fused(cpu_pending[1], f2))
@@ -737,6 +745,34 @@ class BlockSparseMLP_CPU:
             final_hidden_states = cpu_partial.view(shape) if final_hidden_states is None \
                 else final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
+
+    def _fast_out_bszn(self, bsz, eshape):
+        """Host fast path, for BlockSparseMLP.forward's fused decode tier:
+        experts_cfg.out_bszn[:bsz].view(eshape), kept per (bsz, eshape) while out_bszn is the same
+        tensor (the buffer the fused decode kernels write, baked into self.bc at load). The (bsz, H)
+        view cpu_split_combine takes of it is kept beside it, under the kept view's id (alive while
+        kept, so the id is its own). BlockSparseMLP.unload forgets both"""
+        ob = self.experts_cfg.out_bszn
+        c = self.__dict__.get("_fast_out")
+        if c is None or c[0] is not ob:
+            c = self._fast_out = (ob, {})
+        key = (bsz, eshape)
+        v = c[1].get(key)
+        if v is None:
+            v = ob[:bsz].view(eshape)
+            c[1][id(v)] = (v, v.view(-1, v.shape[-1]))
+            c[1][key] = v
+        return v
+
+    def _fast_rows_view(self, final_hidden_states):
+        """Host fast path: final_hidden_states.view(-1, H), the kept one when final_hidden_states is
+        the view BlockSparseMLP._fast_out_bszn keeps (same tensor, same geometry)"""
+        c = self.__dict__.get("_fast_out")
+        if c is not None:
+            v = c[1].get(id(final_hidden_states))
+            if v is not None and v[0] is final_hidden_states:
+                return v[1]
+        return final_hidden_states.view(-1, final_hidden_states.shape[-1])
 
     @override
     def can_defer_load(self):

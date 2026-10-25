@@ -1069,6 +1069,14 @@ class Child:
                 state["mm_content_digests"] = _mm.content_digests()
         except Exception:
             pass
+        # The decode step's host fast path: read at import, by each module that has one (the
+        # workspace cache's says it for all of them)
+        try:
+            from exllamav3.util import tensor as _tensor
+            if hasattr(_tensor, "HOST_FASTPATH"):
+                state["host_fastpath"] = bool(_tensor.HOST_FASTPATH)
+        except Exception:
+            pass
         if hasattr(self.bsm, "hist_prefill_weight"):
             state["hist_prefill_weight"] = self.bsm.hist_prefill_weight()
         if hasattr(c.cache, "qsa_raw_tail"):

@@ -2026,6 +2026,189 @@ decode ending in the middle of b's prompt, True then False and never back; inlin
 switched off at run time; in flight on two cards, both halves of every chunk. Marked `nogpu`; run
 with `--noconftest`. The fork's own tests: 596 passed, 35 skipped (549 before).
 
+### The decode step's host work, kept between calls (`EXL3_HOST_FASTPATH=1`)
+
+Off by default. Read once, when each module that has a fast path is imported (`util/lane.py`,
+`util/tensor.py`, `modules/hyperconnections.py`, `modules/block_sparse_mlp_routing.py`,
+`modules/block_sparse_mlp.py`, `modules/block_sparse_mlp_cpu.py`, `modules/gated_delta_net.py`), so it
+is set in the environment before the library is imported and holds for the whole process: no
+`Generator` argument, no server flag (in the server's wrapper an `export`). Branch `host-fastpath`,
+on `master` at fcd111d5. Also in `doc/env_vars.md`.
+
+**Why.** The night profiling of 2026-10-24 (the server's `docs/REPORT-profiling-20261024.md`, 2.2, 2.4
+and 2.6 a): the thread that issues a decode step (`exl3-generator-worker`) spends 25-30 ms of each
+step preparing and launching about a thousand kernels (measured with the split profiler on, whose own
+share is 3-4 ms of it: below), and with three requests staggered it waits for the cards 5-7% of the
+time: the host is the step. Inclusive shares of that thread (py-spy): the
+MoE module 27%, the gated residual sites 24% (96 a pass, ~90 µs each), the workspace cache's lookups
+11%, GDN 8%. A good part of it is the same bookkeeping, call after call, for the same shapes: format
+a workspace key string, look it up, slice the backing, view it to the shape.
+
+**What the switch changes**, site by site. The same kernels, with the same arguments (for a tensor:
+the same storage, offset, shape, strides and dtype), in the same order; none of the code below calls
+a stream, an event or a synchronize. Only the Python around the calls changes.
+
+- *Workspace cache* (`util/tensor.py`, `GTensorCache.get_bucketed`): the key string `make_key`
+  formats for a (device, backing size, dtype, tag, lane) is kept (`fast_keys`); a later call looks
+  the entry up by it, counts the reference and slices the backing as the plain lookup does. Kept
+  only for a `torch.device` or `str` device, a `torch.dtype` and a `str` tag, where two equal tuples
+  format the same string; anything else, and an entry not yet made, takes the plain path. `get` (the
+  same code) and `drop_all` count every entry made and every emptying in `fast_gen`, under a lock.
+- *Lanes* (`util/lane.py`): `current_lane()` and `host_waits()` read the thread-local's own dict
+  (`_tls.__dict__.get`) instead of `getattr(_tls, name, default)`, which on a thread that never
+  entered a lane raises and catches an AttributeError inside, at every workspace lookup and CPU host
+  slot. The same values (`Lane.enter` is the only writer).
+- *Gated residual sites* (`modules/hyperconnections.py`, `GatedResidual._mix`, `mix`, `apply_`:
+  Qwen4Exp's 96 sites a pass, the final mixer, the MTP head's): for a decode-size call (rows up to
+  `FUSED_MAX_R`, an fp32 contiguous stream stack: the fused pair's domain) the three workspace views
+  `ext.gr_mix` writes (dots, post, mixed), their (b, s, ...) views and the weighted-copy workspace
+  `apply_` hands to the next site are taken once per (device, b, s, table rows, streams, hidden,
+  combine form, lane) and kept in `g_tensor_cache.fast_views` with the `fast_gen` read before they
+  were taken; when the count has moved they are taken again. `proj_h[: proj_m]` is kept per site
+  while `proj_h` is the same tensor and `proj_m` the same count (`_prepare` and `tp_import` make a
+  new `proj_h`, `unload` drops the kept view). In `apply_`, a `post` that is the (b, s, H) view this
+  site's mix returned is passed as the (R, H) view kept beside it, which is what
+  `post.reshape(R, H).contiguous()` returns for it; any other `post` takes that expression. The
+  conversion and capture passes (`quant_preserve`, `capture`), larger row counts, stacks the plain
+  path converts first (fp16 MTP stacks, non-contiguous ones) and the mHC `HyperConnection` are left
+  as they are.
+- *MoE routing* (`modules/block_sparse_mlp_routing.py`, `_routing_buffers`): the three views of a
+  multi-row call up to `ROUTING_CACHE_ROWS` (router logits, selected experts, weights) kept per
+  (device, rows, experts, top-k, lane), as above. One-row calls have their own buffers and never
+  went through it.
+- *MoE fused decode tier* (`BlockSparseMLP.forward`, `BlockSparseMLP_CPU.cpu_split_combine`):
+  `experts_cfg.out_bszn[:bsz].view(eshape)` kept per (bsz, eshape) while `out_bszn` is the same
+  tensor (the output the fused decode kernels write, made at load and baked into `self.bc`), and the
+  (rows, H) view of it that the CPU split's collect is handed (`submit_collect_fused`) kept beside
+  it. What goes to the CPU expert worker, and in what order, is unchanged.
+- *GDN* (`GatedDeltaNet.forward`'s fused decode path): it called `GDNLayerState.staged_views(bsz,
+  seqlen)` only for the record of a speculative pass's shape (for the rewind) and discarded the three
+  views; with the switch it calls `staged_shape(bsz, seqlen)`, the same check and the same record
+  without the views (only for a pass not fed a token at a time, `spec_step is None`, and a state
+  that is exactly a `GDNLayerState`).
+
+**What it relies on.**
+- A view is kept only of a tensor something else already keeps alive (a workspace cache entry, a
+  module's buffer). Keeping one of a tensor that would otherwise be freed would change what the
+  caching allocator hands out later, so later addresses. Workspace entries are only ever added,
+  never replaced, so a view taken while the count is still the current one is a view of the backing
+  `get_bucketed` would return now; the count is read before the views are taken, so an entry made
+  meanwhile, on this thread or another, only makes the next call take them again.
+- The lane is in every key, as in the workspace cache's own: the prefill thread's and the pipeline's
+  passes keep their own views of their own workspaces. Dict reads and writes are atomic under the GIL;
+  the count moves under a lock.
+- The same view objects are now returned call after call where the plain path made new ones: safe
+  as long as nothing changes a view's metadata in place. Nothing in the library does outside the
+  loader (`resize_`, `as_strided_`, `set_`, `t_`, `squeeze_`, `unsqueeze_`, `transpose_`: one `set_`,
+  in `loader/safetensors.py`, on a tensor of its own).
+- A call served by kept views counts no reference on the workspace entries (the plain path counted
+  one per lookup). Nothing reads the counts: `util/memory.py` lists the entries and drops the count,
+  `model_ls.py` reads the keys.
+
+**With the switch off.** The fast functions are defined under `if HOST_FASTPATH:` at module or class
+level, and the plain ones are the code that was there. What the switch-off path runs that it did not
+before: a module-constant test in `BlockSparseMLP.forward`'s fused tier, in `cpu_split_combine` and in
+the GDN fused path's record. `GDNLayerState.staged_shape` exists and nothing calls it.
+
+**The split profiler is not free.** Upstream's `EXL3_SPLIT_PROF=1` (fd11c82e, in 1.6.3; the night's
+counters boot C set it with `EXL3_MOE_CPU_PROF=1`) brackets every CPU-split submit and collect with
+two `torch.cuda.Event`s recorded on the current stream. Its own work (creating, recording and reading
+the events) is 9.7-11.7% of the generator thread's samples in the night's three counters captures (one
+request at 60k and at 125k, three at 60k), 10.5-15.2% of its issue time: of the 16% the report gives
+the CPU split's bookkeeping (60k, one request) 11.7 points are the profiler and 4.6 the split (the
+submit and collect into the CPU expert worker's host, with their launches). All of the 2.7% the
+report counts in `torch.cuda.is_available()` (`_get_available_device_type`, from `current_stream()`
+and events without a device) is inside it too. The decode path makes no such call with the profiler off:
+there is nothing of that kind to take out of production's step (the report's first item). The events
+are recorded on the current device's stream, cuda:0, for the layers on cuda:1 too, so the profiler's
+brackets of the second card's layers do not time that card's work. Not changed here (upstream's code).
+Issue times measured with it on include it: the night's tooling runs py-spy in its counters mode only
+(`nightprof.py`), so every issue time of the report has it, the A/B of where the generator's thread
+runs (P11c and P12d, 20.0 against 23.5 ms a step) too.
+
+**Measured on the CPU** (`experiments/host_fastpath_bench.py`: the sources loaded off and on as the
+tests load them, the extension a function that does nothing, Qwen3.8-Flash-Next's sizes: 4 streams of
+2560, gated residual rank 320, 512 experts, top 10, 48 layers of which 36 GDN; the development machine,
+Python 3.14, torch 2.14 CPU, one thread; µs a call, the best of 5):
+
+| site | rows | off | on |
+|---|---|---|---|
+| a gated residual site (mix + apply) | 1-8 | 13.3-13.7 | 4.3-4.4 |
+| `routing_std` | 1 | 0.78 | 0.80 |
+| `routing_std` | 2-8 | 6.4-6.5 | 1.06-1.10 |
+| MoE tail (routed sum + collect) | 1-8 | 2.45-2.50 | 1.12-1.17 |
+| GDN record | 1-8 | 2.33-2.37 | 0.08 |
+| `current_lane()` | | 0.22 | 0.08 |
+| `get_bucketed` | | 1.45-1.49 | 0.79-0.83 |
+| a pass: 96 sites, 48 MoE layers, 36 GDN | 1 | 1653 | 556 |
+| a pass | 2, 4, 8 | 1877-1898 | 575-579 |
+
+**On the cards, an estimate [S].** In the night's captures (counters boot, py-spy over the generator
+thread) the frames the fast path no longer enters take 2.7-3.5 ms a step: `get_bucketed` under the
+gated residual sites 2.1-2.4 ms, `_routing_buffers` 0.12-0.43, `staged_views` 0.23-0.40, and part of
+`make_key` and `current_lane` elsewhere. On top of that, the views and slices the sites no longer
+redo, which py-spy attributes to the sites' own lines: on the CPU they are a third of what a site
+saves, and at the ratio `get_bucketed` shows between the two machines (about 4: 2.4 ms a step there
+for 4 lookups x ~100 sites, 1.47 µs a lookup here) about 1.3 ms more. So 3-5 ms a step. With three
+requests staggered, where the host is the step (about 27 ms of issue a step once the profiler's 3 ms
+are taken out), that is a step of about 22-24 ms, +12-20% while the cards are not the limit; with one
+request only the ~5 ms of gaps in which the cards wait for the host can come back, +10% at most. Not
+measured.
+
+**What has been checked, and where** (the development machine, no GPU, no extension):
+`tests/test_host_fastpath.py`. The sources are loaded twice, into one package with the switch off and
+one with it on; the same calls go through both and what reaches the extension is compared call by
+call (the function and, per argument, its value or, for a tensor, the buffer it is in, named by what
+it is, its offset, shape, strides and dtype), together with every torch operation that is not a view,
+in order. Scenarios: the sites in the order a pass meets them in a three-block toy with the final
+mixer, batch shapes changing from pass to pass, rows past the fused pair, stacks the plain path
+converts, the weighted-copy handoff and a successor on another device, two passes of other shapes
+interleaved block by block (the staggered decode's two groups), sublayer outputs of every dtype
+and layout, the conversion and capture passes, entries made between a mix and its apply, the cache
+emptied between passes, a table rebuilt, passes on lanes 1 and 2, two threads issuing at once, an
+entry made again by another thread, the routing buffers at every row count up to past the kept ones,
+the routed sum and its collect, the GDN record (against `staged_views`, and the call site's branch).
+Thirty mutations of the fast path (a count check dropped, the lane, the batch shape or the dtype left
+out of a key, an identity check dropped, a conversion let through, another shape recorded, ...) each
+make a test fail, but one that cannot: the identity check in `_fast_rows_view` is redundant while the
+kept view is held in the same dict. The whole suite passes with the switch off and with it on.
+Not checked: anything on the cards (no CUDA tensor has gone through the fast path; equality on the
+cards is the GPU check below), a real model's full forward (the toy has three blocks), mHC models
+(their `HyperConnection` is untouched, the workspace cache's change applies to them), tensor
+parallelism (the ranks import the library in their own processes and read the switch from the
+environment they inherit), ROCm, a free-threaded Python.
+
+**The GPU check** (on the workstation, production stopped; fish, one line each). The branch in a
+checkout of its own, `~/exl3-host-fastpath`, so production's `~/Desktop/exllamav3` stays as it is (the
+exact check uses the fork it is run from; the night's boots put it ahead on `PYTHONPATH`). Scenario 11
+of the exact check, about 10 minutes by the estimate (two loads): the same runs in a process with
+`EXL3_HOST_FASTPATH=1` and one without, both with the raw-key ring, with scenario 9's production
+generator (`s3`) and its fixed-window one (`off`), expected identical everywhere against the plain
+process repeated:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --dry-run --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+
+Then the issue time, with the night's method and tools (`~/exl3-prof-20261024`: `boot.sh` in counters
+mode, which is the one that runs py-spy, at 200 Hz over the generator thread; `digest_issue.py`: issue
+ms a step = (1 - share in the host wait) x window / steps), in two boots that differ in
+`EXL3_HOST_FASTPATH` only: the same starting placement (`boot.sh` copies `placement-base`), sweeps out
+of reach, the window held at 1 (as P11c and P12d), one request at 60k and then three staggered, and
+the split profiler and the CPU pool's profiler off. Both read their variable as `bool(value)`, so they
+are set empty, not `0`:
+
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=0" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF0 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=1" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF1 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF0
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF1
+
+The switch leaves no line in the log: in `HF1`'s captures the sites' stacks go through `_mix_fast`, in
+`HF0`'s never. The tok/s of the same windows are in each run's `summary.jsonl`; whether the cards then
+become the limit is what the three-request windows say.
+
+Tests: `tests/test_host_fastpath.py` (no GPU, no extension; marked `nogpu`, run with
+`--noconftest`), the scenario's plan and report in `tests/test_exact_check.py`.
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
@@ -2060,7 +2243,11 @@ raw-key ring, the same forced runs in a process with the full raw plane and one 
 512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
 from the disk tier), expected identical against the full plane's process repeated, and the memory
 each load left free per card beside what the library says the ring saves (about 13 minutes by the
-estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below.
+estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below. On
+request (`--scenarios 11`; 10 is the number of the branch `stream-beside-decode`'s): (11) the decode
+step's host fast path, two processes that differ in `EXL3_HOST_FASTPATH` only, with scenario 9's
+production generator and fixed-window one and its workload, expected identical everywhere (about 10
+minutes, two loads; "The decode step's host work, kept between calls", above).
 
 **Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
 loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
@@ -2127,7 +2314,10 @@ for content-addressed multimodal pages: `mm_content_hash` (the generator's switc
 `mm_content_digests` (the embeddings' digests, which the switch turns on for the whole process,
 `tokenizer.mm_embedding.content_digests`) must read off, and `EXL3_MM_CONTENT_HASH` is removed with the
 others. No scenario turns it on: the check's prompts are text, whose pages hash the same either way.
-Scenario 1 with every switch off reports nothing about switches (`tests/test_exact_check.py`).
+The host fast path too: `host_fastpath` (what the workspace cache's module read at import) must read
+off, and `EXL3_HOST_FASTPATH` is removed with the others; scenario 11 sets it in one of its two
+processes and warns when either did not read what it was given. Scenario 1 with every switch off
+reports nothing about switches (`tests/test_exact_check.py`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
@@ -2154,7 +2344,8 @@ process on the cards as a problem and the rest as it will be.
 
 How long: the dry run's estimate is about 1.9 hours for the default scenarios 1-7 (prefill 700
 tokens/s, decode 60 tokens/s for one job and 60 x sqrt(n) for n, 1 minute per model load, 40-65 s
-measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9; a scenario
+measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9, 10 for scenario
+11; a scenario
 gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
 directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
 the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the
