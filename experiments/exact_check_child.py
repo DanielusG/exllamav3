@@ -843,6 +843,9 @@ class Child:
         self.broken = None
         self.spent = {}
         self.free_min = {}
+        # The CPU expert hosts' streaming thresholds as the process made them, for the runs
+        # that change them (scenario 10): (host index, card) -> the card's own threshold
+        self.stream_t_base = {}
 
     # ---------------------------------------------------------------- records
     def write(self, rec: dict):
@@ -1066,6 +1069,14 @@ class Child:
                 state["mm_content_digests"] = _mm.content_digests()
         except Exception:
             pass
+        # The decode step's host fast path: read at import, by each module that has one (the
+        # workspace cache's says it for all of them)
+        try:
+            from exllamav3.util import tensor as _tensor
+            if hasattr(_tensor, "HOST_FASTPATH"):
+                state["host_fastpath"] = bool(_tensor.HOST_FASTPATH)
+        except Exception:
+            pass
         if hasattr(self.bsm, "hist_prefill_weight"):
             state["hist_prefill_weight"] = self.bsm.hist_prefill_weight()
         if hasattr(c.cache, "qsa_raw_tail"):
@@ -1110,6 +1121,57 @@ class Child:
         gen.max_chunk_size = int(sw.get("chunk") or base["chunk"])
         if base.get("stagger_min_jobs") is not None:
             gen.stagger_min_jobs = int(sw.get("stagger_min_jobs") or base["stagger_min_jobs"])
+        self.apply_stream_switches(sw)
+
+    def moe_hosts(self) -> list:
+        """The CPU expert workers' hosts of the loaded models, one per component with split layers."""
+        out = []
+        c = getattr(self, "container", None)
+        for m in (getattr(self, "model", None), getattr(c, "draft_model", None) if c is not None else None):
+            hosts = getattr(getattr(m, "config", None), "moe_cpu_hosts", None) or {}
+            for h in list(hosts.values()):
+                if not any(h is o for o in out):
+                    out.append(h)
+        return out
+
+    def apply_stream_switches(self, sw: dict):
+        """
+        Scenario 10's two knobs of the CPU expert hosts' streamed prefill, per run:
+
+        - "beside_t": the fork's lower threshold for chunks beside a decode
+          (EXL3_MOE_STREAM_T_BESIDE, MoeCpuHost.stream_t_beside), 0 = off. Only on hosts made
+          with the variable (beside_stats is not None): the generator lists them when its
+          prefill thread is set up (Generator._side_plan) and tells them from then on whether a
+          decode goes on beside the chunks; a host's value is read at every layer planned. Left
+          out, a host gets back the value it was made with.
+        - "stream_t": every card's own threshold (the state's stream_t, from the link's
+          bandwidth at the first streamed layer), e.g. 1 = every expert a chunk selects
+          streamed, as EXL3_MOE_STREAM_T=1 at import. Left out, the cards' own come back.
+
+        Between runs nothing is in flight, so nothing reads them while they change.
+        """
+        hosts = self.moe_hosts()
+        want = sw.get("beside_t")
+        made = [h for h in hosts if getattr(h, "beside_stats", None) is not None]
+        if want and not made:
+            raise RunError("nessun host degli esperti CPU fatto con EXL3_MOE_STREAM_T_BESIDE: la soglia accanto al "
+                           "decode non si può accendere in questo processo")
+        for h in made:
+            if not hasattr(h, "_ec_beside_made"):
+                h._ec_beside_made = h.stream_t_beside
+            h.stream_t_beside = int(want) if want is not None else h._ec_beside_made
+        st_want = sw.get("stream_t")
+        n = 0
+        for i, h in enumerate(hosts):
+            for card, st in list((getattr(h, "sstate", None) or {}).items()):
+                key = (i, card)
+                if key not in self.stream_t_base:
+                    self.stream_t_base[key] = st["stream_t"]
+                st["stream_t"] = int(st_want) if st_want is not None else self.stream_t_base[key]
+                n += 1
+        if st_want is not None and not n:
+            raise RunError("nessuno stato di streaming sulle schede (nessun layer a streaming ancora): la soglia "
+                           "delle schede non si può cambiare prima di un giro di riscaldamento")
 
     def forget(self):
         """Make the next run ingest its prompts from their first token: a recurrent model
@@ -1144,6 +1206,12 @@ class Child:
         rc = getattr(gen, "recurrent_cache", None)
         if rc is not None and isinstance(getattr(rc, "metrics", None), dict):
             out["recurrent"] = dict(rc.metrics)
+        # The streamed layers planned at the cards' own threshold and at the lower one beside a
+        # decode (the fork's EXL3_MOE_STREAM_T_BESIDE: MoeCpuHost.beside_stats, per lane),
+        # summed over the hosts and the lanes; only with a host made with the variable
+        made = [h for h in self.moe_hosts() if isinstance(getattr(h, "beside_stats", None), dict)]
+        if made:
+            out["stream"] = {k: sum(int(v) for h in made for v in (h.beside_stats.get(k) or ())) for k in ("normal", "beside", "small")}
         pt = getattr(gen, "pagetable", None)
         if pt is not None and isinstance(getattr(pt, "metrics", None), dict):
             out["pagetable"] = dict(pt.metrics)
@@ -1179,6 +1247,14 @@ class Child:
         out["stagger"] = bool(getattr(gen, "stagger_decode", False))
         out["tail"] = getattr(gen, "tail_checkpoint_interval", None)
         out["head_first"] = getattr(gen, "_pipe_head_first", None)
+        hosts = self.moe_hosts()
+        if any(getattr(h, "beside_stats", None) is not None for h in hosts):
+            out["beside_t"] = [getattr(h, "stream_t_beside", None) for h in hosts]
+            out["beside_hosts"] = len(getattr(gen, "_beside_hosts", ()) or ())
+        sts = {f"{i}:cuda:{card}": st.get("stream_t") for i, h in enumerate(hosts)
+               for card, st in sorted((getattr(h, "sstate", None) or {}).items())}
+        if sts:
+            out["stream_t"] = sts
         return out
 
     def reset_memory(self):

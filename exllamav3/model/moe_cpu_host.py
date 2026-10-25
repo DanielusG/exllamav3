@@ -83,6 +83,46 @@ def _align64(x):
     return (x + 63) & ~63
 
 
+def _stream_t_beside(value: str | None) -> int:
+    """EXL3_MOE_STREAM_T_BESIDE as MoeCpuTuning keeps it: 0 when unset or empty (off), else an
+    integer of at least 1. Anything else is refused: 0 or less would stream experts no token of
+    the chunk selected"""
+    if value is None or not value.strip():
+        return 0
+    try:
+        t = int(value.strip())
+    except ValueError:
+        t = 0
+    if t < 1:
+        raise ValueError(
+            f"EXL3_MOE_STREAM_T_BESIDE must be an integer of at least 1, or unset: {value!r}")
+    return t
+
+
+# The smallest prompt chunk the lower threshold beside a decode applies to (EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS).
+# A short chunk selects many experts once or twice each: at threshold 1 it streams nearly every CPU-resident
+# expert it selects, about one weight block per assignment, while its CPU tail is small and quick. Measured
+# on the workstation on 2026-10-25 (exact mode): a 47-token prompt beside a decode took 5.0 s to its first
+# token instead of 1.1. A 4096-token chunk selects most experts many times over, and the threshold leaves
+# the worker only the cold experts: there it paid (FORK.md)
+STREAM_T_BESIDE_MIN_ROWS = 2048
+
+
+def _stream_t_beside_min_rows(value: str | None) -> int:
+    """EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS as MoeCpuTuning keeps it: STREAM_T_BESIDE_MIN_ROWS when unset or
+    empty, else an integer of at least 1"""
+    if value is None or not value.strip():
+        return STREAM_T_BESIDE_MIN_ROWS
+    try:
+        n = int(value.strip())
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise ValueError(
+            f"EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS must be an integer of at least 1, or unset: {value!r}")
+    return n
+
+
 class MoeCpuTuning:
     """
     Tunable knobs for the CPU MoE offload path, collected in one place: env vars are read once
@@ -139,6 +179,12 @@ class MoeCpuTuning:
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
+        # The fork's lower threshold for prompt chunks planned on a lane of their own while the
+        # generator takes decode steps beside them (MoeCpuHost._stream_threshold); 0 = off, and
+        # every chunk takes the card's threshold above
+        self.stream_t_beside = _stream_t_beside(os.environ.get("EXL3_MOE_STREAM_T_BESIDE"))
+        # ... for chunks of at least this many rows; shorter ones keep the card's threshold
+        self.stream_t_beside_min_rows = _stream_t_beside_min_rows(os.environ.get("EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS"))
         self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
         self.batch_experts = max(1, min(
@@ -889,6 +935,11 @@ class MoeCpuHost:
     # (the instance's own is made in __init__; a host made without it, as upstream's tests of the
     # streamed path make theirs, takes this one: one thread, nothing to contend for)
     _stage_lock = threading.Lock()
+    # (the same for the lower streaming threshold beside a decode: off)
+    stream_t_beside = 0
+    stream_t_beside_min_rows = STREAM_T_BESIDE_MIN_ROWS
+    decode_beside = False
+    beside_stats = None
 
     def __init__(self, config):
         self.config = config
@@ -932,6 +983,15 @@ class MoeCpuHost:
         self.num_wslots = TUNING.num_wslots
         self.wslot_size = TUNING.wslot_size
         self.stream_t = TUNING.stream_t
+        # EXL3_MOE_STREAM_T_BESIDE (0: off): the threshold of a chunk planned on a lane other
+        # than 0 while decode_beside holds, which the generator sets every round of prompt
+        # ingestion (Generator._note_beside); beside_stats counts the streamed layers planned
+        # at each threshold, per lane (_stream_threshold): "beside" the lower one, "small" a chunk beside
+        # a decode below EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS rows (the card's threshold)
+        self.stream_t_beside = TUNING.stream_t_beside
+        self.stream_t_beside_min_rows = TUNING.stream_t_beside_min_rows
+        self.decode_beside = False
+        self.beside_stats = {"normal": [0, 0, 0], "beside": [0, 0, 0], "small": [0, 0, 0]} if self.stream_t_beside else None
         self.stream_min_rows = TUNING.stream_min_rows
         self.batch_experts = TUNING.batch_experts
         self.wseq = 0
@@ -1987,16 +2047,56 @@ class MoeCpuHost:
             counts1.scatter_add_(0, shifted, torch.ones_like(shifted))
             counts1_h = counts1.tolist()
             neg, counts_h = counts1_h[0], counts1_h[1:]
-            streamed = [e for e in range(E) if counts_h[e] >= st["stream_t"]]
+            stream_t = self._stream_threshold(st, rows)
+            streamed = [e for e in range(E) if counts_h[e] >= stream_t]
             if TUNING.stream_debug:
                 n_str = sum(counts_h[e] for e in streamed)
-                print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
+                thr = f", threshold {stream_t}" if self.stream_t_beside else ""
+                print(f" -- stream L{layer_idx}: rows {rows}{thr}, streamed experts "
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
                 return self.submit(layer_idx, y, selected_experts, routing_weights)
             return self._submit_prefill_streamed(
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
                 counts_h, flat, shifted, neg)
+
+    def _stream_threshold(self, st, rows: int) -> int:
+        """
+        The streaming threshold of the layer submit_prefill is planning: the card's own
+        (st["stream_t"], from the link's bandwidth or EXL3_MOE_STREAM_T) or, with
+        EXL3_MOE_STREAM_T_BESIDE, that value for a chunk of at least
+        EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS rows planned on a lane other than 0 while the
+        generator takes decode steps beside the prompt chunks (decode_beside).
+
+        Why: the worker serves its job ring in publication order, so a decode step's job for a
+        layer waits behind the tail jobs a chunk beside it has published; the fewer the tail
+        jobs, the shorter the wait, and streaming more of the chunk's experts to the card
+        leaves it fewer. A chunk with nobody decoding beside it is best at the card's own
+        threshold, below which the weights' DMA costs more than the tail it saves.
+
+        Lane 0 never takes the lower threshold: a chunk there is issued by the generator's own
+        thread, inline, and the decode step after it waits for the whole chunk anyway.
+        decode_beside is one bool the generator's thread writes when it changes, at the top of
+        a round of prompt ingestion (_note_beside), read here as it stands: no lock, no wait,
+        and a change takes effect from the next layer planned. Nothing else of the streamed path
+        depends on the threshold: the load sizes it for every one of the chunk's assignments
+        on CPU-resident experts going through it (prefill_worst_case_parts) and allocates its
+        persistent buffers then, so a lower threshold adds batches through the same buffers,
+        not memory.
+        """
+        t = self.stream_t_beside
+        if not t:
+            return st["stream_t"]
+        lane = current_lane()
+        beside = bool(lane) and self.decode_beside
+        # A short chunk beside a decode keeps the card's threshold: it would stream nearly every
+        # CPU-resident expert it selects for a tail the worker serves quickly (STREAM_T_BESIDE_MIN_ROWS)
+        small = beside and rows < self.stream_t_beside_min_rows
+        stats = self.beside_stats
+        if stats is not None:
+            # (each lane's entry is written by that lane's thread only)
+            stats["small" if small else "beside" if beside else "normal"][min(lane, 2)] += 1
+        return t if beside and not small else st["stream_t"]
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible

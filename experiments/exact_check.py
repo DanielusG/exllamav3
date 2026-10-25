@@ -34,6 +34,20 @@ Scenarios (--scenarios):
      runs in a process with the full raw plane and one with the ring (a document past the sparse
      threshold, the same beside three jobs generating, the next turn from VRAM and from the disk
      tier), and the memory each load leaves on the cards
+  9  (on request) the production combination: the MTP head with several drafts, the batched verify
+     and head update, the cost window, the raw-key ring
+  10 (on request) more of a chunk's experts streamed while a decode goes on beside it
+     (EXL3_MOE_STREAM_T_BESIDE): the jobs generating beside the prompt against the same jobs
+     alone, the prompt ingested beside them with the lower threshold against the cards' own
+     (judged against two yardsticks: the prompt joining the batch elsewhere, and the prompt
+     alone with every expert streamed), the prompt alone with the switch on against off, and a
+     long prompt beside two jobs with the switch off and on (memory per card)
+ 11  (on request) the decode step's host fast path (EXL3_HOST_FASTPATH, read at import): scenario 9's
+     production generator and the fixed window in two processes that differ in the switch only
+  12 (on request) the decode MoE kernels under another environment (--s12-env, default
+     EXL3_MOE_COOP_WIDE=1, the coop launcher's wide tile): the same forced decode runs, a job alone
+     and two in one batch with W=3 and W=1 drafts (2 to 8 rows), in a process without and one with
+     the variables, judged within the noise of the shape and batch meters
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -111,6 +125,8 @@ FORK_ENV_SWITCHES = (
     "EXL3_MOE_HIST_PREFILL_WEIGHT", "EXL3_DISK_CACHE_UNCACHE", "EXL3_PREFILL_PIPELINE_HEAD",
     "EXL3_MTP_BATCHED_VERIFY", "EXL3_MTP_BATCHED_UPDATE", "EXL3_QSA_RAW_TAIL",
     "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
+    "EXL3_MOE_STREAM_T_BESIDE",
+    "EXL3_HOST_FASTPATH",
 )
 
 PROMPTS = [
@@ -428,8 +444,9 @@ def cmp(scenario: int, cid: str, label: str, test: dict, refr: dict, *, expect: 
     expected within the noise they are the yardstick; for one expected identical, a control that
     differs from the reference says the test cannot be identical for a reason of upstream's own
     (the row is then within that control's noise, said so). `upto`: an int, {"window": job} (the
-    positions generated during that job's ingestion; with "both", in the reference run as well),
-    or {"before_first_end": True}. `requires`: what the test run must have exercised, else the row
+    positions generated during that job's ingestion; with "both", in the reference run as well;
+    with "batch", only those before the two runs' decode batches part, same_batch_upto), or
+    {"before_first_end": True}. `requires`: what the test run must have exercised, else the row
     is an error; `soft`: the same, as a note. `free`: the two runs are free greedy runs, not forced
     (compared up to where their tokens part, see evaluate_probs). `group`: the report's sub-table.
     """
@@ -472,6 +489,9 @@ SCENARIO_TITLES = {
     7: "Stress: blocchi",
     8: "Chiavi grezze del QSA solo per il blocco in costruzione",
     9: "La combinazione di produzione: MTP a più bozze, verifica e aggiornamento in un colpo, finestra a costo, anello",
+    10: "Più esperti in streaming nei pezzi di prompt accanto al decode",
+    11: "Il lavoro dell'host del passo di decode tenuto fra le chiamate (EXL3_HOST_FASTPATH)",
+    12: "Il kernel MoE del decode con un'altra variabile d'ambiente",
 }
 
 
@@ -980,7 +1000,110 @@ def build_plan(args) -> dict:
     if 9 in sc:
         s9_plan(args, procs, comps)
 
+    # ---------------------------------------------------------------- scenario 10
+    if 10 in sc:
+        s10_plan(args, procs, comps)
+    # ---------------------------------------------------------------- scenario 11
+    if 11 in sc:
+        s11_plan(args, procs, comps)
+    # ---------------------------------------------------------------- scenario 12
+    if 12 in sc:
+        s12_plan(args, procs, comps)
+
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
+
+
+# The variables scenario 12 may not change: the exact mode's (EXACT_ENV) and what the child sets
+# for every process (child_env)
+S12_FIXED = tuple(EXACT_ENV) + ("EXL3_MOE_CPU_SLOTS", "EXL3_MOE_CPU_PROMOTE", "EXL3_MOE_HOST_CORES")
+
+
+def parse_env_assignments(text: str) -> dict:
+    """ "A=1,B=2" -> {"A": "1", "B": "2"}: EXL3_ variables only, none of S12_FIXED"""
+    out = {}
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        k, eq, v = item.partition("=")
+        k = k.strip()
+        if not eq or not re.fullmatch(r"EXL3_[A-Z0-9_]+", k):
+            raise ValueError(f"assegnamento non valido: {item!r} (EXL3_NOME=VALORE)")
+        if k in S12_FIXED:
+            raise ValueError(f"{k} è fissato per ogni processo del controllo, lo scenario 12 non lo cambia")
+        out[k] = v.strip()
+    if not out:
+        raise ValueError("nessuna variabile")
+    return out
+
+
+S12_JOBS = {"a": "a", "ab": "ab"}
+S12_MAX_ROWS = 8            # BlockSparseMLP.MAX_BSZN: the decode-size path the variables act on
+
+
+def s12_plan(args, procs: list, comps: list):
+    """
+    Scenario 12: the decode MoE kernels under another environment (args.s12_env, default
+    EXL3_MOE_COOP_WIDE=1: the coop launcher's wide tile for every stage, which the extension reads
+    once per process). Two fork processes, `base` without the variables and `test` with them, the
+    same forced decode runs in each: a job alone and two jobs in one batch, with the MTP head
+    drafting W = args.s12_window (fixed) and W = 1 on the same caches, i.e. 1 + W rows per job:
+    with the default W = 3, 4 and 8 rows, and 2 and 4 with W = 1, every one on the decode-size
+    path (BlockSparseMLP's MAX_BSZN, 8 rows) the variables act on. No switch of the fork, no prompt
+    beside the decode: the decode alone. A different tile adds a row's products in another order,
+    so the logits are expected within the noise, not identical: judged against the bigger of two
+    differences upstream itself shows when a step's rows change, both in `base` (the shape meter:
+    the same forced tokens with W fixed against W = 1, scenario 9's; and the batch meter: `a` alone
+    against `a` beside `b`). Each run twice in `base`, the floor. The test process must have the
+    variables and the base one none of them, else the rows are errors.
+    """
+    PB, PT = "s12-fork-base", "s12-fork-test"
+    env = parse_env_assignments(args.s12_env)
+    W = args.s12_window
+    T = args.s12_tokens
+    gens = {f"w{W}": {}, "w1": {"draft_tokens": 1}} if W != 1 else {"w1": {}}
+    first = next(iter(gens))
+    forced = lambda wl: [jobspec(x, q(i), forced = ref(PB, f"s12.free.{x}", x)) for i, x in enumerate(S12_JOBS[wl])]
+
+    def process(name: str, penv: dict) -> Proc:
+        p = Proc(name, "fork", [12], env = penv, server_args = ["--draft-num-tokens", str(W)])
+        for g, sw in gens.items():
+            p.add(gen_step(f"g.{g}", 12, switches = sw))
+            if g == first:
+                p.add(run_step("s12.warm.a", 12, [jobspec("a", q(0), args.warmup_tokens)], warmup = True))
+                p.add(run_step("s12.warm.ab", 12, [jobspec(x, q(i), args.warmup_tokens) for i, x in enumerate("ab")],
+                               warmup = True))
+                if name == PB:
+                    for i, x in enumerate("ab"):
+                        p.add(run_step(f"s12.free.{x}", 12, [jobspec(x, q(i), T)]))
+            for wl in S12_JOBS:
+                for k in (1, 2):
+                    p.add(run_step(f"s12.{g}.{wl}.ref{k}", 12, forced(wl)))
+        p.prompts = prompt_specs(p.steps, {})
+        return p
+
+    procs.append(process(PB, {}))
+    procs.append(process(PT, dict(env)))
+    need = {"env": {"proc": PT, "vars": dict(env)}, "env_absent": {"proc": PB, "vars": sorted(env)}}
+    other = [g for g in gens if g != first]
+    for g in gens:
+        rows = {"a": 1 + (W if g == first else 1)}
+        for wl, jobs in S12_JOBS.items():
+            n_rows = len(jobs) * rows["a"]
+            for x in jobs:
+                yards = []
+                if other:
+                    yards.append((ref(PB, f"s12.{first}.{wl}.ref1", x), ref(PB, f"s12.{other[0]}.{wl}.ref1", x)))
+                if x == "a":
+                    yards.append((ref(PB, f"s12.{g}.a.ref1", "a"), ref(PB, f"s12.{g}.ab.ref1", "a")))
+                where = "da solo" if wl == "a" else "nel batch di due"
+                comps.append(cmp(12, f"s12.{g}.{wl}.{x}",
+                                 f"`{x}` {where}, W={rows['a'] - 1} ({n_rows} righe): con le variabili contro senza",
+                                 ref(PT, f"s12.{g}.{wl}.ref1", x), ref(PB, f"s12.{g}.{wl}.ref1", x),
+                                 expect = "noise", floor = (ref(PB, f"s12.{g}.{wl}.ref1", x), ref(PB, f"s12.{g}.{wl}.ref2", x)),
+                                 yards = yards, drafts = False, requires = need))
+    comps.append({"kind": "same_placement", "scenario": 12, "id": "s12.placement", "procs": [PB, PT]})
+    comps.append({"kind": "library", "scenario": 12, "id": "s12.library", "procs": {PB: "fork", PT: "fork"}})
 
 
 def parse_windows_list(text: str) -> list:
@@ -1156,6 +1279,243 @@ def s9_plan(args, procs: list, comps: list):
                   "label": "(e) l'anello nei due processi e la memoria libera per scheda"})
     comps.append({"kind": "same_placement", "scenario": 9, "id": "s9.placement", "procs": [PF, PR]})
     comps.append({"kind": "library", "scenario": 9, "id": "s9.library", "procs": {PF: "fork", PR: "fork"}})
+
+
+def s10_plan(args, procs: list, comps: list):
+    """
+    Scenario 10: one fork process made with EXL3_MOE_STREAM_T_BESIDE=1 (a host copies the
+    variable when it is made), the lower threshold turned off and on per run by the child
+    (switch "beside_t"), the prompt's chunks in flight on the two cards as production runs them.
+
+    The jobs generating beside the prompt do not stream (decode-size batches never go through
+    the streamed prefill): they must come out identical to the same jobs alone. The prompt's
+    own logits move, since the experts its chunks send to the CPU worker today go to the cards:
+    judged within the noise of the bigger of two yardsticks, both differences upstream has
+    already: the prompt ingested inline beside the same jobs but queued later (it joins the
+    decode batch elsewhere, as after an ingestion beside the decode), and the same prompt alone
+    with every expert streamed against the cards' own threshold (switch "stream_t" = 1). The
+    prompt alone in flight with the switch on must be identical to inline: nobody decodes, the
+    cards' own threshold. The long prompt is there for the memory on the cards (reported per
+    run); its two runs are compared for information only.
+    """
+    P = "s10-fork"
+    p = Proc(P, "fork", [10], env = {"EXL3_MOE_STREAM_T_BESIDE": "1"})
+    D, R, L, W = args.decoder_tokens, args.reader_tokens, args.lead, args.warmup_tokens
+    pipe = {"pipeline": True, "thread": True}
+    on, off = dict(pipe, beside_t = 1), dict(pipe, beside_t = 0)
+    after = {"after": "a", "tokens": L}
+    # n jobs generating, 1 + DRAFT_TOKENS rows each, within side_max_rows: the chunks run beside
+    decs = [n for n in args.s10_decoders if 1 <= n and n * (1 + DRAFT_TOKENS) <= SIDE_MAX_ROWS]
+    if not decs:
+        raise SystemExit(f"--s10-decoders: nessun valore tra 1 e {SIDE_MAX_ROWS // (1 + DRAFT_TOKENS)}")
+    nmax = max(decs + ([2] if args.s10_long else []))
+    rdoc = doc("s10r", args.s10_prompt, 1)
+    p.add(gen_step("g0", 10))
+    p.add(run_step("s10.warm.1", 10, [jobspec("a", q(0), W)], warmup = True))
+    p.add(run_step("s10.warm.n", 10, [jobspec(x, q(i), W) for i, x in enumerate(NAMES[:nmax])], warmup = True))
+    p.add(run_step("s10.warm.r", 10, [jobspec("r", doc("s10w", doc_length(64, 8), 2), 8)], warmup = True))
+    for i, x in enumerate(NAMES[:nmax]):
+        p.add(run_step(f"s10.free.{x}", 10, [jobspec(x, q(i), D)]))
+    for n in decs:
+        for k in (1, 2):
+            p.add(run_step(f"s10.dec{n}.ref{k}", 10, [jobspec(x, q(i), forced = ref(P, f"s10.free.{x}", x))
+                                                       for i, x in enumerate(NAMES[:n])]))
+
+    def free_dec(n):
+        return [jobspec(x, q(i), 6000) for i, x in enumerate(NAMES[:n])]
+
+    def forced_dec(n):
+        return [jobspec(x, q(i), forced = ref(P, f"s10.free.{x}", x)) for i, x in enumerate(NAMES[:n])]
+
+    # Inline, as upstream (lane 0: the cards' own threshold whatever the switch)
+    for n in decs:
+        R0 = ref(P, f"s10.n{n}.free", "r")
+        p.add(run_step(f"s10.n{n}.free", 10, free_dec(n) + [jobspec("r", rdoc, R, start = after)], until = {"job": "r"}))
+        for k in (1, 2):
+            p.add(run_step(f"s10.n{n}.ref{k}", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                           until = {"job": "r"}))
+        p.add(run_step(f"s10.n{n}.shift", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0,
+                                                                      start = {"after": "a", "tokens": L + args.shift})],
+                       until = {"job": "r"}))
+        p.add(run_step(f"s10.n{n}.alone", 10, [jobspec("r", rdoc, forced = R0)]))
+        p.add(run_step(f"s10.n{n}.alone.all", 10, [jobspec("r", rdoc, forced = R0)], switches = {"stream_t": 1}))
+    # From here on the prompt's chunks in flight; the first such round sets the prefill thread up
+    # with the hosts the variable made (Generator._side_plan), switch as made (on)
+    p.add(run_step("s10.warm.pipe", 10, [jobspec("a", q(0), 6000), jobspec("r", doc("s10w", doc_length(64, 8), 2), 8,
+                                                                         start = {"after": "a", "tokens": 16})],
+                   until = {"job": "r"}, switches = pipe, warmup = True))
+    for n in decs:
+        R0 = ref(P, f"s10.n{n}.free", "r")
+        p.add(run_step(f"s10.n{n}.off", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                       until = {"job": "r"}, switches = off))
+        p.add(run_step(f"s10.n{n}.on", 10, free_dec(n) + [jobspec("r", rdoc, forced = R0, start = after)],
+                       until = {"job": "r"}, switches = on))
+        p.add(run_step(f"s10.n{n}.off.dec", 10, forced_dec(n) + [jobspec("r", rdoc, R, start = after)],
+                       until = {"job": "r"}, switches = off))
+        p.add(run_step(f"s10.n{n}.on.dec", 10, forced_dec(n) + [jobspec("r", rdoc, R, start = after)],
+                       until = {"job": "r"}, switches = on))
+    n0 = decs[0]
+    p.add(run_step("s10.alone.on", 10, [jobspec("r", rdoc, forced = ref(P, f"s10.n{n0}.free", "r"))], switches = on))
+    if args.s10_long:
+        rl = doc("s10l", args.s10_long, 1)
+        p.add(run_step("s10.long.off", 10, free_dec(2) + [jobspec("r", rl, 32, start = after)], until = {"job": "r"}, switches = off))
+        p.add(run_step("s10.long.on", 10, free_dec(2) + [jobspec("r", rl, forced = ref(P, "s10.long.off", "r"), start = after)],
+                       until = {"job": "r"}, switches = on))
+    p.prompts = prompt_specs(p.steps, {})
+    procs.append(p)
+
+    need_on = {"pipeline": "on", "beside": True, "streamed_beside": True}
+    for n in decs:
+        what = f"{n} job che generano"
+        comps.append(cmp(10, f"s10.n{n}.reader", f"{what}: `r` in volo accanto con la soglia bassa contro con la soglia delle schede",
+                         ref(P, f"s10.n{n}.on", "r"), ref(P, f"s10.n{n}.off", "r"), expect = "noise",
+                         yards = [(ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.shift", "r")),
+                                  (ref(P, f"s10.n{n}.alone", "r"), ref(P, f"s10.n{n}.alone.all", "r"))],
+                         requires = need_on))
+        comps.append(cmp(10, f"s10.n{n}.reader.off", f"{what}: `r` in volo accanto, interruttore spento, contro in linea come upstream",
+                         ref(P, f"s10.n{n}.off", "r"), ref(P, f"s10.n{n}.ref1", "r"),
+                         floor = (ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.ref2", "r")),
+                         yards = [(ref(P, f"s10.n{n}.ref1", "r"), ref(P, f"s10.n{n}.shift", "r"))],
+                         requires = {"pipeline": "on", "no_beside": True}))
+        comps.append(cmp(10, f"s10.n{n}.yard.all", f"{what}: metro, `r` da solo con ogni esperto in streaming contro la soglia delle schede",
+                         ref(P, f"s10.n{n}.alone.all", "r"), ref(P, f"s10.n{n}.alone", "r"), expect = "info"))
+        for i, x in enumerate(NAMES[:n]):
+            # Against the same jobs beside `r` with the switch off: their prompts go in the same
+            # way. Against the jobs alone only for information: with two jobs and the chunks in
+            # flight the second prompt goes in after the first job has started generating, where
+            # the reference ingests both in one inline pass, and which experts a prefill chunk
+            # streams depends on the counts over the whole chunk (2026-10-25: different from the
+            # first position whatever the switch).
+            # Up to where the two runs' batches part (2026-10-25, on the cards: exact mode ingests
+            # `r` some 30% faster with the switch off, so it joins the decode earlier there; and
+            # the second job's prompt joins the first job's decode one or two steps apart in two
+            # runs, by wall time, before `r` is even queued). So only the job that joins last is
+            # judged: the earlier ones' batch changes at a point that moves with wall time
+            last = i == n - 1
+            comps.append(cmp(10, f"s10.n{n}.{x}", f"{what}: `{x}` accanto a `r` con la soglia bassa contro con la soglia delle schede"
+                             + ("" if last else f" (per informazione: `{NAMES[n - 1]}` entra nel suo batch in un punto che "
+                                                "dipende dal tempo, prima che `r` sia accodato)"),
+                             ref(P, f"s10.n{n}.on.dec", x), ref(P, f"s10.n{n}.off.dec", x),
+                             floor = (ref(P, f"s10.dec{n}.ref1", x), ref(P, f"s10.dec{n}.ref2", x)),
+                             upto = {"window": "r", "both": True, "batch": True} if last else {"window": "r", "both": True},
+                             drafts = False, expect = "identical" if last else "info", requires = need_on))
+            comps.append(cmp(10, f"s10.n{n}.{x}.alone", f"{what}: `{x}` accanto a `r` con la soglia bassa contro gli stessi job senza prompt accanto",
+                             ref(P, f"s10.n{n}.on.dec", x), ref(P, f"s10.dec{n}.ref1", x), expect = "info",
+                             upto = {"window": "r"}, drafts = False))
+    comps.append(cmp(10, "s10.alone", "`r` da solo in volo con l'interruttore acceso contro in linea (nessuno genera: soglia delle schede)",
+                     ref(P, "s10.alone.on", "r"), ref(P, f"s10.n{n0}.alone", "r"),
+                     requires = {"pipeline": "on", "no_beside": True}))
+    if args.s10_long:
+        comps.append(cmp(10, "s10.long", f"`r` di {args.s10_long} token accanto a 2 job, soglia bassa contro soglia delle schede "
+                                         "(per informazione: il giro c'è per la memoria)",
+                         ref(P, "s10.long.on", "r"), ref(P, "s10.long.off", "r"), expect = "info"))
+def s11_plan(args, procs: list, comps: list):
+    """
+    Scenario 11, the decode step's host fast path (EXL3_HOST_FASTPATH=1, read once at import, so a
+    process of its own): two processes of the fork that differ in that variable only, both with
+    production's layout (the raw-key ring) and generators: scenario 9's `s3` (every switch production
+    runs, W from the test schedule) and `off` (the same without the MTP decode switches, W fixed: the
+    serial verify and a head pass per job). The workload of scenario 9 (a job alone, a staggered batch
+    of three, a document ingested beside two jobs generating, the next turn from VRAM). The switch
+    changes no kernel, no argument and no order, only the Python around them: identical everywhere,
+    free and forced runs, against the plain process repeated.
+    """
+    PP, PH = "s11-fork-plain", "s11-fork-hostfast"
+    W9 = args.s9_window
+    T9 = args.s9_tokens
+    R9 = args.s9_reader
+    rdoc = doc("s11r", args.s9_prompt, 1)
+    turn_key = "turn/s11"
+    src = "s11.s3.free1"           # the free runs every forced run takes its tokens from
+    turn_spec = {"kind": "turn", "base": rdoc, "answer": ref(PP, f"{src}.doc", "r"), "suffix": TURN_SUFFIX}
+    gens = s9_generators(args)
+    after = {"after": "a", "tokens": args.lead}
+
+    def workload(g: str, kind: str, k: int) -> list:
+        pre = f"s11.{g}.{kind}{k}"
+        if kind == "free":
+            return [
+                run_step(f"{pre}.a", 11, [jobspec("a", q(0), T9)]),
+                run_step(f"{pre}.abc", 11, [jobspec(x, q(i), T9) for i, x in enumerate("abc")]),
+                run_step(f"{pre}.doc", 11, [jobspec("a", q(0), 6000), jobspec("b", q(1), 6000),
+                                            jobspec("r", rdoc, R9, start = after)], until = {"job": "r"}),
+                run_step(f"{pre}.turn", 11, [jobspec("t", turn_key, 32)], forget = False),
+            ]
+        return [
+            run_step(f"{pre}.a", 11, [jobspec("a", q(0), forced = ref(PP, f"{src}.a", "a"))]),
+            run_step(f"{pre}.abc", 11, [jobspec(x, q(i), forced = ref(PP, f"{src}.abc", x)) for i, x in enumerate("abc")]),
+            run_step(f"{pre}.doc", 11, [jobspec("a", q(0), forced = ref(PP, f"{src}.doc", "a")),
+                                        jobspec("b", q(1), forced = ref(PP, f"{src}.doc", "b")),
+                                        jobspec("r", rdoc, forced = ref(PP, f"{src}.doc", "r"), start = after)],
+                     until = {"job": "r"}),
+            run_step(f"{pre}.turn", 11, [jobspec("t", turn_key, forced = ref(PP, f"{src}.turn", "t"))], forget = False),
+        ]
+
+    def process(name: str, env: dict, order: list) -> Proc:
+        p = Proc(name, "fork", [11], env = env, server_args = ["--draft-num-tokens", str(W9)])
+        for i, (g, sets) in enumerate(order):
+            p.add(gen_step(f"g.{g}", 11, switches = gens[g]))
+            if i == 0:
+                # As in scenario 9: the graphs and the first rounds of the prefill thread and of the
+                # pipeline before anything compared
+                p.add(run_step("s11.warm.a", 11, [jobspec("a", q(0), args.warmup_tokens)], warmup = True))
+                p.add(run_step("s11.warm.abc", 11, [jobspec(x, q(i), args.warmup_tokens) for i, x in enumerate("abc")],
+                               warmup = True))
+                p.add(run_step("s11.warm.doc", 11, [jobspec("a", q(0), 6000),
+                                                    jobspec("r", doc("s11w", doc_length(64, 8), 2), 8,
+                                                            start = {"after": "a", "tokens": 16})],
+                               until = {"job": "r"}, warmup = True))
+            for kind, k in sets:
+                p.add(*workload(g, kind, k))
+        p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+        return p
+
+    ring = {"EXL3_QSA_RAW_TAIL": "1"}
+    procs.append(process(PP, dict(ring), [("s3", [("free", 1), ("free", 2), ("forced", 1), ("forced", 2)]),
+                                          ("off", [("forced", 1), ("forced", 2)])]))
+    procs.append(process(PH, dict(ring, EXL3_HOST_FASTPATH = "1"), [("s3", [("free", 1), ("forced", 1)]),
+                                                                    ("off", [("forced", 1)])]))
+
+    # Every run of several jobs is compared up to where the two processes' decode batches part
+    # (same_batch_upto). The prefill thread and the pipeline put the second and third prompts in
+    # beside the first job's decode, so where they join depends on wall time, which the switch
+    # changes (it is what the switch is for): on the cards on 2026-10-25 `b` joined `a` at its
+    # 35th position with the fast path and at its 30th without, and every difference came after
+    # such a point. `a` beside the document: its batch changes when `b` joins, before `r` is
+    # queued, so for information only
+    BATCH = {"batch": True}
+    jobs = [("a", "a", "`a` da solo", None, {}, {}, "identical")]
+    jobs += [("abc", x, f"`{x}` nel batch di tre (decode sfalsato)", BATCH, {"stagger_calls": True}, {}, "identical")
+             for x in "abc"]
+    jobs += [("doc", "a", "`a` durante l'ingestione di `r` accanto (thread, pezzi in volo; per informazione: `b` entra nel "
+                          "suo batch in un punto che dipende dal tempo, prima che `r` sia accodato)",
+              {"window": "r", "both": True}, {}, {}, "info"),
+             ("doc", "b", "`b` durante l'ingestione di `r` accanto (thread, pezzi in volo)",
+              {"window": "r", "both": True, "batch": True}, {"thread": "on", "pipeline": "on", "beside": True},
+              {"piped": True}, "identical")]
+    jobs += [("doc", "r", f"`r` (documento di {args.s9_prompt} token) ingerito accanto ad `a` e `b`, poi nel batch",
+              BATCH, {"thread": "on", "pipeline": "on"}, {"piped": True}, "identical"),
+             ("turn", "t", "turno dopo ripreso dalla VRAM", None, {"resumed": True}, {}, "identical")]
+
+    def rows(group: str, label: str, run: str, floor: tuple, *, free: bool = False, need: dict | None = None):
+        for wl, job, what, upto, req, soft, expect in jobs:
+            comps.append(cmp(11, f"s11.{group}.{run}.{wl}.{job}", f"({group}) {label}: {what}" + (", token liberi" if free else ""),
+                             ref(PH, f"s11.{run}.{wl}", job), ref(PP, f"s11.{run}.{wl}", job),
+                             floor = (ref(PP, f"s11.{floor[0]}.{wl}", job), ref(PP, f"s11.{floor[1]}.{wl}", job)),
+                             upto = upto, requires = dict(req, **(need or {})) if expect != "info" else {}, soft = soft,
+                             free = free, group = group, expect = expect))
+
+    sched = {"scheduled": True}
+    rows("a", "produzione (`s3`), via veloce dell'host accesa contro spenta", "s3.free1", ("s3.free1", "s3.free2"),
+         free = True, need = dict(sched, verify_windows = True))
+    rows("b", "produzione (`s3`), via veloce dell'host accesa contro spenta, imposti", "s3.forced1",
+         ("s3.forced1", "s3.forced2"), need = sched)
+    rows("c", f"W={W9} fisso senza gli interruttori MTP (`off`), via veloce accesa contro spenta, imposti", "off.forced1",
+         ("off.forced1", "off.forced2"))
+    comps.append({"kind": "switch_state", "scenario": 11, "id": "s11.switch", "name": "host_fastpath",
+                  "expect": {PP: False, PH: True}})
+    comps.append({"kind": "same_placement", "scenario": 11, "id": "s11.placement", "procs": [PP, PH]})
+    comps.append({"kind": "library", "scenario": 11, "id": "s11.library", "procs": {PP: "fork", PH: "fork"}})
 
 
 # --------------------------------------------------------------------------------------------
@@ -1360,6 +1720,31 @@ def ingestion_window(rec: dict, reader: str):
     return j["enqueued"], end
 
 
+def same_batch_upto(t_rec: dict, r_rec: dict, t_job: str, r_job: str) -> int:
+    """How far two runs of the same jobs keep the same decode batch for one of them: the job's
+    positions before another job joins the batch (its first sampled token) or leaves it (ended)
+    at a different position of this job in the two runs. Where the others join depends on wall
+    time once prompts go in beside the decode (the prefill thread, the pipeline), and a batch of
+    another composition is other kernels' shapes, so past that point the two runs part by
+    design, whatever is under test."""
+    bound = None
+    others = [k for k in (t_rec.get("order") or []) if k != t_job]
+    others += [k for k in (r_rec.get("order") or []) if k != r_job and k not in others]
+    for k in others:
+        for when in (first_sample_time, lambda rec, name: (job_view(rec, name) or {}).get("ended")):
+            tt, tr = when(t_rec, k), when(r_rec, k)
+            pt = None if tt is None else tokens_before(t_rec, t_job, tt)
+            pr = None if tr is None else tokens_before(r_rec, r_job, tr)
+            if pt == pr:
+                continue
+            for x in (pt, pr):
+                if x is not None and (bound is None or x < bound):
+                    bound = x
+    n = max(len((job_view(t_rec, t_job) or {}).get("digest") or []),
+            len((job_view(r_rec, r_job) or {}).get("digest") or []))
+    return n if bound is None else bound
+
+
 def first_end_time(rec: dict):
     """End time of the iteration in which the first job of a run ended (eos), None if none did."""
     ends = [j.get("ended") for j in (rec.get("jobs") or {}).values() if j.get("ended") is not None]
@@ -1518,6 +1903,15 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
                        "EXL3_PREFILL_PIPELINE_HEAD=second")
     if req.get("stagger_calls") and not (stats.get("stagger") or {}).get("steps"):
         out.append("nessuna chiamata sfalsata")
+    # The streamed layers planned at the lower threshold beside a decode (scenario 10)
+    stream = stats.get("stream")
+    if req.get("streamed_beside") and not (stream or {}).get("beside"):
+        out.append("nessun layer a streaming pianificato con la soglia bassa accanto al decode"
+                   + ("" if stream is not None else " (nessun host fatto con EXL3_MOE_STREAM_T_BESIDE)")
+                   + f" (host avvisati dal generatore: {state.get('beside_hosts', '-')})")
+    if req.get("no_beside") and (stream or {}).get("beside"):
+        out.append(f"{stream['beside']} layer a streaming pianificati con la soglia bassa: l'interruttore doveva essere spento "
+                   "o nessuno doveva generare accanto")
     if req.get("tail_stashes") and not (stats.get("tail") or {}).get("stashes"):
         out.append("nessun checkpoint di coda preso")
     # The MTP decode's switches (the fork's counters, the run's difference)
@@ -1533,6 +1927,17 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
         taken = sorted(int(k[1:]) for k, v in window.items() if k.startswith("w") and k[1:].isdigit() and v)
         if len(taken) < 2:
             out.append(f"una sola finestra presa ({taken}): le forme non sono cambiate")
+    # Scenario 12: the variables in the environment of the processes (the child's start record)
+    if req.get("env"):
+        got = (res.meta.get(req["env"]["proc"]) or {}).get("env") or {}
+        miss = [f"{k}={v}" for k, v in req["env"]["vars"].items() if got.get(k) != v]
+        if miss:
+            out.append(f"`{req['env']['proc']}` non aveva {', '.join(miss)} nell'ambiente (la prova confronta la stessa cosa)")
+    if req.get("env_absent"):
+        got = (res.meta.get(req["env_absent"]["proc"]) or {}).get("env") or {}
+        extra = [f"{k}={got[k]}" for k in req["env_absent"]["vars"] if k in got]
+        if extra:
+            out.append(f"`{req['env_absent']['proc']}` aveva {', '.join(extra)} nell'ambiente (il riferimento non è senza)")
     j = job_view(rec, job) or {}
     if req.get("resumed") and not j.get("cached_tokens"):
         out.append("nessun token ripreso dalla cache")
@@ -1574,11 +1979,15 @@ def evaluate_probs(c: dict, res: Results) -> dict:
                 row.update(verdict = ERR, why = f"`{upto['window']}` non ha dato token nel giro di riferimento")
                 return row
             inside = min(inside, tokens_before(r_rec, c["ref"]["job"], wr[1]))
+        if upto.get("batch"):
+            inside = min(inside, same_batch_upto(t_rec, r_rec, c["test"]["job"], c["ref"]["job"]))
         window = (started, inside)
         if inside <= started:
             row.update(verdict = ERR, why = "nessuna posizione generata durante l'ingestione", window = window)
             return row
         upto = inside
+    elif isinstance(upto, dict) and upto.get("batch"):
+        upto = same_batch_upto(t_rec, r_rec, c["test"]["job"], c["ref"]["job"])
     elif isinstance(upto, dict) and upto.get("before_first_end"):
         t_end = first_end_time(t_rec)
         upto = None if t_end is None else tokens_before(t_rec, c["test"]["job"], t_end)
@@ -1606,12 +2015,21 @@ def evaluate_probs(c: dict, res: Results) -> dict:
             return None
         va, vb = job_view(a, p[0]["job"]), job_view(b, p[1]["job"])
         bound = upto
+        if isinstance(spec, dict) and spec.get("batch") and not spec.get("window"):
+            bound = same_batch_upto(a, b, p[0]["job"], p[1]["job"])
         if isinstance(spec, dict) and spec.get("window") and spec.get("both"):
             # The positions before the reader joined the batch in this pair's own two runs
             wa, wb = ingestion_window(a, spec["window"]), ingestion_window(b, spec["window"])
-            if wa is None or wb is None:
+            if wa is None and wb is None and not job_view(a, spec["window"]) and not job_view(b, spec["window"]):
+                # A pair without the reader (the jobs alone, repeated): the positions the comparison
+                # itself was bounded to
+                bound = upto
+            elif wa is None or wb is None:
                 return None
-            bound = min(tokens_before(a, p[0]["job"], wa[1]), tokens_before(b, p[1]["job"], wb[1]))
+            else:
+                bound = min(tokens_before(a, p[0]["job"], wa[1]), tokens_before(b, p[1]["job"], wb[1]))
+                if spec.get("batch"):
+                    bound = min(bound, same_batch_upto(a, b, p[0]["job"], p[1]["job"]))
         if free:
             # A floor of free runs too: up to where its own two runs part
             pa = parting(va, vb)
@@ -1930,6 +2348,8 @@ SWITCHES_OFF = {
     # Content-addressed multimodal pages: the generator's switch, and the embeddings' digests, which it
     # turns on for the whole process (tokenizer.mm_embedding.content_digests)
     "mm_content_hash": False, "mm_content_digests": False,
+    # The decode step's host fast path (EXL3_HOST_FASTPATH, read at import by the modules that have one)
+    "host_fastpath": False,
 }
 
 
@@ -2015,6 +2435,17 @@ def capture_checks(plan: dict, res: Results) -> dict:
                 if on:
                     note(c["scenario"], f"nel fork del confronto con stock non tutti gli interruttori sono spenti "
                                         f"(`{rid}`): {', '.join(on)}")
+        elif kind == "switch_state":
+            for pname, want in c["expect"].items():
+                for rid, rec in sorted(res.records.get(pname, {}).items()):
+                    if rec.get("op") != "generator":
+                        continue
+                    state = rec.get("switches_state") or {}
+                    if c["name"] not in state:
+                        note(c["scenario"], f"`{pname}` (`{rid}`) non dice `{c['name']}`: la libreria non ha l'interruttore?")
+                    elif bool(state[c["name"]]) is not bool(want):
+                        note(c["scenario"], f"`{pname}` (`{rid}`) ha `{c['name']}` = {state[c['name']]!r}, "
+                                            f"doveva essere {want!r}: il confronto non è quello detto")
         elif kind == "library":
             for pname, want in c["procs"].items():
                 meta = res.meta.get(pname)
@@ -2162,6 +2593,44 @@ SCENARIO_TEXT = {
        "accanto al documento si confrontano fino al passo in cui `r` entra nel batch in uno dei due giri: quel passo "
        "dipende dal tempo (un pezzo accanto al decode si registra quando ha finito). Il tier su disco non c'è: lo "
        "scenario 8 confronta l'anello col disco, e gli interruttori MTP non toccano le immagini delle pagine.",
+    10: "Un processo del fork fatto con `EXL3_MOE_STREAM_T_BESIDE=1` (l'host degli esperti CPU legge la variabile quando "
+        "nasce); il figlio spegne e accende la soglia bassa giro per giro (`beside_t`), con i pezzi del prompt in volo sulle "
+        "due schede come in produzione. Un documento `r` ingerito accanto a 1 e 2 job che generano. I job accanto non "
+        "passano dal prefill a streaming (lotti da decode): attesi identici agli stessi job da soli, fino al passo in cui `r` "
+        "entra nel batch. Il documento invece cambia negli ultimi bit, perché gli esperti che i suoi pezzi mandano oggi al "
+        "worker CPU vanno sulle schede: giudicato entro il rumore del più grande di due metri, tutti e due differenze che "
+        "upstream ha già, cioè `r` in linea accodato più tardi (entra nel batch in un altro punto, come dopo un'ingestione "
+        "accanto al decode) e `r` da solo con ogni esperto in streaming contro la soglia delle schede (`stream_t` = 1). "
+        "`r` da solo in volo con l'interruttore acceso deve uscire identico a in linea: nessuno genera, vale la soglia "
+        "delle schede. Il prompt lungo accanto a 2 job, spento e acceso, c'è per la memoria per scheda (tabella dei giri); "
+        "il suo confronto è solo informativo. I job accanto si confrontano con gli stessi job accanto a `r` a interruttore "
+        "spento: con due job e i pezzi in volo il secondo prompt entra quando il primo job genera già, mentre i job da soli "
+        "entrano insieme in un passaggio in linea, e quali esperti un pezzo di prefill porta sulle schede dipende dai "
+        "conteggi di tutto il pezzo (il confronto coi job da soli resta informativo). Un pezzo accanto al decode più corto "
+        "di `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` (2048) tiene la soglia delle schede. Il decode sfalsato è spento (con 2 job la produzione lo accende: la soglia non "
+        "dipende da come il decode è diviso, solo da quante righe ha).",
+    11: "La via veloce dell'host (`EXL3_HOST_FASTPATH=1`, letta all'import: un processo a sé) tiene fra una chiamata e "
+        "l'altra quello che il passo di decode rifaceva in Python a ogni chiamata: le chiavi della cache dei tensori, le "
+        "viste dei workspace dei siti del gated residual, del routing e della somma del MoE, il record della forma del "
+        "passaggio speculativo del GDN. Gli stessi kernel, con gli stessi argomenti, sugli stessi stream, nello stesso "
+        "ordine. Due processi del fork con l'anello delle chiavi grezze, che differiscono solo per la variabile: "
+        "`s11-fork-plain` e `s11-fork-hostfast`. In ciascuno il generatore di produzione dello scenario 9 (`s3`: decode "
+        "sfalsato, thread di prefill, pezzi in volo, checkpoint di coda, verifica e aggiornamento in un colpo, finestra a "
+        "costo col programma «W») e `off` (gli stessi senza gli interruttori MTP nuovi, W fisso: la verifica seriale e "
+        "un passaggio della testa per job). Il carico dello scenario 9; i giri imposti prendono i token da `s3` libero "
+        "del processo senza la via veloce. Atteso **identico** dappertutto, giri liberi e imposti. Il metro è il processo "
+        "senza la via veloce ripetuto.",
+    12: "Due processi del fork senza interruttori: `s12-fork-base` senza variabili e `s12-fork-test` con quelle di "
+        "`--s12-env` (default `EXL3_MOE_COOP_WIDE=1`: la tile larga, 128 colonne e 4 x 4 warp, in ogni stadio dei kernel "
+        "MoE del decode; l'estensione legge la variabile una volta per processo). Gli stessi giri imposti in tutti e due: "
+        "`a` da solo e `a`/`b` in un batch, con la testa MTP che bozza W token fisso e W=1 sulle stesse cache (1 + W righe "
+        "per job: con W=3 4 e 8 righe, con W=1 2 e 4, tutte nel percorso del decode fino a 8 righe, quello su cui le "
+        "variabili agiscono). I token imposti vengono dai giri liberi di `a` e `b` da soli in `base`. Un'altra tile somma "
+        "i prodotti di una riga in un altro ordine: atteso **entro il rumore**, non identico, contro la più grande di due "
+        "differenze che upstream stesso mostra quando cambiano le righe di un passo, tutte e due in `base`: il metro delle "
+        "forme (gli stessi token con W fisso contro W=1, quello dello scenario 9) e il metro del batch (`a` da solo contro "
+        "`a` accanto a `b`). Ogni giro due volte in `base`: il pavimento. Errore se il processo di prova non aveva le "
+        "variabili o quello di riferimento ne aveva qualcuna.",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -2408,9 +2877,9 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
                 if st.get("slowest"):
                     out += ["Chiamate più lunghe: " + ", ".join(f"{fmt(t, 2)} s ({op})" for t, op in st["slowest"][:8]), ""]
     # Memory and timing per run, for the scenarios where they are asked for
-    if s in (3, 4, 5):
+    if s in (3, 4, 5, 10):
         out += runs_table(s, plan, res)
-    if s == 9:
+    if s in (9, 11):
         out += mtp_runs_table(s, plan, res)
     hangs = []
     for proc in plan["procs"]:
@@ -3185,7 +3654,9 @@ def parse_cli(argv: list | None = None):
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
     ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7",
                     help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; a richiesta l'8, l'anello delle chiavi grezze "
-                           "del QSA, e il 9, la combinazione di produzione con la decodifica MTP nuova)")
+                           "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, il 10, più esperti "
+                           "in streaming nei pezzi di prompt accanto al decode, l'11, il lavoro dell'host del passo di "
+                           "decode tenuto fra le chiamate, e il 12, i kernel MoE del decode con le variabili di --s12-env)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -3245,6 +3716,17 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--s9-mixed", type = lambda v: [parse_windows_list(x) for x in v.split("/") if x.strip()],
                     default = [[0, 1, 2, 3], [3, 0, 3, 1]],
                     help = "programmi di finestre misti dello scenario 9, separati da / (default 0,1,2,3/3,0,3,1)")
+    ap.add_argument("--s10-prompt", type = int, default = doc_length(64, 64),
+                    help = "token del documento dello scenario 10 (default 16449: quattro pezzi da 4096 e un ultimo di 64)")
+    ap.add_argument("--s10-decoders", type = int_list, default = [1, 2], help = "job che generano accanto al documento nello scenario 10")
+    ap.add_argument("--s10-long", type = int, default = 131073,
+                    help = "token del prompt lungo dello scenario 10, accanto a 2 job (0 = niente: il giro c'è per la memoria)")
+    ap.add_argument("--s12-env", default = "EXL3_MOE_COOP_WIDE=1",
+                    help = "variabili del processo di prova dello scenario 12, VAR=VALORE separate da virgole "
+                           "(default EXL3_MOE_COOP_WIDE=1, la tile larga dei kernel MoE del decode)")
+    ap.add_argument("--s12-window", type = int, default = 3,
+                    help = "bozze MTP dello scenario 12 (--draft-num-tokens, W fisso; anche W=1 sulle stesse cache)")
+    ap.add_argument("--s12-tokens", type = int, default = 192, help = "token imposti per job nello scenario 12")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)
@@ -3282,6 +3764,13 @@ def parse_cli(argv: list | None = None):
         ap.error("--chunk: multiplo di 256")
     if args.s9_window < 1 or any(max(m) > args.s9_window for m in args.s9_mixed):
         ap.error("--s9-window: almeno 1, e i programmi di --s9-mixed non oltre")
+    try:
+        parse_env_assignments(args.s12_env)
+    except ValueError as e:
+        ap.error(f"--s12-env: {e}")
+    if args.s12_window < 1 or len(S12_JOBS["ab"]) * (1 + args.s12_window) > S12_MAX_ROWS:
+        ap.error(f"--s12-window: da 1 a {S12_MAX_ROWS // 2 - 1} (due job di 1 + W righe nel percorso del decode, "
+                 f"{S12_MAX_ROWS} righe al più)")
     return args
 
 

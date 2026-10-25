@@ -97,6 +97,8 @@ class Generator:
     _flight = None
     _side = None
     _pipe = ()
+    _beside_hosts = ()
+    _beside_on = False
 
     def __init__(
         self,
@@ -528,6 +530,11 @@ class Generator:
         # Chunks ingested beside a decode since the last report: [chunks, decode steps beside
         # them, seconds of chunks]; reported in one line once no job is ingesting any more
         self._side_stretch = None
+        # The CPU expert hosts with a lower streaming threshold for chunks beside a decode
+        # (EXL3_MOE_STREAM_T_BESIDE; found when the thread is set up, _side_plan) and what they
+        # were last told (_note_beside). Empty without the variable: nothing is written
+        self._beside_hosts = ()
+        self._beside_on = False
 
         # Prompt chunks in flight on two cards (_pipe_round): each chunk issued in two halves,
         # the first by the prefill thread and the second by a thread of its own, so that a card
@@ -2000,6 +2007,12 @@ class Generator:
         flying = self._flight.jobs if self._flight is not None else ()
         side = self.prefill_thread and self._side_plan()
 
+        # Whether this round's decode step goes on beside the chunks under way: the CPU expert
+        # hosts that lower their streaming threshold for such chunks are told before any chunk
+        # is handed over or waited for (_note_beside)
+        if self._beside_hosts:
+            self._note_beside(bool(side) and 0 < self._decode_rows() <= self.side_max_rows)
+
         if self._pipe or (side and self.prefill_pipeline and self._side is None and self._pipe_plan()):
             self._pipe_round(results, flying, bool(side and self.prefill_pipeline))
             return
@@ -2087,6 +2100,28 @@ class Generator:
         return rows
 
 
+    def _note_beside(self, on: bool):
+        """
+        Tell the CPU expert hosts that lower their streaming threshold for prompt chunks beside
+        a decode (EXL3_MOE_STREAM_T_BESIDE, MoeCpuHost._stream_threshold) whether this round's
+        decode step goes on beside the chunks under way: somebody is generating, the prefill
+        thread is at work, and the decode batch is one a chunk may overlap (side_max_rows).
+        Otherwise the round waits for its chunks, and a chunk waited for is best at the card's
+        own threshold.
+
+        Called at the top of _prefill_round, before any chunk is handed over or waited for, so
+        a chunk's layers are planned with what holds while they run. One bool per host, written
+        by this thread only and read by the lanes as it stands (a layer planned while it
+        changes takes either value). What a round cannot know at its top: in flight on two cards,
+        a job whose last chunk the round records goes on to the decode step at once, beside the
+        chunk started meanwhile, which hears of it at the next round (one decode step later).
+        """
+        if on != self._beside_on:
+            self._beside_on = on
+            for h in self._beside_hosts:
+                h.decode_beside = on
+
+
     def _moe_hosts(self) -> list:
         """The CPU expert workers' hosts of the model and of the draft model (one per component)."""
         hosts = {}
@@ -2132,6 +2167,19 @@ class Generator:
                 )
                 extra = "" if slots is None else \
                     f", CPU expert worker slots {slots[0]} for the decode and {slots[1]} for the prefill"
+                # Hosts that stream more of a chunk's experts while the decode goes on beside it
+                # (EXL3_MOE_STREAM_T_BESIDE): _prefill_round tells them when. They start from
+                # False with this generator, whatever an earlier one over the same model left
+                self._beside_hosts = tuple(h for h in self._moe_hosts() if getattr(h, "stream_t_beside", 0))
+                self._beside_on = False
+                for h in self._beside_hosts:
+                    h.decode_beside = False
+                if self._beside_hosts:
+                    ts = sorted({h.stream_t_beside for h in self._beside_hosts})
+                    ms = sorted({getattr(h, "stream_t_beside_min_rows", None) for h in self._beside_hosts} - {None})
+                    extra += f"; experts streamed from {'/'.join(map(str, ts))} assignments in chunks beside a decode"
+                    if ms:
+                        extra += f" (chunks of {'/'.join(map(str, ms))} rows or more)"
                 print(f" -- Prefill thread: on{extra}", flush = True)
             else:
                 print(f" !! Prefill thread not available: {why}", flush = True)

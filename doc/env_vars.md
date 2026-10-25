@@ -438,6 +438,29 @@ Windows the driver drops an idle link to Gen1, so the probe keeps traffic on it 
 0.5 s and until the rate is steady. Setting this explicitly pins the threshold on every device
 and disables the bandwidth scaling.
 
+### `EXL3_MOE_STREAM_T_BESIDE` (default: unset)
+
+A second threshold, an integer of at least 1, for prompt chunks ingested beside a decode
+(`Generator(prefill_thread = True)`): a chunk's layer planned on the prefill thread (or either
+lane of `prefill_pipeline`) while the generator takes decode steps beside it streams the experts
+with at least this many assignments, on every device, as given; any other chunk keeps the
+threshold above. The CPU expert worker serves its jobs in order, so a decode step's jobs wait
+behind the tail jobs of a chunk published before them; a lower threshold leaves the worker a
+shorter tail (`1`: none). Measured with `1` for every chunk on a split Qwen3.8-Flash-Next: the
+request decoding beside a prompt +27-57%, the prompt beside it -1% to -7.5%, but a prompt alone
+-20%, which is why this applies beside a decode only. Read once, at import; unset or empty is
+off, and a value that is not an integer of at least 1 is refused at import. No memory beyond what
+the load reserves for the streamed path. A fork switch (`FORK.md`).
+
+### `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` (default: `2048`)
+
+With `EXL3_MOE_STREAM_T_BESIDE` set: a chunk beside a decode with fewer rows than this keeps the
+device's threshold. A short chunk has few assignments per expert, so the lower threshold would
+stream nearly every expert it selects for a handful of rows each (on the workstation's cards: a
+47-token prompt beside a decode took 5.0 s to its first token at `1`, 1.1 s at the device's threshold). Read once, at import;
+unset or empty is the default, a value that is not an integer of at least 1 is refused at import.
+A fork switch (`FORK.md`).
+
 ### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
 Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch
@@ -528,6 +551,17 @@ streamed batch.
 
 Accumulate per-phase wall time in the CPU compute pool and report every 512 jobs. Enabled once
 per worker at startup.
+
+### `EXL3_SPLIT_PROF` (default: unset)
+
+Any non-empty value: bracket every CPU-split submit and collect of the MoE layers with two CUDA events
+on the current stream and print, every 2048 collects, the median, p90 and max of the brackets and the
+four slowest layers. Read at import. The events are recorded on the current device's stream (the
+decode does not switch device), so on a model split over two cards the brackets of the second card's
+layers time the first card's stream. It is not free: on Qwen3.8-Flash-Next (two cards, one to three
+requests) the events' creation, recording and readout took 10-12% of the decode thread's time and
+10-15% of its issue time, including `torch.cuda.is_available()` at every event made without a device.
+Host-time measurements should be taken with it unset.
 
 ### `EXL3_MOE_ARENA_DEBUG` (default: `0`)
 
@@ -930,6 +964,24 @@ Default for `Config.infer_params.vision_pinned`: store the vision component's li
 weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing straight from
 a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
 component.
+
+## Host side of the decode step
+
+### `EXL3_HOST_FASTPATH` (default: `0`)
+
+Keeps between calls the Python bookkeeping a decode step otherwise redoes at every call for the same
+shapes: the workspace cache's key strings (`GTensorCache.get_bucketed`), the workspace views of the
+gated residual sites (Qwen4Exp's hyperconnections: the fused mix and apply of a decode-size pass), of
+the MoE router's multi-row outputs and of the fused MoE decode tier's routed sum, and the record of a
+speculative pass the fused GDN path takes for the rewind; the lane of the calling thread is read
+without the exception `getattr` with a default raises and catches inside. The same kernels with the
+same arguments in the same order: only host time changes. A view is kept only of a tensor the cache or
+the module already keeps alive, under a key that holds the lane, and is taken again whenever the
+workspace cache makes or drops an entry. On the CPU (Qwen3.8-Flash-Next's sizes, the extension a
+function that does nothing) a pass's 96 sites, 48 MoE layers and 36 GDN layers go from 1.65-1.90 ms
+to 0.56-0.58 ms of Python; on the cards an estimated 3-5 ms a decode step, not measured. Read at import
+by each module that has a fast path: set it before importing the library. FORK.md, "The decode step's
+host work, kept between calls".
 
 ## Disk cache tier
 

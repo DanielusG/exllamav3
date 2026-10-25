@@ -1,7 +1,15 @@
 from __future__ import annotations
+import os
+import threading
 import torch
 from .device_copy import to_device
-from .lane import current_lane
+from .lane import current_lane, _tls as _lane_tls
+
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import. GTensorCache.get_bucketed keeps the key it builds for a (device, size, dtype, tag,
+# lane) instead of formatting it again at every call, and counts the entries it makes or drops
+# (fast_gen) so that a caller keeping views of its workspaces knows when to take them again
+HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 
 class SeqTensor:
 
@@ -226,6 +234,16 @@ class GTensorCache:
 
     def __init__(self):
         self.cache = {}
+        if HOST_FASTPATH:
+            # make_key's string per (device, backing numel, dtype, tag, lane) of get_bucketed;
+            # fast_gen moves whenever an entry is made or the cache is emptied. fast_views: what a
+            # decode site keeps of its workspaces (views of entries of this cache, under keys of
+            # the site's own), each stored with the fast_gen it was taken at and valid while that
+            # is still the count: entries are only ever added, and drop_all empties both
+            self.fast_keys = {}
+            self.fast_views = {}
+            self.fast_gen = 0
+            self._fast_lock = threading.Lock()
 
     def make_key(self, device, shape, dtype, x):
         device = torch.device(device)
@@ -254,6 +272,48 @@ class GTensorCache:
         nb = 1 << max(numel - 1, 0).bit_length()
         return self.get(device, (nb,), dtype, x)[:numel]
 
+    if HOST_FASTPATH:
+
+        def get(self, device, shape, dtype, x = ""):
+            key = self.make_key(device, shape, dtype, x)
+            made = key not in self.cache
+            if made:
+                refc, v = (0, torch.empty(shape, dtype = dtype, device = device))
+            else:
+                refc, v = self.cache[key]
+            self.cache[key] = (refc + 1, v)
+            if made:
+                # After the entry is in place: a view taken against the old count is retaken
+                with self._fast_lock:
+                    self.fast_gen += 1
+            return v
+
+        def get_bucketed(self, device, numel, dtype, x = ""):
+            """get_bucketed with the key kept: the same entry, its count and the same slice as
+            the plain lookup. The key of a (device, size, dtype, tag, lane) is what make_key
+            formats for it, kept only when the device is a torch.device or a str, the dtype a
+            torch.dtype and the tag a str: then two of these tuples that compare equal format
+            the same key (a torch.device is never equal to a str or an int, a dtype only to
+            itself). Anything else goes the plain way every time. The lane is read off the
+            thread-local as current_lane() does (util/lane.py, with the same switch)."""
+            nb = 1 << max(numel - 1, 0).bit_length()
+            mk = (device, nb, dtype, x, _lane_tls.__dict__.get("lane", 0))
+            try:
+                key = self.fast_keys.get(mk)
+            except TypeError:
+                # Something unhashable in the call (never in the library's own)
+                return self.get(device, (nb,), dtype, x)[:numel]
+            if key is None:
+                if not (type(x) is str and type(dtype) is torch.dtype and
+                        (type(device) is torch.device or type(device) is str)):
+                    return self.get(device, (nb,), dtype, x)[:numel]
+                key = self.fast_keys[mk] = self.make_key(device, (nb,), dtype, x)
+            ent = self.cache.get(key)
+            if ent is None:
+                return self.get(device, (nb,), dtype, x)[:numel]
+            self.cache[key] = (ent[0] + 1, ent[1])
+            return ent[1][:numel]
+
     def get_scratch(self, device, numel, dtype, x, rows: int, static_rows: int | None = None):
         """Flat workspace of numel elements for one call processing `rows` rows. Decode-class calls (rows up to
         static_rows, default SCRATCH_STATIC_ROWS) take a kept bucketed backing (get_bucketed); larger calls allocate
@@ -275,5 +335,9 @@ class GTensorCache:
 
     def drop_all(self):
         self.cache.clear()
+        if HOST_FASTPATH:
+            with self._fast_lock:
+                self.fast_gen += 1
+            self.fast_views.clear()
 
 g_tensor_cache = GTensorCache()

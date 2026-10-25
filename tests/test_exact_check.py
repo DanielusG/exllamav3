@@ -187,6 +187,59 @@ def test_the_positions_generated_during_an_ingestion():
     assert EC.evaluate_probs(probs_cmp(upto = {"window": "r"}, drafts = False), res)["verdict"] == EC.ERR
 
 
+def test_two_runs_are_compared_only_while_their_decode_batches_are_the_same():
+    # Scenario 10 on the cards, 2026-10-25: the second job joined the first's decode at a's 22nd
+    # token in one run and at its 24th in the other (wall time, before `r` was queued), and `r`
+    # joined at a's 640th / b's 627th in one and a's 397th / b's 365th in the other (exact mode
+    # ingests it faster with the switch off). Past those points the two runs part by design
+    def run(b_at, r_at_a, r_at_b, n = 700):
+        line, a_n, b_n, t = [], 0, 0, 0.0
+        b_t = r_t = None
+        while a_n < n:
+            t += 1.0
+            a_n += 1
+            if a_n > b_at:
+                b_n += 1
+                if b_t is None:
+                    b_t = t
+            if r_t is None and (a_n > r_at_a or (b_n > r_at_b and b_t is not None)):
+                r_t = t
+            line.append([t, [a_n, b_n, 1 if r_t is not None else 0]])
+        rec = runrec(a = view(list(range(n))), b = view(list(range(n))), r = dict(view([1]), enqueued = 48.5))
+        rec["order"], rec["timeline"] = ["a", "b", "r"], line
+        return rec
+    on, off = run(22, 640, 627), run(24, 397, 375)
+    assert EC.same_batch_upto(on, off, "a", "a") == 22
+    assert EC.same_batch_upto(on, off, "b", "b") == min(EC.tokens_before(on, "b", EC.first_sample_time(off, "r")),
+                                                        EC.tokens_before(off, "b", EC.first_sample_time(off, "r")))
+    # The same history: as far as the records go
+    assert EC.same_batch_upto(on, on, "a", "a") == 700
+    # In a comparison, with the reader's window in both runs; the floor of the jobs alone
+    # (no reader in it) is taken over the comparison's own positions
+    alone = runrec(a = view(list(range(700))), b = view(list(range(700))))
+    res = Res({("p", "t"): on, ("p", "r1"): off, ("p", "a1"): alone, ("p", "a2"): alone})
+    c = EC.cmp(10, "x", "label", EC.ref("p", "t", "b"), EC.ref("p", "r1", "b"),
+               floor = (EC.ref("p", "a1", "b"), EC.ref("p", "a2", "b")),
+               upto = {"window": "r", "both": True, "batch": True}, drafts = False)
+    row = EC.evaluate_probs(c, res)
+    assert row["verdict"] == EC.IDENT and row["test"]["n"] == EC.same_batch_upto(on, off, "b", "b")
+    assert row["floor"] is not None and row["floor"]["n"] == row["test"]["n"]
+    c["test"], c["ref"] = EC.ref("p", "t", "a"), EC.ref("p", "r1", "a")
+    c["floor"] = (EC.ref("p", "a1", "a"), EC.ref("p", "a2", "a"))
+    row = EC.evaluate_probs(c, res)
+    assert row["verdict"] == EC.ERR and "durante l'ingestione" in row["why"]     # 22 < the 48 before `r`
+    # Without a reader's window: up to where the batches part, and the floor over its own runs
+    c["upto"] = {"batch": True}
+    c["floor"] = (EC.ref("p", "t", "a"), EC.ref("p", "t", "a"))
+    row = EC.evaluate_probs(c, res)
+    assert row["verdict"] == EC.IDENT and row["test"]["n"] == 22 and row["floor"]["n"] == 700
+    on["jobs"]["a"]["digest"] = list(on["jobs"]["a"]["digest"])
+    on["jobs"]["a"]["digest"][22] = -1                                           # past the bound: not compared
+    assert EC.evaluate_probs(c, res)["verdict"] == EC.IDENT
+    on["jobs"]["a"]["digest"][21] = -1
+    assert EC.evaluate_probs(c, res)["verdict"] == EC.DIFF
+
+
 def test_a_comparison_expected_within_the_noise_takes_its_yardsticks():
     same = view([1, 2, 3, 4])
     resumed = view([1, 2, 3, 4], digest = [0] * 4, logp = [-0.5, -0.52, -0.52, -0.53])
@@ -340,7 +393,7 @@ def all_refs(plan):
     return out
 
 
-@pytest.mark.parametrize("scenarios", [None, "8", "9"])
+@pytest.mark.parametrize("scenarios", [None, "8", "9", "10", "11", "12"])
 def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
     plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
@@ -591,6 +644,272 @@ def test_scenario_9_reports_each_group_with_what_it_expects():
     assert r["verdict"] == EC.ERR and "mtp_batched_verify non esercitato" in r["why"]
 
 
+def test_scenario_10_judges_the_prompt_against_its_yardsticks_and_the_jobs_beside_as_identical():
+    plan = EC.build_plan(args_for("--scenarios", "10"))
+    (p,) = plan["procs"]
+    assert p["env"] == {"EXL3_MOE_STREAM_T_BESIDE": "1"}
+    sw = {st["id"]: st.get("switches") or {} for st in p["steps"] if st["op"] == "run"}
+    on = {k for k, v in sw.items() if v.get("beside_t") == 1}
+    off = {k for k, v in sw.items() if v.get("beside_t") == 0}
+    assert on and off and all(sw[k].get("pipeline") for k in on | off)
+    # The first run in flight sets the prefill thread up with the switch as the process made it:
+    # Generator._side_plan lists the hosts that have a value then, once per generator
+    first = next(st for st in p["steps"] if (st.get("switches") or {}).get("pipeline"))
+    assert "beside_t" not in first["switches"] and first.get("warmup")
+    assert sw["s10.n1.alone.all"] == {"stream_t": 1}
+    # The prompt's logits move with the switch (within the bigger yardstick); everything else is the same
+    differ = {f"s10.n{n}.{k}" for n in (1, 2) for k in ("on", "shift", "alone.all")} | {"s10.long.on"}
+    res = fake_results(plan, differ = differ)
+    recs = res.records["s10-fork"]
+    for rid, rec in recs.items():
+        if rid in on:
+            beside = 0 if rid == "s10.alone.on" else 40
+            rec["stats"]["stream"] = {"normal": 12, "beside": beside}
+        elif rid in off:
+            rec["stats"]["stream"] = {"normal": 0, "beside": 0}
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    for n in (1, 2):
+        assert rows[f"s10.n{n}.reader"]["verdict"] == EC.NOISE, rows[f"s10.n{n}.reader"]
+        assert rows[f"s10.n{n}.reader.off"]["verdict"] == EC.IDENT
+        for i, x in enumerate(EC.NAMES[:n]):
+            # Only the job that joins last is judged (the others' batch changes by wall time)
+            assert rows[f"s10.n{n}.{x}"]["verdict"] == (EC.IDENT if i == n - 1 else EC.INFO), rows[f"s10.n{n}.{x}"]
+            assert rows[f"s10.n{n}.{x}.alone"]["verdict"] == EC.INFO
+    assert rows["s10.alone"]["verdict"] == EC.IDENT
+    assert rows["s10.long"]["verdict"] == EC.INFO
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert summary_cells(report)[0][1] == EC.NOISE, summary_cells(report)
+    # The memory per run is in the table of the runs
+    assert "`s10-fork` / `s10.long.on`" in report
+    # A run that did not plan a layer at the lower threshold did not test the switch: an error
+    recs["s10.n2.on"]["stats"]["stream"] = {"normal": 52, "beside": 0}
+    recs["s10.alone.on"]["stats"]["stream"] = {"normal": 12, "beside": 3}
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s10.n2.reader"]["verdict"] == EC.ERR and "soglia bassa" in rows["s10.n2.reader"]["why"]
+    assert rows["s10.alone"]["verdict"] == EC.ERR and "doveva essere spento" in rows["s10.alone"]["why"]
+    # Over the yardsticks is a difference
+    recs["s10.n2.on"]["stats"]["stream"] = {"normal": 12, "beside": 40}
+    recs["s10.n2.on"]["jobs"]["r"]["logp"] = [-3.0] * 8
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s10.n2.reader"]["verdict"] == EC.DIFF and "metro" in rows["s10.n2.reader"]["why"]
+
+
+def test_the_child_turns_the_lower_threshold_and_the_cards_threshold_per_run():
+    """The child's two knobs of scenario 10 on hosts shaped as the fork's MoeCpuHost: the lower
+    threshold beside a decode only on hosts made with the variable, given back when a run leaves
+    it out; every card's own threshold overridden and given back; the counters summed."""
+    made = types.SimpleNamespace(stream_t_beside = 1, decode_beside = False,
+                                 beside_stats = {"normal": [0, 3, 2], "beside": [0, 5, 4], "small": [0, 1, 0]},
+                                 sstate = {0: {"stream_t": 23}, 1: {"stream_t": 11}})
+    plain = types.SimpleNamespace(stream_t_beside = 0, beside_stats = None, sstate = {0: {"stream_t": 23}})
+    ch = object.__new__(CH.Child)
+    ch.model = types.SimpleNamespace(config = types.SimpleNamespace(moe_cpu_hosts = {0: made, 1: made}))
+    ch.container = types.SimpleNamespace(draft_model = types.SimpleNamespace(config = types.SimpleNamespace(moe_cpu_hosts = {0: plain})))
+    ch.gen = types.SimpleNamespace(_beside_hosts = (made,))
+    ch.stream_t_base = {}
+    assert ch.moe_hosts() == [made, plain]
+    ch.apply_stream_switches({"beside_t": 0, "stream_t": 1})
+    assert made.stream_t_beside == 0 and plain.stream_t_beside == 0
+    assert [made.sstate[0]["stream_t"], made.sstate[1]["stream_t"], plain.sstate[0]["stream_t"]] == [1, 1, 1]
+    st = ch.state()
+    assert st["beside_t"] == [0, 0] and st["beside_hosts"] == 1
+    assert st["stream_t"] == {"0:cuda:0": 1, "0:cuda:1": 1, "1:cuda:0": 1}
+    ch.apply_stream_switches({})
+    assert made.stream_t_beside == 1
+    assert [made.sstate[0]["stream_t"], made.sstate[1]["stream_t"], plain.sstate[0]["stream_t"]] == [23, 11, 23]
+    assert ch.stats()["stream"] == {"normal": 5, "beside": 9, "small": 1}
+    # Asked of a process none of whose hosts the variable made: an error, not a silent no-op
+    ch.model = types.SimpleNamespace(config = types.SimpleNamespace(moe_cpu_hosts = {0: plain}))
+    ch.container = types.SimpleNamespace(draft_model = None)
+    with pytest.raises(CH.RunError):
+        ch.apply_stream_switches({"beside_t": 1})
+    assert "stream" not in ch.stats()
+    # The cards' threshold before any streamed layer made their state
+    plain.sstate = {}
+    with pytest.raises(CH.RunError):
+        ch.apply_stream_switches({"stream_t": 1})
+
+
+def test_scenario_10_needs_decoders_whose_rows_a_chunk_may_overlap():
+    with pytest.raises(SystemExit):
+        EC.build_plan(args_for("--scenarios", "10", "--s10-decoders", "5,6"))
+    plan = EC.build_plan(args_for("--scenarios", "10", "--s10-decoders", "1", "--s10-long", "0"))
+    ids = [st["id"] for st in plan["procs"][0]["steps"]]
+    assert not any(i.startswith("s10.long") for i in ids) and not any(i.startswith("s10.n2") for i in ids)
+
+
+def test_scenario_11_runs_the_same_generators_in_two_processes_that_differ_in_the_host_fast_path_only():
+    assert 11 not in args_for().scenarios
+    args = args_for("--scenarios", "11")
+    plan = EC.build_plan(args)
+    procs = [(p["name"], p["library"], p["env"], p["server_args"]) for p in plan["procs"]]
+    assert procs == [("s11-fork-plain", "fork", {"EXL3_QSA_RAW_TAIL": "1"}, ["--draft-num-tokens", "3"]),
+                     ("s11-fork-hostfast", "fork", {"EXL3_QSA_RAW_TAIL": "1", "EXL3_HOST_FASTPATH": "1"},
+                      ["--draft-num-tokens", "3"])]
+    assert "EXL3_HOST_FASTPATH" in EC.FORK_ENV_SWITCHES
+    plain, fast = plan["procs"]
+    gens9 = EC.s9_generators(args)
+    for p in plan["procs"]:
+        gens = {st["id"]: st["switches"] for st in p["steps"] if st["op"] == "generator"}
+        assert gens == {"g.s3": gens9["s3"], "g.off": gens9["off"]}
+        ids = [st["id"] for st in p["steps"] if st["op"] == "run"]
+        assert ids[:3] == ["s11.warm.a", "s11.warm.abc", "s11.warm.doc"]
+        # Every forced token is a free run of `s3` in the process without the fast path
+        for st in p["steps"]:
+            for j in st.get("jobs", []) if st["op"] == "run" else []:
+                if "forced" in j:
+                    assert j["forced"]["proc"] == "s11-fork-plain" and j["forced"]["run"].startswith("s11.s3.free1.")
+    runs = lambda p, pre: [st["id"] for st in p["steps"] if st["op"] == "run" and st["id"].startswith(pre)]
+    for pre in ("s11.s3.free1", "s11.s3.forced1", "s11.off.forced1"):
+        assert runs(fast, pre) == runs(plain, pre) and len(runs(plain, pre)) == 4
+    # The plain process repeats each set it is compared on, for the floor
+    assert runs(plain, "s11.s3.free2") and runs(plain, "s11.s3.forced2") and runs(plain, "s11.off.forced2")
+    assert not runs(fast, "s11.s3.free2") and not runs(fast, "s11.off.free")
+    assert plain["prompts"]["turn/s11"]["answer"] == EC.ref("s11-fork-plain", "s11.s3.free1.doc", "r")
+
+
+def test_scenario_11_expects_identical_everywhere_against_the_plain_process_repeated():
+    plan = EC.build_plan(args_for("--scenarios", "11"))
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    by = {}
+    for c in probs:
+        by.setdefault(c["group"], []).append(c)
+    assert {g: len(v) for g, v in by.items()} == {"a": 8, "b": 8, "c": 8}
+    for c in probs:
+        # `a` beside the document only for information: `b` joins its batch by wall time, before `r`
+        info = c["test"]["run"].endswith(".doc") and c["test"]["job"] == "a"
+        assert c["expect"] == ("info" if info else "identical"), c["id"]
+        assert c["test"]["proc"] == "s11-fork-hostfast" and c["ref"]["proc"] == "s11-fork-plain"
+        assert c["test"]["run"] == c["ref"]["run"] and c["test"]["job"] == c["ref"]["job"]
+        assert {r["proc"] for r in c["floor"]} == {"s11-fork-plain"}
+        assert [r["run"].rsplit(".", 1)[0] for r in c["floor"]] == [c["ref"]["run"].rsplit(".", 1)[0],
+                                                                    c["ref"]["run"].rsplit(".", 1)[0][:-1] + "2"]
+    judged = [c for c in probs if c["expect"] == "identical"]
+    assert all(c["free"] and c["requires"].get("verify_windows") and c["requires"].get("scheduled")
+               for c in judged if c["group"] == "a")
+    assert all(not c["free"] and c["requires"].get("scheduled") for c in judged if c["group"] == "b")
+    assert all(not c["free"] and "scheduled" not in c["requires"] for c in judged if c["group"] == "c")
+    for c in probs:
+        run, job = c["test"]["run"], c["test"]["job"]
+        # Runs of several jobs: up to where the two processes' batches part (wall time moves the joins)
+        if run.endswith(".abc") or (run.endswith(".doc") and job == "r"):
+            assert c["upto"] == {"batch": True}, c["id"]
+        if run.endswith(".doc") and job == "b":
+            assert c["upto"] == {"window": "r", "both": True, "batch": True}
+            assert c["requires"]["beside"] and c["requires"]["pipeline"] == "on" and c["soft"] == {"piped": True}
+        if run.endswith(".doc") and job == "a":
+            assert c["upto"] == {"window": "r", "both": True} and c["requires"] == {}
+        if run.endswith(".a") or run.endswith(".turn"):
+            assert c["upto"] is None
+    state = next(c for c in plan["comparisons"] if c["kind"] == "switch_state")
+    assert state["name"] == "host_fastpath" and state["expect"] == {"s11-fork-plain": False, "s11-fork-hostfast": True}
+    assert {"same_placement", "library"} <= {c["kind"] for c in plan["comparisons"]}
+    est = EC.estimate_plan(plan, args_for("--scenarios", "11"))
+    assert 5 * 60 <= est["total"] <= 15 * 60, est["total"] / 60
+
+
+def test_scenario_11_says_when_a_process_did_not_run_the_fast_path_it_was_meant_to():
+    plan = EC.build_plan(args_for("--scenarios", "11"))
+    res = fake_results(plan)
+    for p in plan["procs"]:
+        for rec in res.records[p["name"]].values():
+            if rec["op"] == "generator":
+                rec["switches_state"]["host_fastpath"] = p["name"] == "s11-fork-hostfast"
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert summary_cells(report)[0][1] == EC.IDENT, summary_cells(report)
+    assert f"## 11. {EC.SCENARIO_TITLES[11]}" in report and "| `s11-fork-hostfast` / `s11.s3.free1.a` |" in report
+    assert "host_fastpath" not in report
+    # The variable not taken (a library without the switch, or one that read it otherwise): said
+    # under the scenario, as every problem of the capture itself
+    res.records["s11-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"] = False
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert "**Attenzione**: `s11-fork-hostfast` (`g.s3`) ha `host_fastpath` = False, doveva essere True" in report
+    del res.records["s11-fork-hostfast"]["g.s3"]["switches_state"]["host_fastpath"]
+    assert "non dice `host_fastpath`" in EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    # A run of the fast path that differs from the plain one is a difference, not noise
+    res = fake_results(plan)
+    other = fake_results(plan, differ = ("s11.s3.forced1.abc",))
+    res.records["s11-fork-hostfast"]["s11.s3.forced1.abc"] = other.records["s11-fork-hostfast"]["s11.s3.forced1.abc"]
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s11.b.s3.forced1.abc.a"]["verdict"] == EC.DIFF
+    assert rows["s11.b.s3.forced1.a.a"]["verdict"] == EC.IDENT
+
+
+def test_scenario_12_runs_the_same_decode_in_a_process_without_and_one_with_the_variables():
+    assert 12 not in args_for().scenarios
+    args = args_for("--scenarios", "12")
+    plan = EC.build_plan(args)
+    procs = [(p["name"], p["library"], p["env"], p["server_args"]) for p in plan["procs"]]
+    assert procs == [("s12-fork-base", "fork", {}, ["--draft-num-tokens", "3"]),
+                     ("s12-fork-test", "fork", {"EXL3_MOE_COOP_WIDE": "1"}, ["--draft-num-tokens", "3"])]
+    base, test = plan["procs"]
+    # No switch of the fork: W fixed, then W = 1 over the same caches
+    for p in plan["procs"]:
+        gens = {st["id"]: st["switches"] for st in p["steps"] if st["op"] == "generator"}
+        assert gens == {"g.w3": {}, "g.w1": {"draft_tokens": 1}}
+    runs = lambda p: [st["id"] for st in p["steps"] if st["op"] == "run" and not st.get("warmup")]
+    assert runs(base)[:2] == ["s12.free.a", "s12.free.b"]
+    assert runs(base)[2:] == runs(test)
+    assert runs(test) == [f"s12.{g}.{wl}.ref{k}" for g in ("w3", "w1") for wl in ("a", "ab") for k in (1, 2)]
+    # Every forced job takes the tokens of its own free run alone, in the base process
+    for p in plan["procs"]:
+        for st in p["steps"]:
+            for j in st.get("jobs", []) if st["op"] == "run" else []:
+                if "forced" in j:
+                    assert j["forced"] == EC.ref("s12-fork-base", f"s12.free.{j['name']}", j["name"])
+    # The rows the variables act on: 1 + W per job, two jobs within the decode-size path's 8
+    assert 2 * (1 + args.s12_window) <= EC.S12_MAX_ROWS
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    assert len(probs) == 6
+    for c in probs:
+        assert c["expect"] == "noise" and not c["drafts"]
+        assert c["test"]["proc"] == "s12-fork-test" and c["ref"]["proc"] == "s12-fork-base"
+        assert c["test"]["run"] == c["ref"]["run"] and c["test"]["job"] == c["ref"]["job"]
+        assert c["requires"] == {"env": {"proc": "s12-fork-test", "vars": {"EXL3_MOE_COOP_WIDE": "1"}},
+                                 "env_absent": {"proc": "s12-fork-base", "vars": ["EXL3_MOE_COOP_WIDE"]}}
+        assert {r["proc"] for pair in c["yards"] + [c["floor"]] for r in pair} == {"s12-fork-base"}
+        wl, job = c["test"]["run"].split(".")[2], c["test"]["job"]
+        # the shape meter for every job, the batch meter for `a`
+        assert (EC.ref("s12-fork-base", f"s12.w3.{wl}.ref1", job), EC.ref("s12-fork-base", f"s12.w1.{wl}.ref1", job)) in c["yards"]
+        assert len(c["yards"]) == (2 if job == "a" else 1)
+    labels = sorted(c["label"] for c in probs)
+    assert any("W=3 (8 righe)" in l for l in labels) and any("W=1 (2 righe)" in l for l in labels)
+    kinds = {c["kind"] for c in plan["comparisons"]}
+    assert {"same_placement", "library"} <= kinds
+    # Another set of variables, and what the CLI refuses
+    other = EC.build_plan(args_for("--scenarios", "12", "--s12-env", "EXL3_MOE_COOP_KSPLIT=2, EXL3_MOE_SHARED_COOP=0",
+                                   "--s12-window", "1"))
+    assert other["procs"][1]["env"] == {"EXL3_MOE_COOP_KSPLIT": "2", "EXL3_MOE_SHARED_COOP": "0"}
+    assert [st["id"] for st in other["procs"][0]["steps"] if st["op"] == "generator"] == ["g.w1"]
+    assert len([c for c in other["comparisons"] if c["kind"] == "probs"]) == 3
+    for bad in (["--s12-env", "EXL3_MOE_FUSED_DET=0"], ["--s12-env", "WIDE=1"], ["--s12-env", ""],
+                ["--s12-window", "4"], ["--s12-window", "0"]):
+        with pytest.raises(SystemExit):
+            EC.parse_cli(["--scenarios", "12"] + bad)
+    est = EC.estimate_plan(plan, args)
+    assert 3 * 60 <= est["total"] <= 20 * 60, est["total"] / 60       # two loads, about 5 minutes
+
+
+def test_scenario_12_s_rows_need_the_variables_where_they_were_asked_for():
+    plan = EC.build_plan(args_for("--scenarios", "12"))
+    res = fake_results(plan)
+    res.meta["s12-fork-test"]["env"] = {"EXL3_MOE_COOP_WIDE": "1", "EXL3_MOE_FUSED_DET": "1"}
+    res.meta["s12-fork-base"]["env"] = {"EXL3_MOE_FUSED_DET": "1"}
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert rows and all(r["verdict"] == EC.IDENT for r in rows), [(r["id"], r.get("why")) for r in rows]
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert "## 12. " + EC.SCENARIO_TITLES[12] in report and EC.SCENARIO_TEXT[12] in report
+    # The test process without the variable compares the same thing: an error, not a pass
+    del res.meta["s12-fork-test"]["env"]["EXL3_MOE_COOP_WIDE"]
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert all(r["verdict"] == EC.ERR and "non aveva EXL3_MOE_COOP_WIDE=1" in r["why"] for r in rows)
+    # ... and so does a base process that has it
+    res.meta["s12-fork-test"]["env"]["EXL3_MOE_COOP_WIDE"] = "1"
+    res.meta["s12-fork-base"]["env"]["EXL3_MOE_COOP_WIDE"] = "1"
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert all(r["verdict"] == EC.ERR and "il riferimento non è senza" in r["why"] for r in rows)
+
+
 def test_the_exact_environment_of_the_children():
     args = args_for("--env", "EXL3_HOST_MEM_RESERVE_MB=1024")
     base = {"PATH": "/bin", "EXL3_STAGGER_DECODE": "1", "EXL3_MOE_CPU_SPLIT_STATS": "/x", "PYTHONPATH": "/somewhere"}
@@ -654,7 +973,7 @@ def test_the_estimate_and_the_dry_run():
 
 def test_the_cli_refuses_what_it_cannot_do():
     with pytest.raises(SystemExit):
-        EC.parse_cli(["--scenarios", "1,10"])
+        EC.parse_cli(["--scenarios", "1,99"])
     with pytest.raises(SystemExit):
         EC.parse_cli(["--chunk", "1000"])
     a = EC.parse_cli(["--scenarios", "3,1,3", "--out", "/tmp/x"])
@@ -1390,6 +1709,9 @@ def test_a_switch_left_on_does_not_pass_for_off():
     assert "EXL3_MM_CONTENT_HASH" in EC.FORK_ENV_SWITCHES
     for name in ("mm_content_hash", "mm_content_digests"):
         assert EC.switch_is_off(name, False) and not EC.switch_is_off(name, True)
+    # The decode step's host fast path (read at import)
+    assert "EXL3_HOST_FASTPATH" in EC.FORK_ENV_SWITCHES
+    assert EC.switch_is_off("host_fastpath", False) and not EC.switch_is_off("host_fastpath", True)
 
 
 def test_scenario_1_with_every_switch_of_this_branch_off_says_nothing_about_switches():
@@ -1688,6 +2010,23 @@ def test_the_child_over_a_fake_library(tmp_path):
     assert recs["reset"]["modules"] == 2
     status = json.loads((tmp_path / "proc-fork" / "status.json").read_text())
     assert status["op"] in ("unload", "close", "end", "start") or status["run"] is None
+
+
+@pytest.mark.parametrize("value, want", [(None, False), ("0", False), ("1", True)])
+def test_the_child_says_whether_the_library_runs_the_host_fast_path(tmp_path, monkeypatch, value, want):
+    # The switch is read at import by the library's modules: the child reports what the workspace
+    # cache's module read, not the variable
+    monkeypatch.setitem(FAKE_LIB, "exllamav3/util/__init__.py", "")
+    monkeypatch.setitem(FAKE_LIB, "exllamav3/util/tensor.py",
+                        "import os\nHOST_FASTPATH = os.environ.get('EXL3_HOST_FASTPATH', '0') not in ('', '0')\n")
+    if value is None:
+        monkeypatch.delenv("EXL3_HOST_FASTPATH", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_HOST_FASTPATH", value)
+    out, recs = run_child(tmp_path, "fork", [EC.gen_step("g0", 11)])
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert recs["g0"]["switches_state"]["host_fastpath"] is want
+    assert EC.switch_is_off("host_fastpath", recs["g0"]["switches_state"]["host_fastpath"]) is not want
 
 
 def test_the_child_hands_the_mtp_decode_switches_to_the_generator(tmp_path):

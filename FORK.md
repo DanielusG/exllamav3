@@ -1856,6 +1856,466 @@ the card where CUDA is available: on the workstation they are the first GPU chec
 on for the session when it is the first to import triton (the switch is read at the import); the
 compile checks run in a process of their own.
 
+### More of a chunk's experts streamed while a decode goes on beside it (`EXL3_MOE_STREAM_T_BESIDE`)
+
+Off by default: unset, every prompt chunk streams the experts its card's threshold streams, as
+upstream, and the generator writes nothing. For a model with CPU split experts whose prompt chunks
+run beside the decode (`Generator(prefill_thread = True)`, with or without the pipeline). The
+variable is read once, at import, with the other knobs of the CPU expert host; in the server it
+goes in the environment of the process (the wrapper), as `EXL3_STAGGER_DECODE` does. Also in
+`doc/env_vars.md`.
+
+**Why.** On a split layer a prompt chunk of at least `stream_min_rows` rows (32) goes through
+`MoeCpuHost.submit_prefill`: the experts with at least `stream_t` of the chunk's assignments have
+their weights streamed to the card and run there, the rest (the tail) go to the CPU expert worker
+as jobs on its ring. `stream_t` is per card, from the link's bandwidth measured at load
+(`_ensure_stream_state`): about 23 on the workstation's first card (chipset slot, gen3 x4) and 11
+on the second. The worker serves its ring in publication order (`cpu/moe_handoff.cu`), so a decode
+step beside the chunk has each layer's job wait behind the tail jobs the chunk published before it.
+Measured on the workstation on 2026-10-24 (production's flags, the draft window fixed at 1, the
+placement frozen; the server repo's `docs/REPORT-profiling-20261024.md`, 3.2-3.3 and 4.4): beside a
+prompt the decode step's wait for the worker had maxima of 33-90 ms (1-2 ms alone), with the worker
+busy 40-53% of the time, a wait for its turn more than for capacity. With `EXL3_MOE_STREAM_T=1`
+(every expert a chunk selects streamed, no tail):
+
+| | card's threshold (production) | `EXL3_MOE_STREAM_T=1` | |
+|---|---|---|---|
+| decode beside an 11.7k-token turn | 23.9 tok/s, 80.5 ms a step | 30.3 tok/s, 59.3 ms | +27% |
+| that turn's ingestion | 572 tok/s | 566 tok/s | -1% |
+| decode beside a cold 60k prompt | 15.4 tok/s, 111.6 ms a step | 24.2 tok/s, 77.3 ms | +57% |
+| that prompt's ingestion | 923 tok/s | 854 tok/s | -7.5% |
+| a cold 32k prompt alone | 1329 tok/s | 1062 tok/s | -20% |
+| worker busy beside the prompt | 40-41% | 12-21% | |
+
+For prompts alone no threshold beat the card's own: 12 on both cards -5% (32k) and -10% (128k), 24
+on both -11% and -14%, 40 -37% and -42%, the first card alone at 32 -4.5%, at 48 -21%. Hence the
+card's threshold for a chunk with nobody decoding beside it and a lower one for a chunk beside a
+decode.
+
+**What the switch does.** `EXL3_MOE_STREAM_T_BESIDE=<n>`, an integer of at least 1: a streamed
+layer of a chunk planned on a lane other than 0 while the generator takes decode steps beside the
+chunks under way streams the experts with at least n assignments (1: every expert the chunk
+selects), on every card, as given: not scaled by the link, not capped by the card's threshold.
+A chunk of fewer than `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS` rows (default 2048) keeps the card's
+threshold beside a decode too (*Short chunks* below). The rest of the streamed path is as it was,
+more batches through the same tiers and buffers.
+
+- `exllamav3/model/moe_cpu_host.py`: `MoeCpuTuning.stream_t_beside`, 0 when the variable is unset
+  or empty; anything but an integer of at least 1 raises a ValueError at import (0 would stream
+  experts that no token selected). `MoeCpuTuning.stream_t_beside_min_rows` from
+  `EXL3_MOE_STREAM_T_BESIDE_MIN_ROWS`, 2048 when unset or empty, an integer of at least 1 or a
+  ValueError at import. A host copies both when it is made (`MoeCpuHost.stream_t_beside`,
+  `stream_t_beside_min_rows`, the tuning object's rule for a same-process sweep), with
+  `decode_beside` (False) beside them. `_stream_threshold` gives `submit_prefill` the layer's
+  threshold: the card's, unless the value is set, the calling thread is on a lane other than 0,
+  `decode_beside` holds and the chunk has at least `stream_t_beside_min_rows` rows. `beside_stats`
+  counts the streamed layers planned at each threshold, per lane (`{"normal": [lane 0, 1, 2],
+  "beside": [...], "small": [...]}`, `small` the layers of a chunk beside a decode kept at the
+  card's threshold for its rows; each lane's entry written by its own thread), None with the switch
+  off. A host made without `__init__` has the switch off (class attributes).
+- `exllamav3/generator/generator.py`: `_side_plan`, which sets the prefill thread up, keeps the hosts
+  that have a value (`_beside_hosts`), tells them False (whatever an earlier generator over the same
+  model left) and adds the threshold to its start-up line; `_prefill_round`
+  tells them at its top, before any chunk is handed over or waited for, whether this round's decode
+  step goes on beside the chunks under way (`_note_beside`): the prefill thread is at work, somebody
+  is generating, and the decode batch is one a chunk may overlap (at most `side_max_rows`, 8 rows x
+  tokens). Otherwise the round waits for its chunks, and a chunk waited for is best at the card's
+  threshold. The bool is written only when it changes.
+
+Rules:
+
+- *Who knows.* The generator knows every round whether it steps the decode beside the chunks: it
+  is the condition `_prefill_round` and `_pipe_round` decide on. The host could only guess it, from
+  when lane 0 last published a decode-size job. Lane 0 never takes the lower threshold: a chunk
+  there is the generator's own thread inline (the prefill thread off, unavailable or switched off at
+  run time), and the decode step after it waits for the whole chunk anyway, so a slower chunk is a
+  longer wait. Without the prefill thread `_side_plan` never runs and nothing is written.
+- *Per layer, no lock.* `decode_beside` is read at every streamed layer as it stands: one bool the
+  generator's thread writes and the lanes read, no lock and no wait (the layer's counts readback
+  before it is upstream's). A change takes effect from the next layer planned: the decode ending in
+  the middle of a chunk (the round that finds nobody generating says so before it waits for the
+  chunk), the thread switched off.
+- *What a round cannot know at its top.* In flight on two cards, a round that records a job's last
+  chunk lets that job decode in the same iteration, beside the chunk started meanwhile: that chunk
+  hears of it at the next round, one decode step later. A chunk too short to run beside a decode
+  (`side_min_tokens`) and waited for in a round with somebody generating is told True: it streams
+  at all only with 32 rows or more, so this is a chunk of exactly 32 tokens, or one shorter than
+  `EXL3_SIDE_MIN_TOKENS` with that raised.
+- *Short chunks.* A chunk below `stream_t_beside_min_rows` rows (2048) beside a decode keeps the
+  card's threshold. Found on the cards on 2026-10-25 (exact check scenario 10, two jobs decoding):
+  the second job's own short prompt, ingested on the prefill thread beside the first job's decode,
+  streamed every expert it selected at 1 and took 5.0 s to its first token instead of 1.1 (a
+  47-token prompt, exact mode, which runs the streamed experts without the fused tier): a short chunk
+  has few assignments per expert, so at 1 nearly every expert it selects is one more weight DMA
+  for a handful of rows, while its tail on the worker is short anyway. A chunk of the production
+  size (4096) is above the floor; the last chunk of a prompt usually is not.
+- *Memory.* No VRAM beyond what the load reserves for the streamed path, whatever the threshold.
+  The autosplit's worst case for a split layer (`_autosplit_worst_case`) takes every split of the
+  chunk's assignments between the card's experts and the worker's, and the host's part
+  (`prefill_worst_case_parts`) sizes the streamed path for all of the worker's share going through
+  it: the outputs, the input copy, the sorted lists, and the larger of every row on one expert and
+  the batched tier's largest group; it never reads the threshold. The weight-staging ring
+  (`EXL3_MOE_CPU_WSLOTS` x `EXL3_MOE_CPU_WSLOT_MB`, and its native-order twin for packed layouts),
+  the fused tier's buffers and the batched tier's statics are allocated in the measured load and do
+  not grow. A lower threshold streams more experts, in more batches through the same ring; those it
+  adds are cool (fewer assignments than the card's threshold, so below `EXL3_MOE_STREAM_FUSED_T`)
+  and take the fused tier where the layer has one (per-batch tables of a few bytes per assignment),
+  the per-expert path otherwise, which the bound covers; the tail it removes takes its compressed
+  copies with it. Production ran `EXL3_MOE_STREAM_T=1` through the night's A/B without an OOM.
+- *Numerics.* An expert computed on the card instead of the worker agrees to the last bits only
+  (other kernels), as with any change of `EXL3_MOE_STREAM_T`: with the switch on, a chunk beside a
+  decode is not bit for bit the same chunk alone, and the exact check's comparison of an ingestion
+  beside a decode with one alone (the prefill thread's third session) differs by design. The
+  decode's own computation is untouched (decode-size batches never stream). Which layers take which
+  threshold follows the scheduling: the same plan gives the same layers unless a decode starts or
+  ends during a chunk.
+- *With the other switches.* Promote-on-miss rules the prefill thread out, so the switch too. The
+  placement weight counts a chunk's selections before `submit_prefill`, whatever is streamed. The
+  staggered decode is never on while a job ingests. An MTP head with split experts of its own has a
+  host of its own, told like the model's.
+
+What it costs when it runs: on the generator's thread a count of the decode rows per round (a loop
+over the active jobs) and a bool written when it changes; on a lane a thread-local read and a
+counter per streamed layer. Beside a decode, the DMA of the experts it adds (1.26 MB each on
+Flash-Next; the first card's link carried 3.1 GB/s in the night's trace) and their compute on the
+card instead of the worker: the -1% and -7.5% of the ingestions above, at 1. Nothing written
+anywhere.
+
+On the cards (2026-10-25, exact check scenario 10: production's split, cache 430k with the raw-key
+ring, checkpoints every 8192, 11 worker threads, a 16,449-token document ingested in flight beside 1
+and then 2 jobs generating, the switch turned off and on per run):
+- the jobs generating beside it came out identical with the switch on and off, over every position
+  both runs decoded in the same batch (447 positions of the one job, 399 of them during the
+  ingestion; 365 of the second of two, 340 during it), and the one job identical to the same job
+  alone over all its 640 positions, 592 of them beside the document streaming every expert;
+- the document's own logits moved within the noise of upstream's own differences (max |Δ log p|
+  0.066 against a yardstick of 0.128, the same document alone with every expert streamed; no top-1
+  token changed);
+- the document alone with the switch on came out identical to inline (nobody decoding: the cards'
+  threshold);
+- memory: a 131,073-token prompt beside two jobs, off then on, left the same lowest free memory in
+  one run of the check (710 MiB on cuda:0, 528 on cuda:1) and 32 MiB less on cuda:0 with the
+  switch in the other (678 against 710; cuda:1 464 both); peaks 14.24 / 14.40 GiB either way.
+The comparison of the jobs beside is bounded where the two runs' batches part: exact mode ingests
+the document some 30% faster with the switch off (the fused tier is off, so the experts the switch
+adds run through the slower per-expert path), so it joins the decode earlier there; and the second
+job's prompt joins the first job's decode one or two steps apart in two runs, by wall time, so only
+the job that joins last is judged. The first run of the check, before the floor of 2048 rows, found
+the short-chunk cost above. Speeds there are exact mode's and say nothing of production's (the
+ingestion beside a decode 975 tok/s off against 682 on in exact mode; the night's A/B with the fused
+tier on measured -1% and -7.5%).
+
+Not measured: production's speed with the switch (the decode and the ingestion beside each other, a
+prompt alone, which should not move); only 1 has been tried, values between 1 and the cards'
+thresholds have not.
+
+Tests: `tests/test_stream_beside.py` (no GPU, no extension). The variable: read as an integer of at
+least 1 or off, anything else refused, read once by the tuning object (the sources say so) and
+taken by a host when it is made. The host loaded on its own as in `test_moe_host_lanes.py`, its
+streamed and plain paths recording what they are handed: off, every lane gets the card's experts
+whether told or not; on, the lower threshold for lanes 1 and 2 told that a decode goes on beside,
+never for lane 0; a chunk that streams nothing at the card's threshold; decode-size batches; the
+counters; the load's worst case that never reads the threshold (the sources). The real
+`submit_prefill` and streamed path on lane 1 against that file's model of the streams and the
+worker's ring: at the card's threshold the chunk publishes a tail job, beside a decode none. The
+generator's real round over the toy model of `test_prefill_thread.py`, every chunk recording what
+its host was told as its passes start: nothing written without the variable; a's prompt alone
+False and b's four chunks beside a's decode True, also on a host an earlier generator left True;
+a decode batch too wide to overlap, False; the
+decode ending in the middle of b's prompt, True then False and never back; inline, never told;
+switched off at run time; in flight on two cards, both halves of every chunk. Marked `nogpu`; run
+with `--noconftest`. The fork's own tests: 596 passed, 35 skipped (549 before).
+
+### The decode step's host work, kept between calls (`EXL3_HOST_FASTPATH=1`)
+
+Off by default. Read once, when each module that has a fast path is imported (`util/lane.py`,
+`util/tensor.py`, `modules/hyperconnections.py`, `modules/block_sparse_mlp_routing.py`,
+`modules/block_sparse_mlp.py`, `modules/block_sparse_mlp_cpu.py`, `modules/gated_delta_net.py`), so it
+is set in the environment before the library is imported and holds for the whole process: no
+`Generator` argument, no server flag (in the server's wrapper an `export`). Branch `host-fastpath`,
+on `master` at fcd111d5. Also in `doc/env_vars.md`.
+
+**Why.** The night profiling of 2026-10-24 (the server's `docs/REPORT-profiling-20261024.md`, 2.2, 2.4
+and 2.6 a): the thread that issues a decode step (`exl3-generator-worker`) spends 25-30 ms of each
+step preparing and launching about a thousand kernels (measured with the split profiler on, whose own
+share is 3-4 ms of it: below), and with three requests staggered it waits for the cards 5-7% of the
+time: the host is the step. Inclusive shares of that thread (py-spy): the
+MoE module 27%, the gated residual sites 24% (96 a pass, ~90 µs each), the workspace cache's lookups
+11%, GDN 8%. A good part of it is the same bookkeeping, call after call, for the same shapes: format
+a workspace key string, look it up, slice the backing, view it to the shape.
+
+**What the switch changes**, site by site. The same kernels, with the same arguments (for a tensor:
+the same storage, offset, shape, strides and dtype), in the same order; none of the code below calls
+a stream, an event or a synchronize. Only the Python around the calls changes.
+
+- *Workspace cache* (`util/tensor.py`, `GTensorCache.get_bucketed`): the key string `make_key`
+  formats for a (device, backing size, dtype, tag, lane) is kept (`fast_keys`); a later call looks
+  the entry up by it, counts the reference and slices the backing as the plain lookup does. Kept
+  only for a `torch.device` or `str` device, a `torch.dtype` and a `str` tag, where two equal tuples
+  format the same string; anything else, and an entry not yet made, takes the plain path. `get` (the
+  same code) and `drop_all` count every entry made and every emptying in `fast_gen`, under a lock.
+- *Lanes* (`util/lane.py`): `current_lane()` and `host_waits()` read the thread-local's own dict
+  (`_tls.__dict__.get`) instead of `getattr(_tls, name, default)`, which on a thread that never
+  entered a lane raises and catches an AttributeError inside, at every workspace lookup and CPU host
+  slot. The same values (`Lane.enter` is the only writer).
+- *Gated residual sites* (`modules/hyperconnections.py`, `GatedResidual._mix`, `mix`, `apply_`:
+  Qwen4Exp's 96 sites a pass, the final mixer, the MTP head's): for a decode-size call (rows up to
+  `FUSED_MAX_R`, an fp32 contiguous stream stack: the fused pair's domain) the three workspace views
+  `ext.gr_mix` writes (dots, post, mixed), their (b, s, ...) views and the weighted-copy workspace
+  `apply_` hands to the next site are taken once per (device, b, s, table rows, streams, hidden,
+  combine form, lane) and kept in `g_tensor_cache.fast_views` with the `fast_gen` read before they
+  were taken; when the count has moved they are taken again. `proj_h[: proj_m]` is kept per site
+  while `proj_h` is the same tensor and `proj_m` the same count (`_prepare` and `tp_import` make a
+  new `proj_h`, `unload` drops the kept view). In `apply_`, a `post` that is the (b, s, H) view this
+  site's mix returned is passed as the (R, H) view kept beside it, which is what
+  `post.reshape(R, H).contiguous()` returns for it; any other `post` takes that expression. The
+  conversion and capture passes (`quant_preserve`, `capture`), larger row counts, stacks the plain
+  path converts first (fp16 MTP stacks, non-contiguous ones) and the mHC `HyperConnection` are left
+  as they are.
+- *MoE routing* (`modules/block_sparse_mlp_routing.py`, `_routing_buffers`): the three views of a
+  multi-row call up to `ROUTING_CACHE_ROWS` (router logits, selected experts, weights) kept per
+  (device, rows, experts, top-k, lane), as above. One-row calls have their own buffers and never
+  went through it.
+- *MoE fused decode tier* (`BlockSparseMLP.forward`, `BlockSparseMLP_CPU.cpu_split_combine`):
+  `experts_cfg.out_bszn[:bsz].view(eshape)` kept per (bsz, eshape) while `out_bszn` is the same
+  tensor (the output the fused decode kernels write, made at load and baked into `self.bc`), and the
+  (rows, H) view of it that the CPU split's collect is handed (`submit_collect_fused`) kept beside
+  it. What goes to the CPU expert worker, and in what order, is unchanged.
+- *GDN* (`GatedDeltaNet.forward`'s fused decode path): it called `GDNLayerState.staged_views(bsz,
+  seqlen)` only for the record of a speculative pass's shape (for the rewind) and discarded the three
+  views; with the switch it calls `staged_shape(bsz, seqlen)`, the same check and the same record
+  without the views (only for a pass not fed a token at a time, `spec_step is None`, and a state
+  that is exactly a `GDNLayerState`).
+
+**What it relies on.**
+- A view is kept only of a tensor something else already keeps alive (a workspace cache entry, a
+  module's buffer). Keeping one of a tensor that would otherwise be freed would change what the
+  caching allocator hands out later, so later addresses. Workspace entries are only ever added,
+  never replaced, so a view taken while the count is still the current one is a view of the backing
+  `get_bucketed` would return now; the count is read before the views are taken, so an entry made
+  meanwhile, on this thread or another, only makes the next call take them again.
+- The lane is in every key, as in the workspace cache's own: the prefill thread's and the pipeline's
+  passes keep their own views of their own workspaces. Dict reads and writes are atomic under the GIL;
+  the count moves under a lock.
+- The same view objects are now returned call after call where the plain path made new ones: safe
+  as long as nothing changes a view's metadata in place. Nothing in the library does outside the
+  loader (`resize_`, `as_strided_`, `set_`, `t_`, `squeeze_`, `unsqueeze_`, `transpose_`: one `set_`,
+  in `loader/safetensors.py`, on a tensor of its own).
+- A call served by kept views counts no reference on the workspace entries (the plain path counted
+  one per lookup). Nothing reads the counts: `util/memory.py` lists the entries and drops the count,
+  `model_ls.py` reads the keys.
+
+**With the switch off.** The fast functions are defined under `if HOST_FASTPATH:` at module or class
+level, and the plain ones are the code that was there. What the switch-off path runs that it did not
+before: a module-constant test in `BlockSparseMLP.forward`'s fused tier, in `cpu_split_combine` and in
+the GDN fused path's record. `GDNLayerState.staged_shape` exists and nothing calls it.
+
+**The split profiler is not free.** Upstream's `EXL3_SPLIT_PROF=1` (fd11c82e, in 1.6.3; the night's
+counters boot C set it with `EXL3_MOE_CPU_PROF=1`) brackets every CPU-split submit and collect with
+two `torch.cuda.Event`s recorded on the current stream. Its own work (creating, recording and reading
+the events) is 9.7-11.7% of the generator thread's samples in the night's three counters captures (one
+request at 60k and at 125k, three at 60k), 10.5-15.2% of its issue time: of the 16% the report gives
+the CPU split's bookkeeping (60k, one request) 11.7 points are the profiler and 4.6 the split (the
+submit and collect into the CPU expert worker's host, with their launches). All of the 2.7% the
+report counts in `torch.cuda.is_available()` (`_get_available_device_type`, from `current_stream()`
+and events without a device) is inside it too. The decode path makes no such call with the profiler off:
+there is nothing of that kind to take out of production's step (the report's first item). The events
+are recorded on the current device's stream, cuda:0, for the layers on cuda:1 too, so the profiler's
+brackets of the second card's layers do not time that card's work. Not changed here (upstream's code).
+Issue times measured with it on include it: the night's tooling runs py-spy in its counters mode only
+(`nightprof.py`), so every issue time of the report has it, the A/B of where the generator's thread
+runs (P11c and P12d, 20.0 against 23.5 ms a step) too.
+
+**Measured on the CPU** (`experiments/host_fastpath_bench.py`: the sources loaded off and on as the
+tests load them, the extension a function that does nothing, Qwen3.8-Flash-Next's sizes: 4 streams of
+2560, gated residual rank 320, 512 experts, top 10, 48 layers of which 36 GDN; the development machine,
+Python 3.14, torch 2.14 CPU, one thread; µs a call, the best of 5):
+
+| site | rows | off | on |
+|---|---|---|---|
+| a gated residual site (mix + apply) | 1-8 | 13.3-13.7 | 4.3-4.4 |
+| `routing_std` | 1 | 0.78 | 0.80 |
+| `routing_std` | 2-8 | 6.4-6.5 | 1.06-1.10 |
+| MoE tail (routed sum + collect) | 1-8 | 2.45-2.50 | 1.12-1.17 |
+| GDN record | 1-8 | 2.33-2.37 | 0.08 |
+| `current_lane()` | | 0.22 | 0.08 |
+| `get_bucketed` | | 1.45-1.49 | 0.79-0.83 |
+| a pass: 96 sites, 48 MoE layers, 36 GDN | 1 | 1653 | 556 |
+| a pass | 2, 4, 8 | 1877-1898 | 575-579 |
+
+**On the cards, an estimate [S].** In the night's captures (counters boot, py-spy over the generator
+thread) the frames the fast path no longer enters take 2.7-3.5 ms a step: `get_bucketed` under the
+gated residual sites 2.1-2.4 ms, `_routing_buffers` 0.12-0.43, `staged_views` 0.23-0.40, and part of
+`make_key` and `current_lane` elsewhere. On top of that, the views and slices the sites no longer
+redo, which py-spy attributes to the sites' own lines: on the CPU they are a third of what a site
+saves, and at the ratio `get_bucketed` shows between the two machines (about 4: 2.4 ms a step there
+for 4 lookups x ~100 sites, 1.47 µs a lookup here) about 1.3 ms more. So 3-5 ms a step. With three
+requests staggered, where the host is the step (about 27 ms of issue a step once the profiler's 3 ms
+are taken out), that is a step of about 22-24 ms, +12-20% while the cards are not the limit; with one
+request only the ~5 ms of gaps in which the cards wait for the host can come back, +10% at most. Not
+measured.
+
+**What has been checked, and where** (the development machine, no GPU, no extension):
+`tests/test_host_fastpath.py`. The sources are loaded twice, into one package with the switch off and
+one with it on; the same calls go through both and what reaches the extension is compared call by
+call (the function and, per argument, its value or, for a tensor, the buffer it is in, named by what
+it is, its offset, shape, strides and dtype), together with every torch operation that is not a view,
+in order. Scenarios: the sites in the order a pass meets them in a three-block toy with the final
+mixer, batch shapes changing from pass to pass, rows past the fused pair, stacks the plain path
+converts, the weighted-copy handoff and a successor on another device, two passes of other shapes
+interleaved block by block (the staggered decode's two groups), sublayer outputs of every dtype
+and layout, the conversion and capture passes, entries made between a mix and its apply, the cache
+emptied between passes, a table rebuilt, passes on lanes 1 and 2, two threads issuing at once, an
+entry made again by another thread, the routing buffers at every row count up to past the kept ones,
+the routed sum and its collect, the GDN record (against `staged_views`, and the call site's branch).
+Thirty mutations of the fast path (a count check dropped, the lane, the batch shape or the dtype left
+out of a key, an identity check dropped, a conversion let through, another shape recorded, ...) each
+make a test fail, but one that cannot: the identity check in `_fast_rows_view` is redundant while the
+kept view is held in the same dict. The whole suite passes with the switch off and with it on.
+Not checked: anything on the cards (no CUDA tensor has gone through the fast path; equality on the
+cards is the GPU check below), a real model's full forward (the toy has three blocks), mHC models
+(their `HyperConnection` is untouched, the workspace cache's change applies to them), tensor
+parallelism (the ranks import the library in their own processes and read the switch from the
+environment they inherit), ROCm, a free-threaded Python.
+
+**The GPU check** (on the workstation, production stopped; fish, one line each). The branch in a
+checkout of its own, `~/exl3-host-fastpath`, so production's `~/Desktop/exllamav3` stays as it is (the
+exact check uses the fork it is run from; the night's boots put it ahead on `PYTHONPATH`). Scenario 11
+of the exact check, about 10 minutes by the estimate (two loads): the same runs in a process with
+`EXL3_HOST_FASTPATH=1` and one without, both with the raw-key ring, with scenario 9's production
+generator (`s3`) and its fixed-window one (`off`), expected identical everywhere against the plain
+process repeated:
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --dry-run --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-host-fastpath/experiments/exact_check.py --scenarios 11 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s11
+
+Then the issue time, with the night's method and tools (`~/exl3-prof-20261024`: `boot.sh` in counters
+mode, which is the one that runs py-spy, at 200 Hz over the generator thread; `digest_issue.py`: issue
+ms a step = (1 - share in the host wait) x window / steps), in two boots that differ in
+`EXL3_HOST_FASTPATH` only: the same starting placement (`boot.sh` copies `placement-base`), sweeps out
+of reach, the window held at 1 (as P11c and P12d), one request at 60k and then three staggered, and
+the split profiler and the CPU pool's profiler off. Both read their variable as `bool(value)`, so they
+are set empty, not `0`:
+
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=0" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF0 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    env NP_PYTHONPATH_PRE=/home/daniele/exl3-host-fastpath NP_ENV="EXL3_SPLIT_PROF= EXL3_MOE_CPU_PROF= EXL3_HOST_FASTPATH=1" NP_ARGS="--draft-window-set 1 --moe-swap-hyst 1000000 --moe-swap-floor 1000000" /home/daniele/exl3-prof-20261024/boot.sh HF1 counters prime:ctx60-0 decode:ctx60-0 decode:ctx60-0 decode:ctx60-0 prime:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2 decode:ctx60-0,ctx60-1,ctx60-2
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF0
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/exl3-prof-20261024/digest_issue.py /home/daniele/exl3-prof-20261024/runs/HF1
+
+The switch leaves no line in the log: in `HF1`'s captures the sites' stacks go through `_mix_fast`, in
+`HF0`'s never. The tok/s of the same windows are in each run's `summary.jsonl`; whether the cards then
+become the limit is what the three-request windows say.
+
+Tests: `tests/test_host_fastpath.py` (no GPU, no extension; marked `nogpu`, run with
+`--noconftest`), the scenario's plan and report in `tests/test_exact_check.py`.
+
+## A routed expert is read once per decode step (a bench and a check, no switch)
+
+The night profiling of 2026-10-24 (server repo, `docs/REPORT-profiling-20261024.md`, 2.3 and
+2.6 b) read the ~2.5 ms of MoE kernel that every extra row of a decode step costs as rows
+re-reading the experts other rows of the step also picked. The code does not do that, upstream's
+or this branch's. Every decode-size batch (1 to `MAX_BSZN` = 8 rows, `bszn_eligible` in
+`BlockSparseMLP.forward`) goes to `BC_BlockSparseMLP::run_bszN`, i.e. to the coop kernels of
+`exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` (the night's nsys captures have
+`exl3_moe_coop_a_kernel`, `_b_kernel` and `_rot_kernel` in decode, never `exl3_moe_kernel`, the
+prefill's): block 0 of the rotation pre-kernel sorts the active (row, pick) slots by expert and
+cuts them into runs of at most `ROWS` = 8 slots of one expert (`build_runs`), and kernels A
+(gate/up) and B (down) run one block per (run, column group, projection), the run's slots as the
+rows of one m16 MMA tile (`gemv_tile`, `rows[]`): each weight word is dequantized once for all of
+them. A row picks an expert at most once and a call has at most 8 rows, so every expert a call
+reads is a single run, read once whoever picked it (upstream's
+`tests/kernels/moe/test_moe_coop.py::test_duplicate_experts`). The comment above `run_bszN` in
+`block_sparse_mlp.py` ("no sort/dedup") is about the host: the grouping is on the device.
+
+What a row costs, then, is the experts it adds that no other row of the call picked, at what the
+kernels make of each. From one decode capture of the night's tooling kept on the development
+machine (decode at 60k tokens, cuda:0, 36 SMs; medians per launch): routed A 54, 70, 93, 96 µs
+and B 43, 66, 90, 112 µs for 1 to 4 rows (A takes the wide tile from 40 slots, i.e. 4 rows), the
+shared expert's own launch pair 13 + 9 µs at one row to 19 + 16 at four, each rotation 2-3 µs.
+Each row adds some 23 µs to each of A and B, for about 7-9 experts on the card (the capture's hit
+rate and the rows' overlap are not recorded): 2.6-3.3 µs per expert in each kernel, the gate/up
+pair (0.84 MB at 2 bits) at 250-320 GB/s, the down projection (0.42 MB) at 130-160 GB/s, of the
+card's 448. Some 25-35 µs per layer do not depend on the experts (two dependent launches with
+their first and last waves, the shared expert's pair). The down stage is the weak one: its k is
+short (640, 40 k-slices over 16 warps, two or three each: one round of loads), so its 80 blocks
+per expert are mostly prologue, reduction and completion counter. A better decode kernel would
+win there and in the fixed part; that is native code, and not written here.
+
+What can be tried without native code is the launcher's own geometry. `exl3_moe_coop_launch`
+picks per stage the narrow tile (32 columns, k split 16 ways) or the wide one (128 columns, 4 x 4
+warps), on Blackwell the narrow one unless k >= 4096 or k >= 2048 with 32 slots or more, and a
+split-k factor; `EXL3_MOE_COOP_WIDE` and `EXL3_MOE_COOP_KSPLIT` force one for every stage
+(upstream's testing knobs, `doc/env_vars.md`; the extension reads them once per process). A card
+of 36 SMs keeps 72 of those 512-thread blocks resident: the wide tile's four times fewer blocks
+still fill it, and in the capture A at 4 rows (wide) cost what 3 rows cost narrow, 96 against 93
+µs for a third more experts. Whether it pays elsewhere (B at every row count, A below 4 rows, the
+shared expert's single-slot launch) is what the bench below measures. A per-stage choice would be
+native code; a process-wide one is a variable in the server's wrapper.
+
+**The bench** (`experiments/moe_decode_bench.py`, standard library in the orchestrator, one child
+process per setting): the published extension's kernels called directly at the model's shapes and
+bit widths (read from the checkpoint's safetensors headers with `--model`, nothing loaded),
+random trellises in 6 copies of a layer (96 routed experts and the shared one each, 0.7 GB) so that
+consecutive calls read weights the L2 does not hold, 13% of the picks outside the card's table as the CPU-split experts are (masked in
+the kernel). For 1-8 rows with disjoint, identical and overlapping selections: the routed coop
+launch as `run_bszN` issues it (the shared expert merged through its sigmoid gate), the shared
+expert's own launch, the two together, and the prefill's fused tier (`ext.exl3_moe` +
+`ext.exl3_moe_gather`) at the same rows with the slot layout `forward()` builds for it at decode
+size; the coop paths in one process per setting (`default`, `EXL3_MOE_COOP_WIDE=0`, `=1`,
+`EXL3_MOE_COOP_KSPLIT=2`). GPU time per call from a CUDA graph of the calls (no host in it) when
+capture works, else back-to-back calls, and the host's issue time; the geometry each launch got,
+from the launcher's rule mirrored in Python (checked against the grids of the night's capture).
+Accuracy: for 1, 2, 4 and 8 rows, every path's output per row against a dense reference of the
+same expert MLPs (each expert reconstructed, an fp16 GEMM, as upstream's kernel tests do), within
+3e-3 of the row's largest value, and every setting's coop output against the default's. The
+report (`REPORT.md`, Italian) has: (1) identical selections against disjoint ones at the same
+rows, the read-once check on the card; (2) a line, µs = a + b x distinct experts, per setting:
+the marginal GB/s and the fixed part; (3) the settings per row count; (4) the fused tier against
+coop, with the host time (`forward()`'s `torch.bincount` reads its input's min and max back to the
+host on CUDA, a sync per layer that rules the fused tier out for an asynchronous decode as it is
+written; the bench times it both ways); (5) the accuracy table. About 4 minutes by its own
+estimate (four processes), under a GiB of VRAM on one card.
+
+**Scenario 12 of the exact check** (`--scenarios 12`, below): the same forced decode runs in a
+process without and one with the variables of `--s12-env` (default `EXL3_MOE_COOP_WIDE=1`), within
+the noise of the shape and batch meters. The order: the bench; if a setting is faster at the rows
+production runs (2 to 8 with the cost window, 1 + W per request), scenario 12 with it; then the
+variable in the wrapper.
+
+The night profiling's estimate (-15/-20% of the step with two requests in one batch, at 75% of the
+card's bandwidth) assumed reads that are not there; as a bound on what a decode kernel streaming
+at 75% of peak could give over today's ~50% it stands, but at 2 bits the trellis decode costs
+nearly as many instructions per weight as the bandwidth allows, so that figure is an upper bound
+nobody has shown reachable.
+
+Tests: `tests/test_moe_decode_bench.py` (no GPU: every path over a fake extension whose functions
+take exactly the arguments of the C++ declarations, parsed from the headers; the launcher's
+geometry against the capture's grids; the selections, the fused layout, the header reader, the
+orchestrator and the report) and `tests/test_exact_check.py` (scenario 12).
+
+On the cards (2026-10-25, the integration branch `night-20261025`, cuda:0 for the bench; scenario
+12 with production's split, the cache at 430k with the raw-key ring, checkpoints every 8192):
+- the read-once check holds: 8 rows on the same experts 181 µs against 524 on disjoint ones
+  (routed launch, default setting);
+- `EXL3_MOE_COOP_WIDE=1` takes 11-25% off a whole MoE layer (shared and routed) at 1-8 rows: 97.7
+  -> 87.4 µs at 1 row, 176.1 -> 137.2 at 2, 303.1 -> 250.7 at 4, 581.3 -> 458.6 at 8 (disjoint
+  experts; 0.75-0.89 of the default on every pattern); `EXL3_MOE_COOP_WIDE=0` is the default or a
+  little slower, `EXL3_MOE_COOP_KSPLIT=2` slower up to 4 rows (1.36-1.47) and the default from 5;
+- every setting within 1.0-1.5e-3 of the dense reference per row, the default too: the wide tile is
+  as accurate, in another order;
+- scenario 12 with `EXL3_MOE_COOP_WIDE=1`: within the noise in 4 comparisons of 6, beyond the
+  yardstick in 2 (`b` in the batch at W=3, max |Δ log p| 0.342 against 0.104; `a` alone at W=1,
+  0.319 against 0.131; means 0.014, 0-2 top-1 changes in 192 positions): the rounding of every
+  stage of every MoE layer moves, where the yardstick (W=3 against W=1) moves one stage's tile
+  from 4 rows up. With `EXL3_MOE_COOP_KSPLIT=2`: within the noise in all 6.
+Whether that difference is acceptable is a decision for production, not a verdict of the check.
+
+Command lines for the GPU window (fish, production stopped; the dry run touches no card):
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/moe_decode_bench.py --dry-run --model /home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/moe_decode_bench.py --model /home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/ --out /home/daniele/exl3-moe-bench
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 12 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s12
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
@@ -1890,7 +2350,14 @@ raw-key ring, the same forced runs in a process with the full raw plane and one 
 512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
 from the disk tier), expected identical against the full plane's process repeated, and the memory
 each load left free per card beside what the library says the ring saves (about 13 minutes by the
-estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below.
+estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below. On
+request (`--scenarios 10`): (10) more of a chunk's experts streamed while a decode goes on beside it
+("More of a chunk's experts streamed while a decode goes on beside it", above). On request
+(`--scenarios 11`): (11) the decode step's host fast path, two processes that differ in
+`EXL3_HOST_FASTPATH` only, with scenario 9's production generator and fixed-window one and its
+workload, expected identical everywhere (about 10 minutes, two loads; "The decode step's host work,
+kept between calls", above). On request (`--scenarios 12`): (12) the decode MoE kernels under the
+environment of `--s12-env`, below.
 
 **Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
 loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
@@ -1947,6 +2414,24 @@ beside and in flight. Then the memory each load left free per card (the ring's),
 the libraries, as in scenario 8. The disk tier is not in this scenario (scenario 8 has the ring's
 turn from the disk).
 
+**Scenario 12, the decode MoE kernels under another environment** (`--scenarios 12`, about 5 minutes
+by the estimate: two loads, 22 runs, 6 comparisons). Two fork processes with no switch of this
+branch, `s12-fork-base` without the variables and `s12-fork-test` with those of `--s12-env`
+(`VAR=VALUE` pairs separated by commas, `EXL3_` variables only and none the check fixes for every
+process; default `EXL3_MOE_COOP_WIDE=1`), each with the server's `--draft-num-tokens` at
+`--s12-window` (3): the same forced runs in both, `a` alone and `a`/`b` in one batch, with the MTP
+head drafting W fixed and W = 1 on the same caches (`draft_tokens`, scenario 9's shape meter), so
+1 + W rows per job: 4 and 8 rows, 2 and 4, all on the decode-size path (8 rows at most, which
+`--s12-window` keeps) the variables act on. The forced tokens are those of `a` and `b` alone in
+free runs of `base`. A different tile adds a row's products in another order, so the rows are
+expected **within the noise**, against the bigger of two differences upstream itself shows when a
+step's rows change, both in `base`: the shape meter (W fixed against W = 1) and, for `a`, the batch
+meter (`a` alone against `a` beside `b`); each run twice in `base`, the floor, reported. A row is an
+error when the test process's start record lacks one of the variables, or the base process's has
+one. What it cannot tell: rows above 8 (the fused prefill tier, which the coop knobs do not touch),
+a decode step with W = 0 (one row: kernel A rotates its input in every block, another path), and
+the staggered decode's groups (the same kernels at their groups' row counts).
+
 **The switches.** A switch of this branch left off in a process with every switch off must read as
 off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches
 (`mtp_batched_verify`, `mtp_batched_update` off), the draft window (`"fixed"`, upstream's) and the
@@ -1957,7 +2442,10 @@ for content-addressed multimodal pages: `mm_content_hash` (the generator's switc
 `mm_content_digests` (the embeddings' digests, which the switch turns on for the whole process,
 `tokenizer.mm_embedding.content_digests`) must read off, and `EXL3_MM_CONTENT_HASH` is removed with the
 others. No scenario turns it on: the check's prompts are text, whose pages hash the same either way.
-Scenario 1 with every switch off reports nothing about switches (`tests/test_exact_check.py`).
+The host fast path too: `host_fastpath` (what the workspace cache's module read at import) must read
+off, and `EXL3_HOST_FASTPATH` is removed with the others; scenario 11 sets it in one of its two
+processes and warns when either did not read what it was given. Scenario 1 with every switch off
+reports nothing about switches (`tests/test_exact_check.py`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
@@ -1984,7 +2472,8 @@ process on the cards as a problem and the rest as it will be.
 
 How long: the dry run's estimate is about 1.9 hours for the default scenarios 1-7 (prefill 700
 tokens/s, decode 60 tokens/s for one job and 60 x sqrt(n) for n, 1 minute per model load, 40-65 s
-measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9; a scenario
+measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9, 17 for scenario
+10 (measured on 2026-10-25, one load), 10 for scenario 11, 5 for scenario 12; a scenario
 gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
 directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
 the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the

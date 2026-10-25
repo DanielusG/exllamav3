@@ -45,6 +45,9 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# Fork: the decode step's host fast path (EXL3_HOST_FASTPATH=1, off by default; FORK.md), read once
+# at import: the fused decode tier's view of its routed sum is kept per batch shape (_fast_out_bszn)
+HOST_FASTPATH = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 
 @dataclass
 class FusedBuffers:
@@ -994,6 +997,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.multi_down = None
         self.routing_cfg = None
         self.experts_cfg = None
+        if HOST_FASTPATH:
+            self.__dict__.pop("_fast_out", None)
         self.e_score_correction_bias = None
         self.e_score_bias_vl = None
         self.tid2eid = None
@@ -1382,7 +1387,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             assert bszn_eligible
             self.bc.run_bszN(y, selected_experts, routing_weights)
-            final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
+            if HOST_FASTPATH:
+                final_hidden_states = self._fast_out_bszn(bsz, eshape)
+            else:
+                final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
         # Independent shared-expert work can cover the CPU job (split tail or whole layer)
