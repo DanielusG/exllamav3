@@ -2293,6 +2293,23 @@ take exactly the arguments of the C++ declarations, parsed from the headers; the
 geometry against the capture's grids; the selections, the fused layout, the header reader, the
 orchestrator and the report) and `tests/test_exact_check.py` (scenario 12).
 
+On the cards (2026-10-25, the integration branch `night-20261025`, cuda:0 for the bench; scenario
+12 with production's split, the cache at 430k with the raw-key ring, checkpoints every 8192):
+- the read-once check holds: 8 rows on the same experts 181 µs against 524 on disjoint ones
+  (routed launch, default setting);
+- `EXL3_MOE_COOP_WIDE=1` takes 11-25% off a whole MoE layer (shared and routed) at 1-8 rows: 97.7
+  -> 87.4 µs at 1 row, 176.1 -> 137.2 at 2, 303.1 -> 250.7 at 4, 581.3 -> 458.6 at 8 (disjoint
+  experts; 0.75-0.89 of the default on every pattern); `EXL3_MOE_COOP_WIDE=0` is the default or a
+  little slower, `EXL3_MOE_COOP_KSPLIT=2` slower up to 4 rows (1.36-1.47) and the default from 5;
+- every setting within 1.0-1.5e-3 of the dense reference per row, the default too: the wide tile is
+  as accurate, in another order;
+- scenario 12 with `EXL3_MOE_COOP_WIDE=1`: within the noise in 4 comparisons of 6, beyond the
+  yardstick in 2 (`b` in the batch at W=3, max |Δ log p| 0.342 against 0.104; `a` alone at W=1,
+  0.319 against 0.131; means 0.014, 0-2 top-1 changes in 192 positions): the rounding of every
+  stage of every MoE layer moves, where the yardstick (W=3 against W=1) moves one stage's tile
+  from 4 rows up. With `EXL3_MOE_COOP_KSPLIT=2`: within the noise in all 6.
+Whether that difference is acceptable is a decision for production, not a verdict of the check.
+
 Command lines for the GPU window (fish, production stopped; the dry run touches no card):
 
     /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/moe_decode_bench.py --dry-run --model /home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/
