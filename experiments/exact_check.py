@@ -1476,20 +1476,34 @@ def s11_plan(args, procs: list, comps: list):
     procs.append(process(PH, dict(ring, EXL3_HOST_FASTPATH = "1"), [("s3", [("free", 1), ("forced", 1)]),
                                                                     ("off", [("forced", 1)])]))
 
-    jobs = [("a", "a", "`a` da solo", None, {}, {})]
-    jobs += [("abc", x, f"`{x}` nel batch di tre (decode sfalsato)", None, {"stagger_calls": True}, {}) for x in "abc"]
-    jobs += [("doc", x, f"`{x}` durante l'ingestione di `r` accanto (thread, pezzi in volo)",
-              {"window": "r", "both": True}, {"thread": "on", "pipeline": "on", "beside": True}, {"piped": True}) for x in "ab"]
+    # Every run of several jobs is compared up to where the two processes' decode batches part
+    # (same_batch_upto). The prefill thread and the pipeline put the second and third prompts in
+    # beside the first job's decode, so where they join depends on wall time, which the switch
+    # changes (it is what the switch is for): on the cards on 2026-10-25 `b` joined `a` at its
+    # 35th position with the fast path and at its 30th without, and every difference came after
+    # such a point. `a` beside the document: its batch changes when `b` joins, before `r` is
+    # queued, so for information only
+    BATCH = {"batch": True}
+    jobs = [("a", "a", "`a` da solo", None, {}, {}, "identical")]
+    jobs += [("abc", x, f"`{x}` nel batch di tre (decode sfalsato)", BATCH, {"stagger_calls": True}, {}, "identical")
+             for x in "abc"]
+    jobs += [("doc", "a", "`a` durante l'ingestione di `r` accanto (thread, pezzi in volo; per informazione: `b` entra nel "
+                          "suo batch in un punto che dipende dal tempo, prima che `r` sia accodato)",
+              {"window": "r", "both": True}, {}, {}, "info"),
+             ("doc", "b", "`b` durante l'ingestione di `r` accanto (thread, pezzi in volo)",
+              {"window": "r", "both": True, "batch": True}, {"thread": "on", "pipeline": "on", "beside": True},
+              {"piped": True}, "identical")]
     jobs += [("doc", "r", f"`r` (documento di {args.s9_prompt} token) ingerito accanto ad `a` e `b`, poi nel batch",
-              None, {"thread": "on", "pipeline": "on"}, {"piped": True}),
-             ("turn", "t", "turno dopo ripreso dalla VRAM", None, {"resumed": True}, {})]
+              BATCH, {"thread": "on", "pipeline": "on"}, {"piped": True}, "identical"),
+             ("turn", "t", "turno dopo ripreso dalla VRAM", None, {"resumed": True}, {}, "identical")]
 
     def rows(group: str, label: str, run: str, floor: tuple, *, free: bool = False, need: dict | None = None):
-        for wl, job, what, upto, req, soft in jobs:
+        for wl, job, what, upto, req, soft, expect in jobs:
             comps.append(cmp(11, f"s11.{group}.{run}.{wl}.{job}", f"({group}) {label}: {what}" + (", token liberi" if free else ""),
                              ref(PH, f"s11.{run}.{wl}", job), ref(PP, f"s11.{run}.{wl}", job),
                              floor = (ref(PP, f"s11.{floor[0]}.{wl}", job), ref(PP, f"s11.{floor[1]}.{wl}", job)),
-                             upto = upto, requires = dict(req, **(need or {})), soft = soft, free = free, group = group))
+                             upto = upto, requires = dict(req, **(need or {})) if expect != "info" else {}, soft = soft,
+                             free = free, group = group, expect = expect))
 
     sched = {"scheduled": True}
     rows("a", "produzione (`s3`), via veloce dell'host accesa contro spenta", "s3.free1", ("s3.free1", "s3.free2"),
@@ -1972,6 +1986,8 @@ def evaluate_probs(c: dict, res: Results) -> dict:
             row.update(verdict = ERR, why = "nessuna posizione generata durante l'ingestione", window = window)
             return row
         upto = inside
+    elif isinstance(upto, dict) and upto.get("batch"):
+        upto = same_batch_upto(t_rec, r_rec, c["test"]["job"], c["ref"]["job"])
     elif isinstance(upto, dict) and upto.get("before_first_end"):
         t_end = first_end_time(t_rec)
         upto = None if t_end is None else tokens_before(t_rec, c["test"]["job"], t_end)
@@ -1999,6 +2015,8 @@ def evaluate_probs(c: dict, res: Results) -> dict:
             return None
         va, vb = job_view(a, p[0]["job"]), job_view(b, p[1]["job"])
         bound = upto
+        if isinstance(spec, dict) and spec.get("batch") and not spec.get("window"):
+            bound = same_batch_upto(a, b, p[0]["job"], p[1]["job"])
         if isinstance(spec, dict) and spec.get("window") and spec.get("both"):
             # The positions before the reader joined the batch in this pair's own two runs
             wa, wb = ingestion_window(a, spec["window"]), ingestion_window(b, spec["window"])

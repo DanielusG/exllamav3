@@ -228,6 +228,16 @@ def test_two_runs_are_compared_only_while_their_decode_batches_are_the_same():
     c["floor"] = (EC.ref("p", "a1", "a"), EC.ref("p", "a2", "a"))
     row = EC.evaluate_probs(c, res)
     assert row["verdict"] == EC.ERR and "durante l'ingestione" in row["why"]     # 22 < the 48 before `r`
+    # Without a reader's window: up to where the batches part, and the floor over its own runs
+    c["upto"] = {"batch": True}
+    c["floor"] = (EC.ref("p", "t", "a"), EC.ref("p", "t", "a"))
+    row = EC.evaluate_probs(c, res)
+    assert row["verdict"] == EC.IDENT and row["test"]["n"] == 22 and row["floor"]["n"] == 700
+    on["jobs"]["a"]["digest"] = list(on["jobs"]["a"]["digest"])
+    on["jobs"]["a"]["digest"][22] = -1                                           # past the bound: not compared
+    assert EC.evaluate_probs(c, res)["verdict"] == EC.IDENT
+    on["jobs"]["a"]["digest"][21] = -1
+    assert EC.evaluate_probs(c, res)["verdict"] == EC.DIFF
 
 
 def test_a_comparison_expected_within_the_noise_takes_its_yardsticks():
@@ -766,19 +776,31 @@ def test_scenario_11_expects_identical_everywhere_against_the_plain_process_repe
         by.setdefault(c["group"], []).append(c)
     assert {g: len(v) for g, v in by.items()} == {"a": 8, "b": 8, "c": 8}
     for c in probs:
-        assert c["expect"] == "identical"
+        # `a` beside the document only for information: `b` joins its batch by wall time, before `r`
+        info = c["test"]["run"].endswith(".doc") and c["test"]["job"] == "a"
+        assert c["expect"] == ("info" if info else "identical"), c["id"]
         assert c["test"]["proc"] == "s11-fork-hostfast" and c["ref"]["proc"] == "s11-fork-plain"
         assert c["test"]["run"] == c["ref"]["run"] and c["test"]["job"] == c["ref"]["job"]
         assert {r["proc"] for r in c["floor"]} == {"s11-fork-plain"}
         assert [r["run"].rsplit(".", 1)[0] for r in c["floor"]] == [c["ref"]["run"].rsplit(".", 1)[0],
                                                                     c["ref"]["run"].rsplit(".", 1)[0][:-1] + "2"]
-    assert all(c["free"] and c["requires"].get("verify_windows") and c["requires"].get("scheduled") for c in by["a"])
-    assert all(not c["free"] and c["requires"].get("scheduled") for c in by["b"])
-    assert all(not c["free"] and "scheduled" not in c["requires"] for c in by["c"])
+    judged = [c for c in probs if c["expect"] == "identical"]
+    assert all(c["free"] and c["requires"].get("verify_windows") and c["requires"].get("scheduled")
+               for c in judged if c["group"] == "a")
+    assert all(not c["free"] and c["requires"].get("scheduled") for c in judged if c["group"] == "b")
+    assert all(not c["free"] and "scheduled" not in c["requires"] for c in judged if c["group"] == "c")
     for c in probs:
-        if c["test"]["run"].endswith(".doc") and c["test"]["job"] in "ab":
-            assert c["upto"] == {"window": "r", "both": True}
+        run, job = c["test"]["run"], c["test"]["job"]
+        # Runs of several jobs: up to where the two processes' batches part (wall time moves the joins)
+        if run.endswith(".abc") or (run.endswith(".doc") and job == "r"):
+            assert c["upto"] == {"batch": True}, c["id"]
+        if run.endswith(".doc") and job == "b":
+            assert c["upto"] == {"window": "r", "both": True, "batch": True}
             assert c["requires"]["beside"] and c["requires"]["pipeline"] == "on" and c["soft"] == {"piped": True}
+        if run.endswith(".doc") and job == "a":
+            assert c["upto"] == {"window": "r", "both": True} and c["requires"] == {}
+        if run.endswith(".a") or run.endswith(".turn"):
+            assert c["upto"] is None
     state = next(c for c in plan["comparisons"] if c["kind"] == "switch_state")
     assert state["name"] == "host_fastpath" and state["expect"] == {"s11-fork-plain": False, "s11-fork-hostfast": True}
     assert {"same_placement", "library"} <= {c["kind"] for c in plan["comparisons"]}
