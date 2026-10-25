@@ -1024,6 +1024,13 @@ it differs by up to 0.073 in the GDN states (fp16, values up to 7.9), 1.91 in th
 read, itself ingested with the capture: one pass instead of two) came in 1.21 s against 1.89, one
 sample of each in exact mode, not a speed measure.
 
+**In production** since 2026-10-25 16:50 (`EXL3_RECURRENT_CHECKPOINT_IN_PASS=1` in the wrapper,
+from the branch, merged into `master` the same evening on the user's verdict). The first 80 minutes
+of real traffic (46 requests, mostly one session, none beside another job): no error, no OOM; the
+median ingestion of a turn alone 1.42 s against 1.80 s the week before for 257-1024 new tokens, 2.90
+against 3.31 s for 1025-4096, unchanged below 256 and above 4096; the next turns resumed from the
+captured checkpoint at the previous prompt's last page.
+
 ### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
 
 Off by default: at the default weight, 1, nothing of it runs and the placement is upstream's,
