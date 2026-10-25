@@ -340,7 +340,7 @@ def all_refs(plan):
     return out
 
 
-@pytest.mark.parametrize("scenarios", [None, "8", "9"])
+@pytest.mark.parametrize("scenarios", [None, "8", "9", "12"])
 def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
     plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
@@ -589,6 +589,81 @@ def test_scenario_9_reports_each_group_with_what_it_expects():
     rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
     r = rows["s9.a1.v.free1.a.a"]
     assert r["verdict"] == EC.ERR and "mtp_batched_verify non esercitato" in r["why"]
+
+
+def test_scenario_12_runs_the_same_decode_in_a_process_without_and_one_with_the_variables():
+    assert 12 not in args_for().scenarios
+    args = args_for("--scenarios", "12")
+    plan = EC.build_plan(args)
+    procs = [(p["name"], p["library"], p["env"], p["server_args"]) for p in plan["procs"]]
+    assert procs == [("s12-fork-base", "fork", {}, ["--draft-num-tokens", "3"]),
+                     ("s12-fork-test", "fork", {"EXL3_MOE_COOP_WIDE": "1"}, ["--draft-num-tokens", "3"])]
+    base, test = plan["procs"]
+    # No switch of the fork: W fixed, then W = 1 over the same caches
+    for p in plan["procs"]:
+        gens = {st["id"]: st["switches"] for st in p["steps"] if st["op"] == "generator"}
+        assert gens == {"g.w3": {}, "g.w1": {"draft_tokens": 1}}
+    runs = lambda p: [st["id"] for st in p["steps"] if st["op"] == "run" and not st.get("warmup")]
+    assert runs(base)[:2] == ["s12.free.a", "s12.free.b"]
+    assert runs(base)[2:] == runs(test)
+    assert runs(test) == [f"s12.{g}.{wl}.ref{k}" for g in ("w3", "w1") for wl in ("a", "ab") for k in (1, 2)]
+    # Every forced job takes the tokens of its own free run alone, in the base process
+    for p in plan["procs"]:
+        for st in p["steps"]:
+            for j in st.get("jobs", []) if st["op"] == "run" else []:
+                if "forced" in j:
+                    assert j["forced"] == EC.ref("s12-fork-base", f"s12.free.{j['name']}", j["name"])
+    # The rows the variables act on: 1 + W per job, two jobs within the decode-size path's 8
+    assert 2 * (1 + args.s12_window) <= EC.S12_MAX_ROWS
+    probs = [c for c in plan["comparisons"] if c["kind"] == "probs"]
+    assert len(probs) == 6
+    for c in probs:
+        assert c["expect"] == "noise" and not c["drafts"]
+        assert c["test"]["proc"] == "s12-fork-test" and c["ref"]["proc"] == "s12-fork-base"
+        assert c["test"]["run"] == c["ref"]["run"] and c["test"]["job"] == c["ref"]["job"]
+        assert c["requires"] == {"env": {"proc": "s12-fork-test", "vars": {"EXL3_MOE_COOP_WIDE": "1"}},
+                                 "env_absent": {"proc": "s12-fork-base", "vars": ["EXL3_MOE_COOP_WIDE"]}}
+        assert {r["proc"] for pair in c["yards"] + [c["floor"]] for r in pair} == {"s12-fork-base"}
+        wl, job = c["test"]["run"].split(".")[2], c["test"]["job"]
+        # the shape meter for every job, the batch meter for `a`
+        assert (EC.ref("s12-fork-base", f"s12.w3.{wl}.ref1", job), EC.ref("s12-fork-base", f"s12.w1.{wl}.ref1", job)) in c["yards"]
+        assert len(c["yards"]) == (2 if job == "a" else 1)
+    labels = sorted(c["label"] for c in probs)
+    assert any("W=3 (8 righe)" in l for l in labels) and any("W=1 (2 righe)" in l for l in labels)
+    kinds = {c["kind"] for c in plan["comparisons"]}
+    assert {"same_placement", "library"} <= kinds
+    # Another set of variables, and what the CLI refuses
+    other = EC.build_plan(args_for("--scenarios", "12", "--s12-env", "EXL3_MOE_COOP_KSPLIT=2, EXL3_MOE_SHARED_COOP=0",
+                                   "--s12-window", "1"))
+    assert other["procs"][1]["env"] == {"EXL3_MOE_COOP_KSPLIT": "2", "EXL3_MOE_SHARED_COOP": "0"}
+    assert [st["id"] for st in other["procs"][0]["steps"] if st["op"] == "generator"] == ["g.w1"]
+    assert len([c for c in other["comparisons"] if c["kind"] == "probs"]) == 3
+    for bad in (["--s12-env", "EXL3_MOE_FUSED_DET=0"], ["--s12-env", "WIDE=1"], ["--s12-env", ""],
+                ["--s12-window", "4"], ["--s12-window", "0"]):
+        with pytest.raises(SystemExit):
+            EC.parse_cli(["--scenarios", "12"] + bad)
+    est = EC.estimate_plan(plan, args)
+    assert 3 * 60 <= est["total"] <= 20 * 60, est["total"] / 60       # two loads, about 5 minutes
+
+
+def test_scenario_12_s_rows_need_the_variables_where_they_were_asked_for():
+    plan = EC.build_plan(args_for("--scenarios", "12"))
+    res = fake_results(plan)
+    res.meta["s12-fork-test"]["env"] = {"EXL3_MOE_COOP_WIDE": "1", "EXL3_MOE_FUSED_DET": "1"}
+    res.meta["s12-fork-base"]["env"] = {"EXL3_MOE_FUSED_DET": "1"}
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert rows and all(r["verdict"] == EC.IDENT for r in rows), [(r["id"], r.get("why")) for r in rows]
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert "## 12. " + EC.SCENARIO_TITLES[12] in report and EC.SCENARIO_TEXT[12] in report
+    # The test process without the variable compares the same thing: an error, not a pass
+    del res.meta["s12-fork-test"]["env"]["EXL3_MOE_COOP_WIDE"]
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert all(r["verdict"] == EC.ERR and "non aveva EXL3_MOE_COOP_WIDE=1" in r["why"] for r in rows)
+    # ... and so does a base process that has it
+    res.meta["s12-fork-test"]["env"]["EXL3_MOE_COOP_WIDE"] = "1"
+    res.meta["s12-fork-base"]["env"]["EXL3_MOE_COOP_WIDE"] = "1"
+    rows = [r for r in EC.evaluate_all(plan, res) if r["kind"] == "probs"]
+    assert all(r["verdict"] == EC.ERR and "il riferimento non è senza" in r["why"] for r in rows)
 
 
 def test_the_exact_environment_of_the_children():
