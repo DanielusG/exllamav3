@@ -1856,6 +1856,96 @@ the card where CUDA is available: on the workstation they are the first GPU chec
 on for the session when it is the first to import triton (the switch is read at the import); the
 compile checks run in a process of their own.
 
+## A routed expert is read once per decode step (a bench and a check, no switch)
+
+The night profiling of 2026-10-24 (server repo, `docs/REPORT-profiling-20261024.md`, 2.3 and
+2.6 b) read the ~2.5 ms of MoE kernel that every extra row of a decode step costs as rows
+re-reading the experts other rows of the step also picked. The code does not do that, upstream's
+or this branch's. Every decode-size batch (1 to `MAX_BSZN` = 8 rows, `bszn_eligible` in
+`BlockSparseMLP.forward`) goes to `BC_BlockSparseMLP::run_bszN`, i.e. to the coop kernels of
+`exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` (the night's nsys captures have
+`exl3_moe_coop_a_kernel`, `_b_kernel` and `_rot_kernel` in decode, never `exl3_moe_kernel`, the
+prefill's): block 0 of the rotation pre-kernel sorts the active (row, pick) slots by expert and
+cuts them into runs of at most `ROWS` = 8 slots of one expert (`build_runs`), and kernels A
+(gate/up) and B (down) run one block per (run, column group, projection), the run's slots as the
+rows of one m16 MMA tile (`gemv_tile`, `rows[]`): each weight word is dequantized once for all of
+them. A row picks an expert at most once and a call has at most 8 rows, so every expert a call
+reads is a single run, read once whoever picked it (upstream's
+`tests/kernels/moe/test_moe_coop.py::test_duplicate_experts`). The comment above `run_bszN` in
+`block_sparse_mlp.py` ("no sort/dedup") is about the host: the grouping is on the device.
+
+What a row costs, then, is the experts it adds that no other row of the call picked, at what the
+kernels make of each. From one decode capture of the night's tooling kept on the development
+machine (decode at 60k tokens, cuda:0, 36 SMs; medians per launch): routed A 54, 70, 93, 96 µs
+and B 43, 66, 90, 112 µs for 1 to 4 rows (A takes the wide tile from 40 slots, i.e. 4 rows), the
+shared expert's own launch pair 13 + 9 µs at one row to 19 + 16 at four, each rotation 2-3 µs.
+Each row adds some 23 µs to each of A and B, for about 7-9 experts on the card (the capture's hit
+rate and the rows' overlap are not recorded): 2.6-3.3 µs per expert in each kernel, the gate/up
+pair (0.84 MB at 2 bits) at 250-320 GB/s, the down projection (0.42 MB) at 130-160 GB/s, of the
+card's 448. Some 25-35 µs per layer do not depend on the experts (two dependent launches with
+their first and last waves, the shared expert's pair). The down stage is the weak one: its k is
+short (640, 40 k-slices over 16 warps, two or three each: one round of loads), so its 80 blocks
+per expert are mostly prologue, reduction and completion counter. A better decode kernel would
+win there and in the fixed part; that is native code, and not written here.
+
+What can be tried without native code is the launcher's own geometry. `exl3_moe_coop_launch`
+picks per stage the narrow tile (32 columns, k split 16 ways) or the wide one (128 columns, 4 x 4
+warps), on Blackwell the narrow one unless k >= 4096 or k >= 2048 with 32 slots or more, and a
+split-k factor; `EXL3_MOE_COOP_WIDE` and `EXL3_MOE_COOP_KSPLIT` force one for every stage
+(upstream's testing knobs, `doc/env_vars.md`; the extension reads them once per process). A card
+of 36 SMs keeps 72 of those 512-thread blocks resident: the wide tile's four times fewer blocks
+still fill it, and in the capture A at 4 rows (wide) cost what 3 rows cost narrow, 96 against 93
+µs for a third more experts. Whether it pays elsewhere (B at every row count, A below 4 rows, the
+shared expert's single-slot launch) is what the bench below measures. A per-stage choice would be
+native code; a process-wide one is a variable in the server's wrapper.
+
+**The bench** (`experiments/moe_decode_bench.py`, standard library in the orchestrator, one child
+process per setting): the published extension's kernels called directly at the model's shapes and
+bit widths (read from the checkpoint's safetensors headers with `--model`, nothing loaded),
+random trellises in 6 copies of a layer (96 routed experts and the shared one each, 0.7 GB) so that
+consecutive calls read weights the L2 does not hold, 13% of the picks outside the card's table as the CPU-split experts are (masked in
+the kernel). For 1-8 rows with disjoint, identical and overlapping selections: the routed coop
+launch as `run_bszN` issues it (the shared expert merged through its sigmoid gate), the shared
+expert's own launch, the two together, and the prefill's fused tier (`ext.exl3_moe` +
+`ext.exl3_moe_gather`) at the same rows with the slot layout `forward()` builds for it at decode
+size; the coop paths in one process per setting (`default`, `EXL3_MOE_COOP_WIDE=0`, `=1`,
+`EXL3_MOE_COOP_KSPLIT=2`). GPU time per call from a CUDA graph of the calls (no host in it) when
+capture works, else back-to-back calls, and the host's issue time; the geometry each launch got,
+from the launcher's rule mirrored in Python (checked against the grids of the night's capture).
+Accuracy: for 1, 2, 4 and 8 rows, every path's output per row against a dense reference of the
+same expert MLPs (each expert reconstructed, an fp16 GEMM, as upstream's kernel tests do), within
+3e-3 of the row's largest value, and every setting's coop output against the default's. The
+report (`REPORT.md`, Italian) has: (1) identical selections against disjoint ones at the same
+rows, the read-once check on the card; (2) a line, µs = a + b x distinct experts, per setting:
+the marginal GB/s and the fixed part; (3) the settings per row count; (4) the fused tier against
+coop, with the host time (`forward()`'s `torch.bincount` reads its input's min and max back to the
+host on CUDA, a sync per layer that rules the fused tier out for an asynchronous decode as it is
+written; the bench times it both ways); (5) the accuracy table. About 4 minutes by its own
+estimate (four processes), under a GiB of VRAM on one card.
+
+**Scenario 12 of the exact check** (`--scenarios 12`, below): the same forced decode runs in a
+process without and one with the variables of `--s12-env` (default `EXL3_MOE_COOP_WIDE=1`), within
+the noise of the shape and batch meters. The order: the bench; if a setting is faster at the rows
+production runs (2 to 8 with the cost window, 1 + W per request), scenario 12 with it; then the
+variable in the wrapper.
+
+The night profiling's estimate (-15/-20% of the step with two requests in one batch, at 75% of the
+card's bandwidth) assumed reads that are not there; as a bound on what a decode kernel streaming
+at 75% of peak could give over today's ~50% it stands, but at 2 bits the trellis decode costs
+nearly as many instructions per weight as the bandwidth allows, so that figure is an upper bound
+nobody has shown reachable.
+
+Tests: `tests/test_moe_decode_bench.py` (no GPU: every path over a fake extension whose functions
+take exactly the arguments of the C++ declarations, parsed from the headers; the launcher's
+geometry against the capture's grids; the selections, the fused layout, the header reader, the
+orchestrator and the report) and `tests/test_exact_check.py` (scenario 12).
+
+Command lines for the GPU window (fish, production stopped; the dry run touches no card):
+
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/moe_decode_bench.py --dry-run --model /home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/moe_decode_bench.py --model /home/daniele/models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4/ --out /home/daniele/exl3-moe-bench
+    /home/daniele/miniconda3/envs/tabbyapi/bin/python /home/daniele/Desktop/exllamav3/experiments/exact_check.py --scenarios 12 --device-split 23:233,25:253 --out /home/daniele/exl3-exact-check-s12
+
 ## The overnight exact check (`experiments/exact_check.py`)
 
 What it is: the same-computation check of the v1.5.4 benches (`stagger_bench.py`, `prefill_bench.py`,
@@ -1890,7 +1980,8 @@ raw-key ring, the same forced runs in a process with the full raw plane and one 
 512, the same beside three questions, the next turn from the pages in VRAM and, with a new generator,
 from the disk tier), expected identical against the full plane's process repeated, and the memory
 each load left free per card beside what the library says the ring saves (about 13 minutes by the
-estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below.
+estimate, two loads). On request (`--scenarios 9`): (9) the production combination, below. On request
+(`--scenarios 12`): (12) the decode MoE kernels under the environment of `--s12-env`, below.
 
 **Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
 loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
@@ -1947,6 +2038,24 @@ beside and in flight. Then the memory each load left free per card (the ring's),
 the libraries, as in scenario 8. The disk tier is not in this scenario (scenario 8 has the ring's
 turn from the disk).
 
+**Scenario 12, the decode MoE kernels under another environment** (`--scenarios 12`, about 5 minutes
+by the estimate: two loads, 22 runs, 6 comparisons). Two fork processes with no switch of this
+branch, `s12-fork-base` without the variables and `s12-fork-test` with those of `--s12-env`
+(`VAR=VALUE` pairs separated by commas, `EXL3_` variables only and none the check fixes for every
+process; default `EXL3_MOE_COOP_WIDE=1`), each with the server's `--draft-num-tokens` at
+`--s12-window` (3): the same forced runs in both, `a` alone and `a`/`b` in one batch, with the MTP
+head drafting W fixed and W = 1 on the same caches (`draft_tokens`, scenario 9's shape meter), so
+1 + W rows per job: 4 and 8 rows, 2 and 4, all on the decode-size path (8 rows at most, which
+`--s12-window` keeps) the variables act on. The forced tokens are those of `a` and `b` alone in
+free runs of `base`. A different tile adds a row's products in another order, so the rows are
+expected **within the noise**, against the bigger of two differences upstream itself shows when a
+step's rows change, both in `base`: the shape meter (W fixed against W = 1) and, for `a`, the batch
+meter (`a` alone against `a` beside `b`); each run twice in `base`, the floor, reported. A row is an
+error when the test process's start record lacks one of the variables, or the base process's has
+one. What it cannot tell: rows above 8 (the fused prefill tier, which the coop knobs do not touch),
+a decode step with W = 0 (one row: kernel A rotates its input in every block, another path), and
+the staggered decode's groups (the same kernels at their groups' row counts).
+
 **The switches.** A switch of this branch left off in a process with every switch off must read as
 off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches
 (`mtp_batched_verify`, `mtp_batched_update` off), the draft window (`"fixed"`, upstream's) and the
@@ -1984,7 +2093,7 @@ process on the cards as a problem and the rest as it will be.
 
 How long: the dry run's estimate is about 1.9 hours for the default scenarios 1-7 (prefill 700
 tokens/s, decode 60 tokens/s for one job and 60 x sqrt(n) for n, 1 minute per model load, 40-65 s
-measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9; a scenario
+measured on 2026-10-24; ten loads), 13 minutes for scenario 8, 17 for scenario 9, 5 for scenario 12; a scenario
 gets at most three times its estimate, and at least 30 minutes. The report, `REPORT.md` in the run
 directory, is rewritten after every process and every ten minutes; a closed terminal does not stop
 the night (`orchestrator.log` has what it printed), and `--rebuild <run directory>` makes the
