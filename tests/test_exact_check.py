@@ -917,6 +917,9 @@ def test_scenario_13_runs_both_ways_in_one_process_and_resumes_from_disk_in_anot
     procs = [(p["name"], p["library"], p["env"]) for p in plan["procs"]]
     assert procs == [("s13-fork-a", "fork", {"EXL3_DISK_CACHE_UNCACHE": "1"}),
                      ("s13-fork-b", "fork", {"EXL3_DISK_CACHE_UNCACHE": "1"})]
+    # Every step and comparison is the scenario's own (the report and the estimate group by it)
+    assert {st["scenario"] for p in plan["procs"] for st in p["steps"] if "scenario" in st} == {13}
+    assert {c["scenario"] for c in plan["comparisons"]} == {13}
     pa, pb = plan["procs"]
     runs = {st["id"]: st for st in pa["steps"] if st["op"] == "run"}
     on = lambda rid: bool(runs[rid]["switches"].get("ckpt"))

@@ -1140,37 +1140,37 @@ def s13_plan(args, procs: list, comps: list):
     fx = lambda: jobspec("x", p13, forced = A)
     p = Proc(PA, "fork", [13], env = {"EXL3_DISK_CACHE_UNCACHE": "1"})
     p.add(gen_step("g0", 13))
-    p.add(run_step("s13.warm.1", 10, [jobspec("a", q(0), W)], warmup = True))
-    p.add(run_step("s13.warm.r", 10, [jobspec("x", doc("s13w", doc_length(64, 8), 2), 8)], warmup = True))
+    p.add(run_step("s13.warm.1", 13, [jobspec("a", q(0), W)], warmup = True))
+    p.add(run_step("s13.warm.r", 13, [jobspec("x", doc("s13w", doc_length(64, 8), 2), 8)], warmup = True))
     # The first document: upstream's cut (twice: the floor), the capture (twice), a chunk of 2048 (the meter),
     # the capture on the prefill thread and with two chunks in flight
-    p.add(run_step("s13.free", 10, [jobspec("x", p13, args.s13_answer)]))
+    p.add(run_step("s13.free", 13, [jobspec("x", p13, args.s13_answer)]))
     for k in (1, 2):
-        p.add(run_step(f"s13.off{k}", 10, [fx()], keep_ckpt = keep(f"off{k}")))
+        p.add(run_step(f"s13.off{k}", 13, [fx()], keep_ckpt = keep(f"off{k}")))
     for k in (1, 2):
-        p.add(run_step(f"s13.on{k}", 10, [fx()], switches = on, keep_ckpt = keep(f"on{k}")))
-    p.add(run_step("s13.c2048", 10, [fx()], switches = {"chunk": 2048}))
-    p.add(run_step("s13.thread", 10, [fx()], switches = {"ckpt": True, "thread": True}, keep_ckpt = keep("thread")))
-    p.add(run_step("s13.pipe", 10, [fx()], switches = {"ckpt": True, "pipeline": True}, keep_ckpt = keep("pipe")))
+        p.add(run_step(f"s13.on{k}", 13, [fx()], switches = on, keep_ckpt = keep(f"on{k}")))
+    p.add(run_step("s13.c2048", 13, [fx()], switches = {"chunk": 2048}))
+    p.add(run_step("s13.thread", 13, [fx()], switches = {"ckpt": True, "thread": True}, keep_ckpt = keep("thread")))
+    p.add(run_step("s13.pipe", 13, [fx()], switches = {"ckpt": True, "pipeline": True}, keep_ckpt = keep("pipe")))
     # The second document: the boundary deep in the last chunk
-    p.add(run_step("s13.long.free", 10, [jobspec("x", p13l, args.s13_long_answer)]))
+    p.add(run_step("s13.long.free", 13, [jobspec("x", p13l, args.s13_long_answer)]))
     for k in (1, 2):
-        p.add(run_step(f"s13.long.off{k}", 10, [jobspec("x", p13l, forced = AL)], keep_ckpt = keep(f"long_off{k}")))
-    p.add(run_step("s13.long.on", 10, [jobspec("x", p13l, forced = AL)], switches = on, keep_ckpt = keep("long_on")))
-    p.add(run_step("s13.long.c2048", 10, [jobspec("x", p13l, forced = AL)], switches = {"chunk": 2048}))
+        p.add(run_step(f"s13.long.off{k}", 13, [jobspec("x", p13l, forced = AL)], keep_ckpt = keep(f"long_off{k}")))
+    p.add(run_step("s13.long.on", 13, [jobspec("x", p13l, forced = AL)], switches = on, keep_ckpt = keep("long_on")))
+    p.add(run_step("s13.long.c2048", 13, [jobspec("x", p13l, forced = AL)], switches = {"chunk": 2048}))
     # The next turn: from its first token (the reference, repeated, and with chunks of 2048), resumed from
     # upstream's checkpoint and from the captured one
-    p.add(run_step("s13.t2.full.free", 10, [jobspec("y", turn_key, args.s13_next)]))
-    p.add(run_step("s13.t2.full.ref2", 10, [jobspec("y", turn_key, forced = B)]))
-    p.add(run_step("s13.t2.full.c2048", 10, [jobspec("y", turn_key, forced = B)], switches = {"chunk": 2048}))
-    p.add(run_step("s13.t2.off.prep", 10, [fx()]))
-    p.add(run_step("s13.t2.off", 10, [jobspec("y", turn_key, forced = B)], forget = False))
-    p.add(run_step("s13.t2.on.prep", 10, [fx()], switches = on))
-    p.add(run_step("s13.t2.on", 10, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
+    p.add(run_step("s13.t2.full.free", 13, [jobspec("y", turn_key, args.s13_next)]))
+    p.add(run_step("s13.t2.full.ref2", 13, [jobspec("y", turn_key, forced = B)]))
+    p.add(run_step("s13.t2.full.c2048", 13, [jobspec("y", turn_key, forced = B)], switches = {"chunk": 2048}))
+    p.add(run_step("s13.t2.off.prep", 13, [fx()]))
+    p.add(run_step("s13.t2.off", 13, [jobspec("y", turn_key, forced = B)], forget = False))
+    p.add(run_step("s13.t2.on.prep", 13, [fx()], switches = on))
+    p.add(run_step("s13.t2.on", 13, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
     # The disk tier shared with the next process: the first turn with the capture, then the close, which
     # persists what is only in VRAM or RAM
-    p.add(gen_step("g1", 10, switches = on, disk = "s13"))
-    p.add(run_step("s13.disk", 10, [fx()], switches = on, keep_ckpt = keep("disk")))
+    p.add(gen_step("g1", 13, switches = on, disk = "s13"))
+    p.add(run_step("s13.disk", 13, [fx()], switches = on, keep_ckpt = keep("disk")))
     p.add({"op": "ckpt_cmp", "id": "s13.ckpt", "scenario": 13,
            "pairs": [["off2", "off1"], ["on2", "on1"], ["thread", "on1"], ["pipe", "on1"], ["disk", "on1"],
                      ["on1", "off1"], ["long_off2", "long_off1"], ["long_on", "long_off1"]]})
@@ -1179,8 +1179,8 @@ def s13_plan(args, procs: list, comps: list):
     p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
     procs.append(p)
     pb = Proc(PB, "fork", [13], env = {"EXL3_DISK_CACHE_UNCACHE": "1"})
-    pb.add(gen_step("g0", 10, switches = on, disk = "s13"))
-    pb.add(run_step("s13.t2.restart", 10, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
+    pb.add(gen_step("g0", 13, switches = on, disk = "s13"))
+    pb.add(run_step("s13.t2.restart", 13, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
     pb.prompts = prompt_specs(pb.steps, {turn_key: turn_spec})
     procs.append(pb)
 
@@ -1195,31 +1195,31 @@ def s13_plan(args, procs: list, comps: list):
         # The prompt's last chunk runs whole: the passes past the boundary are another shape, and the GDN
         # scan goes on from the boundary's fp32 state instead of the fp16 one stored there, so only the
         # noise of a different cut is expected; the meter is the same prompt with chunks of 2048
-        cmp(10, "s13.on", f"risposta imposta ({args.s13_answer} token) al documento di {prompt_spec_of(p13)['length']} "
+        cmp(13, "s13.on", f"risposta imposta ({args.s13_answer} token) al documento di {prompt_spec_of(p13)['length']} "
             "token: checkpoint preso dentro la passata contro taglio al confine",
             ref(PA, "s13.on1", "x"), ref(PA, "s13.off1", "x"), expect = "noise", floor = off_floor, yards = meter,
             drafts = False, requires = {"captured": True}),
-        cmp(10, "s13.on.rep", "la stessa con la cattura, ripetuta",
+        cmp(13, "s13.on.rep", "la stessa con la cattura, ripetuta",
             ref(PA, "s13.on2", "x"), ref(PA, "s13.on1", "x"), floor = off_floor, requires = {"captured": True}),
-        cmp(10, "s13.thread", "la cattura col prefill sul secondo thread, contro in linea",
+        cmp(13, "s13.thread", "la cattura col prefill sul secondo thread, contro in linea",
             ref(PA, "s13.thread", "x"), ref(PA, "s13.on1", "x"), floor = on_floor,
             requires = {"captured": True, "thread": "on"}),
-        cmp(10, "s13.pipe", "la cattura con due pezzi in volo sulle due schede, contro in linea",
+        cmp(13, "s13.pipe", "la cattura con due pezzi in volo sulle due schede, contro in linea",
             ref(PA, "s13.pipe", "x"), ref(PA, "s13.on1", "x"), floor = on_floor,
             requires = {"captured": True, "pipeline": "on"}),
-        cmp(10, "s13.disk", "la cattura col tier su disco acceso, contro senza",
+        cmp(13, "s13.disk", "la cattura col tier su disco acceso, contro senza",
             ref(PA, "s13.disk", "x"), ref(PA, "s13.on1", "x"), floor = on_floor, requires = {"captured": True}),
-        cmp(10, "s13.long", f"risposta imposta al documento di {prompt_spec_of(p13l)['length']} token (confine "
+        cmp(13, "s13.long", f"risposta imposta al documento di {prompt_spec_of(p13l)['length']} token (confine "
             f"{args.s13_long_pages * 256 % args.chunk} token dentro l'ultimo pezzo): cattura contro taglio",
             ref(PA, "s13.long.on", "x"), ref(PA, "s13.long.off1", "x"), expect = "noise",
             floor = (ref(PA, "s13.long.off1", "x"), ref(PA, "s13.long.off2", "x")), yards = lmeter, drafts = False,
             requires = {"captured": True}),
-        cmp(10, "s13.t2.full", "turno dopo da capo, ripetuto", ref(PA, "s13.t2.full.ref2", "y"),
+        cmp(13, "s13.t2.full", "turno dopo da capo, ripetuto", ref(PA, "s13.t2.full.ref2", "y"),
             ref(PA, "s13.t2.full.free", "y"), floor = None),
-        cmp(10, "s13.t2", "turno dopo ripreso dal checkpoint catturato contro ripreso da quello di upstream",
+        cmp(13, "s13.t2", "turno dopo ripreso dal checkpoint catturato contro ripreso da quello di upstream",
             ref(PA, "s13.t2.on", "y"), ref(PA, "s13.t2.off", "y"), expect = "noise", yards = tmeter, drafts = False,
             requires = {"resumed": True, "same_resume": ref(PA, "s13.t2.off", "y")}),
-        cmp(10, "s13.t2.restart", "turno dopo ripreso dal checkpoint catturato letto dal disco in un processo nuovo, "
+        cmp(13, "s13.t2.restart", "turno dopo ripreso dal checkpoint catturato letto dal disco in un processo nuovo, "
             "contro lo stesso ripreso dalla RAM",
             ref(PB, "s13.t2.restart", "y"), ref(PA, "s13.t2.on", "y"), floor = None,
             requires = {"resumed": True, "same_resume": ref(PA, "s13.t2.on", "y")}),
