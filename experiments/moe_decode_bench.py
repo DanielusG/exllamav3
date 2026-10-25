@@ -405,9 +405,11 @@ class Bench:
         self.mcg, self.mul1 = s["cb"] == 1, s["cb"] == 2
         self.gen = torch.Generator(device = self.dev).manual_seed(cfg["seed"])
         self.layers = [self._experts(self.E, self.Hi, self.I, self.Ho, s["K_gu"], s["K_d"]) for _ in range(cfg["layers"])]
+        # One shared expert per layer copy, as the model has: a single one would stay in the L2
         self.shared = None
         if s.get("sh_I"):
-            self.shared = self._experts(1, self.Hi, s["sh_I"], self.Ho, s["sh_K_gu"], s["sh_K_d"])
+            self.shared = [self._experts(1, self.Hi, s["sh_I"], self.Ho, s["sh_K_gu"], s["sh_K_d"])
+                           for _ in range(cfg["layers"])]
         self.sh_gate_w = (self._randn((self.H,)) * 0.02).half()
         self._buffers()
 
@@ -467,7 +469,7 @@ class Bench:
         self.c_ctr = t.zeros((coop_ctr_len(S, MAX_BSZN, self.I, self.Ho),), dtype = t.int, device = d)
         self.c_out = t.empty((MAX_BSZN, self.H), dtype = t.float, device = d)
         if self.shared is not None:
-            Is = self.shared["I"]
+            Is = self.shared[0]["I"]
             self.s_had_g = t.empty((MAX_BSZN, self.Hi), dtype = t.half, device = d)
             self.s_had_u = t.empty((MAX_BSZN, self.Hi), dtype = t.half, device = d)
             self.s_gu_g = t.empty((MAX_BSZN, Is), dtype = t.half, device = d)
@@ -511,9 +513,9 @@ class Bench:
 
     # ---- the paths
 
-    def coop_shared(self, x):
+    def coop_shared(self, x, layer: int = 0):
         """The shared expert's one-expert launch (run_bszN, sh_coop): its output in s_out[:R]"""
-        sh = self.shared
+        sh = self.shared[layer]
         R = x.shape[0]
         self.ext.exl3_moe_coop(
             x, self.s_sel[:R], self.s_rw[:R], -1, -1, self.Hi,
@@ -555,7 +557,7 @@ class Bench:
     def coop_layer(self, layer: int, inp: dict):
         """Shared launch, then the routed one merging it: one MoE layer of a decode step"""
         if self.shared is not None:
-            self.coop_shared(inp["x"])
+            self.coop_shared(inp["x"], layer)
         return self.coop_routed(layer, inp, True)
 
     def fused_routed(self, layer: int, inp: dict, count_on_device: bool = False):
@@ -623,7 +625,7 @@ class Bench:
                 routed[b] += w * self._mlp_ref(ly, e, xp[b: b + 1], cb)[0, : self.H]
         out = {"routed": routed, "shared": None, "layer": routed.clone()}
         if self.shared is not None:
-            shared = self._mlp_ref(self.shared, 0, xp, self.cfg["shapes"].get("sh_cb", cb))[:, : self.H]
+            shared = self._mlp_ref(self.shared[layer], 0, xp, self.cfg["shapes"].get("sh_cb", cb))[:, : self.H]
             gate = t.sigmoid((x.float() * self.sh_gate_w.float()).sum(1, keepdim = True))
             out["shared"] = shared
             out["layer"] = routed + gate * shared
@@ -801,7 +803,7 @@ def run_child(cfg: dict, setting: str, out_dir: str, torch = None, ext = None, o
                     elif path == "coop_layer":
                         calls.append(lambda inp = inp, layer = layer: bench.coop_layer(layer, inp))
                     elif path == "coop_shared":
-                        calls.append(lambda inp = inp: bench.coop_shared(inp["x"]))
+                        calls.append(lambda inp = inp, layer = layer: bench.coop_shared(inp["x"], layer))
                     else:
                         calls.append(lambda inp = inp, layer = layer: bench.fused_routed(layer, inp, cfg.get("graph", True)))
                 rec = {"kind": "time", "setting": setting, "path": path, "pattern": pattern, "rows": R,
@@ -811,7 +813,7 @@ def run_child(cfg: dict, setting: str, out_dir: str, torch = None, ext = None, o
                     rec["geometry"] = coop_geometry(bench.Hi, bench.I, bench.Ho, R * bench.topk, bench.slots_max,
                                                     True, sms, blackwell, **knobs)
                 if path in ("coop_shared", "coop_layer") and bench.shared is not None:
-                    rec["geometry_shared"] = coop_geometry(bench.Hi, bench.shared["I"], bench.Ho, R, MAX_BSZN,
+                    rec["geometry_shared"] = coop_geometry(bench.Hi, bench.shared[0]["I"], bench.Ho, R, MAX_BSZN,
                                                            True, sms, blackwell, **knobs)
                 try:
                     rec.update(time_calls(torch, device, calls, cfg["iters"], cfg["repeats"], cfg.get("graph", True)))
@@ -1160,7 +1162,10 @@ def child_env(base: dict, setting: str) -> dict:
 def vram_estimate(cfg: dict) -> int:
     s = cfg["shapes"]
     per_expert = (2 * s["Hi"] * s["I"] * s["K_gu"] + s["I"] * s["Ho"] * s["K_d"]) / 8
-    return int(cfg["layers"] * cfg["experts"] * per_expert + 64 * 2 ** 20)
+    shared = 0
+    if s.get("sh_I"):
+        shared = (2 * s["Hi"] * s["sh_I"] * s["sh_K_gu"] + s["sh_I"] * s["Ho"] * s["sh_K_d"]) / 8
+    return int(cfg["layers"] * (cfg["experts"] * per_expert + shared) + 64 * 2 ** 20)
 
 
 def time_estimate(cfg: dict) -> float:
