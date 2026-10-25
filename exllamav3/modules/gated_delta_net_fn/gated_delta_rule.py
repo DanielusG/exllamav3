@@ -95,26 +95,45 @@ def torch_recurrent_kda(q, k, v, g, beta, state):
 _scan_sub_range = int(os.environ.get("EXL3_GDN_SUB_CHUNK", "2048"))
 
 
-def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
+def _scan_ranges(T: int, sub: int, split_at: int | None) -> list:
+    """The sub-ranges _chunked_scan runs: from the start in steps of `sub`, and with a split
+    point, from the start up to it in steps of `sub` and from it to the end in steps of `sub`.
+    The part before the split is then exactly the sub-ranges of a pass that ended there"""
+    if split_at is None:
+        return [(t0, min(t0 + sub, T)) for t0 in range(0, T, sub)]
+    return [(t0, min(t0 + sub, split_at)) for t0 in range(0, split_at, sub)] + \
+           [(t0, min(t0 + sub, T)) for t0 in range(split_at, T, sub)]
+
+
+def _chunked_scan(fn, q, k, v, g, beta, state, save_state, split_at = None, on_split = None):
     """
     fn (chunk_gated_delta_rule / chunk_kda) over one batch row in sub-ranges of the sequence.
     q, k: (1, T, H, K); v: (1, T, HV, V); state: (1, HV, K, V) fp32 or None. Returns the
     concatenated output (1, T, HV, V) in fn's output dtype and the final state (None unless
     save_state)
+
+    split_at, on_split: with 0 < split_at < T, the scan also stops at split_at and hands the
+    fp32 state there, after split_at tokens, to on_split (fork: the recurrent checkpoint in
+    pass, RecurrentCapture). Up to split_at the sub-ranges are those of a pass of split_at
+    tokens, so the state handed over is the final state such a pass would return; the scan
+    then goes on from it unchanged
     """
     T = q.shape[1]
     sub = _scan_sub_range if _scan_sub_range > 0 else T
-    if T <= sub:
+    if split_at is not None and not 0 < split_at < T:
+        split_at = None
+    if T <= sub and split_at is None:
         return fn(q, k, v, g = g, beta = beta, initial_state = state, output_final_state = save_state,
                   use_qk_l2norm_in_kernel = True)
     out = None
-    for t0 in range(0, T, sub):
-        t1 = min(t0 + sub, T)
+    for t0, t1 in _scan_ranges(T, sub, split_at):
         o, state = fn(q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g = g[:, t0:t1], beta = beta[:, t0:t1],
                       initial_state = state, output_final_state = True, use_qk_l2norm_in_kernel = True)
         if out is None:
             out = torch.empty((1, T) + o.shape[2:], dtype = o.dtype, device = o.device)
         out[:, t0:t1] = o
+        if t1 == split_at and on_split is not None:
+            on_split(state)
     return out, state if save_state else None
 
 
@@ -135,7 +154,14 @@ def gated_delta_rule_fn(
     params: dict = None,
     channelwise_g: bool = False,
     slots_in: torch.Tensor | None = None,
+    split_at: int | None = None,
+    on_split = None,
 ):
+    """
+    split_at, on_split: see _chunked_scan (fork: the recurrent checkpoint in pass). Honoured by
+    the chunked scans only, i.e. for passes of num_v_heads tokens or more; a shorter pass never
+    calls on_split
+    """
     if params is None:
         params = {}
 
@@ -172,7 +198,7 @@ def gated_delta_rule_fn(
                 state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
                 core_attn, new_state = _chunked_scan(
                     chunk_kda, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                    state, save_state,
+                    state, save_state, split_at, on_split,
                 )
                 if save_state and state is not None:
                     recurrent_state[so, 0].copy_(new_state.squeeze(0))
@@ -222,7 +248,7 @@ def gated_delta_rule_fn(
             state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                state, save_state,
+                state, save_state, split_at, on_split,
             )
             if save_state and state is not None:
                 recurrent_state[so, 0].copy_(new_state.squeeze(0))

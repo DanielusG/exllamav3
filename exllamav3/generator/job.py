@@ -1759,15 +1759,22 @@ class Job:
                     self.cached_tokens += best_match
                     progress += best_match
 
-            # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+            # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint.
+            # Fork (Generator.recurrent_checkpoint_in_pass): unless the chunk's modules copy their state at the
+            # last page boundary while the pass goes on (cache/recurrent_capture.py): the chunk then runs whole
             recurrent_last_page = False
+            capture = None
             if self.generator.recurrent_cache is not None:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
-                    prefill_end = last_page_b
                     recurrent_last_page = True
-                    prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+                    if last_page_b < prefill_end and self.can_capture_recurrent():
+                        from ..cache.recurrent_capture import RecurrentCapture
+                        capture = RecurrentCapture(last_page_b - prefill_start, last_page_b)
+                    else:
+                        prefill_end = last_page_b
+                        prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1853,6 +1860,8 @@ class Job:
                         # MTP needs the target's post-final-norm state for every prompt token.
                         # Normal prefill stops at the last cache-writing layer, before final norm.
                         params["last_tokens_only"] = 1
+                    if capture is not None:
+                        params["recurrent_capture"] = capture
                     return params
 
                 def draft_update(params):
@@ -1983,7 +1992,10 @@ class Job:
                     seq.prefill_complete = True
 
                 if recurrent_last_page:
-                    self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+                    if capture is not None:
+                        self.stash_captured(self.generator.recurrent_cache, capture)
+                    else:
+                        self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
 
 
         if progress:
@@ -2166,7 +2178,56 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
-    def _stash_with_tail(self, cache, key, interval):
+    def can_capture_recurrent(self) -> bool:
+        """
+        Whether the prompt's last-page checkpoint may be taken inside a chunk that goes past it
+        (Generator.recurrent_checkpoint_in_pass): one sequence, no embeddings (an image span moves
+        the chunk's ends), and a recurrent state on the target side only (a recurrent draft model's
+        side is not captured)
+        """
+        rs = self.recurrent_state
+        return bool(getattr(self.generator, "recurrent_checkpoint_in_pass", False)) and \
+            len(self.sequences) == 1 and not self.embeddings and \
+            rs is not None and rs.target is not None and rs.draft is None
+
+
+    def stash_captured(self, cache, capture):
+        """
+        maybe_stash_recurrent for the prompt's last page when the chunk's modules copied their state there
+        (RecurrentCapture) instead of the chunk ending there: the checkpoint at capture.position, under that
+        page's hash, with what the copies hold. Called by the chunk's record, after its passes. A capture a
+        recurrent layer is missing from is not stashed: the conversation's next turn then resumes from an
+        earlier checkpoint, as when the checkpoint cache has let this one go (counted in
+        Generator.recurrent_capture_stats["incomplete"])
+        """
+        seq = self.sequences[0]
+        gen = self.generator
+        stats = getattr(gen, "recurrent_capture_stats", None)
+        if stats is None:
+            stats = {"captured": 0, "incomplete": 0}
+        pos = capture.position
+        if self.last_recurrent_checkpoint_pos == pos:
+            return
+        state = capture.state(gen.cache, self.recurrent_state.checkpoint_size)
+        if state is None:
+            stats["incomplete"] += 1
+            if not getattr(gen, "_capture_warned", False):
+                gen._capture_warned = True
+                print(f" !! Recurrent checkpoint in pass: a capture at position {pos} lacks a recurrent layer, "
+                      f"no checkpoint taken there (further cases counted, recurrent_capture_stats)", flush = True)
+            return
+        assert pos % PAGE_SIZE == 0 and pos <= seq.kv_position
+        page = seq.allocated_pages[pos // PAGE_SIZE - 1]
+        assert page.kv_position == PAGE_SIZE
+        self.last_recurrent_checkpoint_pos = pos
+        if getattr(gen, "tail_checkpoint_interval", 0) or getattr(self, "tail_checkpoint_key", None):
+            self._stash_with_tail(cache, page.phash, PAGE_SIZE, state = state)
+        else:
+            cache.put(page.phash, state)
+        stats["captured"] += 1
+
+
+    def _stash_with_tail(self, cache, key, interval, state = None):
         """
         maybe_stash_recurrent with the checkpoint that follows a generating job (Generator.tail_checkpoint_interval,
         or a tail checkpoint still outstanding after the switch went off). The checkpoint at this page is such a
@@ -2180,9 +2241,14 @@ class Job:
         the disk tier's copy of it is not this stash's. So a tail checkpoint is not taken over one that is there
         (the one in RAM is touched, as a regular put would), and the prompt's last-page checkpoint is kept track
         of only when this job created it.
+
+        state: what to stash, the job's recurrent state by default (a captured state for the prompt's last page,
+        stash_captured)
         """
         seq = self.sequences[0]
         gen = self.generator
+        if state is None:
+            state = self.recurrent_state
         stats = getattr(gen, "tail_stats", None)
         if stats is None:
             stats = {"stashes": 0, "replaced": 0, "t_stash": 0.0}
@@ -2204,16 +2270,16 @@ class Job:
         if tail:
             if fresh:
                 t0 = time.perf_counter()
-                cache.put(key, self.recurrent_state, tail = True)
+                cache.put(key, state, tail = True)
                 stats["t_stash"] += time.perf_counter() - t0
                 # (not stored at all when larger than the whole budget)
                 if key in cache:
                     self.tail_checkpoint_key = key
                     stats["stashes"] += 1
             elif key in cache:
-                cache.put(key, self.recurrent_state)
+                cache.put(key, state)
         else:
-            cache.put(key, self.recurrent_state)
+            cache.put(key, state)
             # The prompt's last page (the pass prefill makes for it): the checkpoint a tail one may take the
             # place of
             if fresh and interval is not None and self.new_tokens <= 0 and key in cache:

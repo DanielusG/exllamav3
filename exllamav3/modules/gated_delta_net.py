@@ -34,7 +34,7 @@ _conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
 # taking the staging views it does not use (GDNLayerState.staged_shape)
 _host_fastpath = os.environ.get("EXL3_HOST_FASTPATH", "0") not in ("", "0")
 from ..model.model_tp_shared import TPTensorWrapper
-from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
+from .gated_delta_net_fn import causal_conv1d_update, conv_window, gated_delta_rule_fn
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
@@ -532,6 +532,9 @@ class GDNLayerState:
 
 
 class GatedDeltaNet(Module):
+
+    # Fork: copies its state at a page boundary inside a prompt chunk (cache/recurrent_capture.py)
+    captures_recurrent_state = True
 
     def __init__(
         self,
@@ -1289,6 +1292,13 @@ class GatedDeltaNet(Module):
             scan_history = False
             spec_step = None
 
+        # Fork: the recurrent checkpoint in pass (cache/recurrent_capture.py): this layer's state at a
+        # page boundary inside a prompt chunk, copied while the pass goes on. Not in a speculative
+        # pass, and not in a tensor-parallel rank (the generator does not ask for it there)
+        cap = params.get("recurrent_capture") if save_state and not save_history and not rsg[0].exported else None
+        if cap is not None and not (cap.wants(bsz, seqlen) and cap.offset >= self.conv_kernel_size):
+            cap = None
+
         def stage(bsz, seqlen):
             # Staging rows (and their record for the rewind) of this pass
             return rsl.staged_step_views(bsz, spec_step) if spec_step is not None else rsl.staged_views(bsz, seqlen)
@@ -1324,7 +1334,7 @@ class GatedDeltaNet(Module):
             self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
-            not spec_step
+            not spec_step and cap is None
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
@@ -1449,6 +1459,21 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
+        # The conv window at the capture's boundary: the conv_kernel_size inputs before it, as a pass
+        # that ended there stores them (its state kernel writes the inputs, converted, into the window)
+        if cap is not None:
+            cap_conv = conv_window(mixed_qkv, cap.offset, self.conv_kernel_size, conv_token_major,
+                                   torch.empty((self.fdim_qkv, self.conv_kernel_size), dtype = conv_state.dtype,
+                                               device = conv_state.device))
+            cap_scan = []
+
+            def on_split(state):
+                # The scan's fp32 state after the boundary's tokens, stored as the pool stores it
+                # (the copy_ of a pass's final state into its pool row), shaped as a pool row
+                cap_scan.append(state.to(recurrent_state.dtype, copy = True).unsqueeze(1))
+        else:
+            on_split = None
+
         # Convolution
         mixed_qkv = causal_conv1d_update(
             mixed_qkv = mixed_qkv,
@@ -1482,8 +1507,14 @@ class GatedDeltaNet(Module):
             v_head_dim = self.v_head_dim,
             params = params,
             channelwise_g = self.kda,
+            split_at = cap.offset if cap is not None else None,
+            on_split = on_split,
         )
         del mixed_qkv, beta, g
+        # (a pass the chunked scans did not run, shorter than num_v_heads, has no state at the boundary:
+        # the layer is then missing from the capture, and the record takes no checkpoint)
+        if cap is not None and cap_scan:
+            cap.take(rsl, (cap_scan[0], cap_conv))
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)

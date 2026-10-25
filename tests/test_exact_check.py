@@ -393,7 +393,7 @@ def all_refs(plan):
     return out
 
 
-@pytest.mark.parametrize("scenarios", [None, "8", "9", "10", "11", "12"])
+@pytest.mark.parametrize("scenarios", [None, "8", "9", "10", "11", "12", "13"])
 def test_the_plan_refers_only_to_runs_that_come_before(scenarios):
     plan = EC.build_plan(args_for(*(["--scenarios", scenarios] if scenarios else [])))
     seen = set()
@@ -910,6 +910,142 @@ def test_scenario_12_s_rows_need_the_variables_where_they_were_asked_for():
     assert all(r["verdict"] == EC.ERR and "il riferimento non è senza" in r["why"] for r in rows)
 
 
+def test_scenario_13_runs_both_ways_in_one_process_and_resumes_from_disk_in_another():
+    assert 13 not in args_for().scenarios
+    args = args_for("--scenarios", "13")
+    plan = EC.build_plan(args)
+    procs = [(p["name"], p["library"], p["env"]) for p in plan["procs"]]
+    assert procs == [("s13-fork-a", "fork", {"EXL3_DISK_CACHE_UNCACHE": "1"}),
+                     ("s13-fork-b", "fork", {"EXL3_DISK_CACHE_UNCACHE": "1"})]
+    # Every step and comparison is the scenario's own (the report and the estimate group by it)
+    assert {st["scenario"] for p in plan["procs"] for st in p["steps"] if "scenario" in st} == {13}
+    assert {c["scenario"] for c in plan["comparisons"]} == {13}
+    pa, pb = plan["procs"]
+    runs = {st["id"]: st for st in pa["steps"] if st["op"] == "run"}
+    on = lambda rid: bool(runs[rid]["switches"].get("ckpt"))
+    # upstream's cut where the switch is off, the capture where it is on, on every path
+    assert not any(on(r) for r in ("s13.off1", "s13.off2", "s13.c2048", "s13.long.off1", "s13.long.c2048", "s13.t2.off"))
+    assert all(on(r) for r in ("s13.on1", "s13.on2", "s13.thread", "s13.pipe", "s13.long.on", "s13.t2.on", "s13.disk"))
+    assert runs["s13.thread"]["switches"].get("thread") and runs["s13.pipe"]["switches"].get("pipeline")
+    # the turns resumed from the checkpoint their prep run left
+    assert not runs["s13.t2.off"]["forget"] and not runs["s13.t2.on"]["forget"]
+    restart = [st for st in pb["steps"] if st["op"] == "run"]
+    assert [st["id"] for st in restart] == ["s13.t2.restart"] and not restart[0]["forget"]
+    assert pb["steps"][0]["disk"] == "s13" and pb["steps"][0]["switches"] == {"ckpt": True}
+    # every checkpoint a comparison names is kept by a run before the comparison, in the same process
+    ids = [st["id"] for st in pa["steps"]]
+    kept = {st["keep_ckpt"]["tag"]: ids.index(st["id"]) for st in pa["steps"] if st.get("keep_ckpt")}
+    cmp_step = next(st for st in pa["steps"] if st["op"] == "ckpt_cmp")
+    for c in plan["comparisons"]:
+        if c["kind"] == "ckpt":
+            assert c["rec"] == {"proc": "s13-fork-a", "run": cmp_step["id"], "job": ""}
+            for a, b in c["pairs"]:
+                assert [a, b] in cmp_step["pairs"] and max(kept[a], kept[b]) < ids.index(cmp_step["id"])
+    # both documents' last page boundary falls inside their last chunk, not at its end
+    for key, (pages, last) in (("doc/s13/", (args.s13_pages, args.s13_last)), ("doc/s13l/", (args.s13_long_pages, args.s13_long_last))):
+        spec = next(v for k, v in pa["prompts"].items() if k.startswith(key))
+        assert spec["length"] == pages * 256 + last + 1 and (pages * 256) % args.chunk
+    expect = {c["id"]: c.get("expect") for c in plan["comparisons"]}
+    assert expect["s13.on"] == "noise" and expect["s13.long"] == "noise" and expect["s13.t2"] == "noise"
+    assert all(expect[k] == "identical" for k in ("s13.on.rep", "s13.thread", "s13.pipe", "s13.disk", "s13.t2.restart",
+                                                  "s13.ckpt.repeat"))
+    # the switch is scrubbed from every child unless a process asks for it
+    assert "EXL3_RECURRENT_CHECKPOINT_IN_PASS" in EC.FORK_ENV_SWITCHES
+    assert EC.switch_is_off("recurrent_checkpoint_in_pass", False) and not EC.switch_is_off("recurrent_checkpoint_in_pass", True)
+    # a boundary at a chunk's end has nothing to capture
+    with pytest.raises(SystemExit):
+        EC.parse_cli(["--scenarios", "13", "--s13-pages", "48"])
+    with pytest.raises(SystemExit):
+        EC.parse_cli(["--scenarios", "13", "--s13-long-last", "0"])
+
+
+def test_scenario_13_judges_the_checkpoints_and_the_pass_saved():
+    plan = EC.build_plan(args_for("--scenarios", "13"))
+    res = fake_results(plan)
+    recs = res.records["s13-fork-a"]
+    for rid, rec in recs.items():
+        if rec.get("op") == "run":
+            on = rid in ("s13.on1", "s13.on2", "s13.thread", "s13.pipe", "s13.long.on", "s13.t2.on", "s13.disk")
+            rec["stats"]["capture"] = {"captured": 1 if on else 0, "incomplete": 0}
+            for v in rec["jobs"].values():
+                v["prefill"] = [[1.0, 1, 2]] * (3 if on else 4)
+    res.records["s13-fork-b"]["s13.t2.restart"]["stats"]["capture"] = {"captured": 1, "incomplete": 0}
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    assert rows["s13.ckpt.repeat"]["verdict"] == EC.IDENT
+    assert rows["s13.ckpt.capture"]["verdict"] == EC.INFO
+    assert rows["s13.on.rep"]["verdict"] == EC.IDENT and rows["s13.on"]["verdict"] in (EC.IDENT, EC.NOISE)
+    report = EC.render_report(plan, res, {"started": "s", "ended": "e"}, True)
+    assert "## 13. " in report and "| on1 / off1 | GDNLayerState[0] | float16 | 36 | 36 / 36 |" in report
+    assert "`s13.on1` 3 contro `s13.off1` 4" in report
+    # the chunk cut anyway (no pass saved), no capture taken, a checkpoint missing or with other token ids
+    for v in recs["s13.on1"]["jobs"].values():
+        v["prefill"] = [[1.0, 1, 2]] * 4
+    recs["s13.on2"]["stats"]["capture"] = {"captured": 0, "incomplete": 2}
+    cmp_rec = recs["s13.ckpt"]
+    pair = next(pr for pr in cmp_rec["pairs"] if (pr["a"], pr["b"]) == ("long_on", "long_off1"))
+    pair["rows"][1]["identical"] = 0
+    pair["identical"] = False
+    rep = next(pr for pr in cmp_rec["pairs"] if (pr["a"], pr["b"]) == ("pipe", "on1"))
+    rep["rows"][0].update(identical = 35, max_abs = 2 ** -14)
+    rep["identical"] = False
+    rows = {r["id"]: r for r in EC.evaluate_all(plan, res)}
+    r = rows["s13.ckpt.capture"]
+    assert r["verdict"] == EC.FAIL and "attesa una in meno" in r["why"] and "(id dei token) diversi" in r["why"]
+    assert rows["s13.ckpt.repeat"]["verdict"] == EC.DIFF and "pipe / on1: non identici" in rows["s13.ckpt.repeat"]["why"]
+    assert rows["s13.on.rep"]["verdict"] == EC.ERR and "2 catture incomplete" in rows["s13.on.rep"]["why"]
+
+
+def test_the_child_keeps_the_last_page_checkpoint_and_compares_two():
+    from collections import OrderedDict
+
+    # (named as the library's layer states: the child reports by class name)
+    class GDNLayerState:
+        pass
+
+    class PLELayerState:
+        pass
+
+    layers = {(0, 0): GDNLayerState(), (-1, 0): PLELayerState()}
+
+    def stash(pos, scale, ids):
+        return {"position": pos, "checkpoint_size": 1, "target": {
+            "position": pos, "checkpoint_size": 1,
+            (0, 0): (torch.full((1, 1, 2, 3), scale, dtype = torch.half), torch.ones(4, 3, dtype = torch.bfloat16)),
+            (-1, 0): (torch.zeros(4, 6, dtype = torch.half), torch.tensor(ids, dtype = torch.long))}}
+
+    child = CH.Child.__new__(CH.Child)
+    child.torch = torch
+    child.kept = {}
+    child.container = types.SimpleNamespace(cache = types.SimpleNamespace(get_all_recurrent_layers = lambda: layers))
+    rc = OrderedDict()
+    child.gen = types.SimpleNamespace(recurrent_cache = rc)
+    rec = {"jobs": {"x": {"prompt_tokens": 12900}}}
+    # an interval checkpoint before the prompt's last page, the one at it, one in the answer
+    rc[b"\x01" * 16] = stash(12288, 0.5, [1, 2, 3])
+    rc[b"\x02" * 16] = stash(12800, 0.25, [4, 5, 6])
+    rc[b"\x03" * 16] = stash(13056, 0.125, [7, 8, 9])
+    out = child.keep_checkpoint({"tag": "off", "job": "x"}, rec)
+    assert out["found"] and out["position"] == 12800 and out["layers"] == 2 and out["key"] == "02" * 8
+    # the kept copy is the child's own: the cache may let its stash go
+    rc[b"\x02" * 16]["target"][(0, 0)][0].fill_(9.0)
+    assert float(child.kept["off"]["layers"][(0, 0)][0].max()) == 0.25
+    rc.clear()
+    rc[b"\x02" * 16] = stash(12800, 0.25 + 2 ** -10, [4, 5, 6])
+    child.keep_checkpoint({"tag": "on", "job": "x"}, rec)
+    rc[b"\x02" * 16] = stash(12800, 0.25, [4, 5, 6])
+    child.keep_checkpoint({"tag": "rep", "job": "x"}, rec)
+    rc.clear()
+    assert child.keep_checkpoint({"tag": "none", "job": "x"}, rec)["found"] is False
+    cmp_rec = child.ckpt_cmp({"id": "c", "scenario": 13, "pairs": [["rep", "off"], ["on", "off"], ["none", "off"]]})
+    same, close, missing = cmp_rec["pairs"]
+    assert same["identical"] and same["position"] == [12800, 12800] and same["same_key"]
+    assert not close["identical"] and close["same_layers"]
+    by = {(r["kind"], r["index"]): r for r in close["rows"]}
+    assert by[("GDNLayerState", 0)]["identical"] == 0 and by[("GDNLayerState", 0)]["max_abs"] == pytest.approx(2 ** -10)
+    assert by[("GDNLayerState", 1)]["identical"] == 1 and by[("PLELayerState", 1)]["dtype"] == "int64"
+    assert missing["missing"] == ["none"]
+
+
 def test_the_exact_environment_of_the_children():
     args = args_for("--env", "EXL3_HOST_MEM_RESERVE_MB=1024")
     base = {"PATH": "/bin", "EXL3_STAGGER_DECODE": "1", "EXL3_MOE_CPU_SPLIT_STATS": "/x", "PYTHONPATH": "/somewhere"}
@@ -1041,6 +1177,14 @@ def fake_results(plan, *, differ = (), missing = ()):
                 recs[st["id"]] = {"op": "stress", "id": st["id"], "ok": True,
                                   "stress": {"drained": True, "exceptions": [], "job_errors": 0, "max_step_s": 2.0, "step_limit": 60,
                                              "jobs": 40, "kinds": {"short": 30, "doc": 6, "turn": 4}}}
+            elif st["op"] == "ckpt_cmp":
+                rows = [{"kind": "GDNLayerState", "index": 0, "tensors": 36, "identical": 36, "shape_dtype": True,
+                         "max_abs": 0.0, "max_ref": 3.5, "dtype": "float16", "numel": 100},
+                        {"kind": "PLELayerState", "index": 1, "tensors": 1, "identical": 1, "shape_dtype": True,
+                         "max_abs": 0.0, "max_ref": 0.0, "dtype": "int64", "numel": 3}]
+                recs[st["id"]] = {"op": "ckpt_cmp", "id": st["id"], "ok": True,
+                                  "pairs": [{"a": a, "b": b, "position": [12800, 12800], "same_key": True, "same_layers": True,
+                                             "rows": [dict(r) for r in rows], "identical": True} for a, b in st["pairs"]]}
             elif st["op"] in ("close", "reset_hist"):
                 recs[st["id"]] = {"op": st["op"], "id": st["id"], "ok": True}
         res.records[p["name"]] = recs

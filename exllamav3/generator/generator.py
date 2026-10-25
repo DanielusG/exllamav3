@@ -83,6 +83,7 @@ class Generator:
     # can be added to one shared by every such generator
     stagger_decode = False
     prefill_thread = False
+    recurrent_checkpoint_in_pass = False
     mtp_batched_verify = False
     mtp_batched_update = False
     draft_window = "fixed"
@@ -137,6 +138,7 @@ class Generator:
         draft_window: str = "fixed",
         draft_window_set: list[int] | str | None = None,
         mm_content_hash: bool = False,
+        recurrent_checkpoint_in_pass: bool = False,
         **kwargs
     ):
         """
@@ -382,6 +384,22 @@ class Generator:
             queued after it, and what was hashed the other way is not found again (a cache miss, never
             a page reused for other content). EXL3_MM_CONTENT_HASH=1 in the environment turns it on for
             callers that do not pass the argument, digests included. Default False
+
+        :param recurrent_checkpoint_in_pass:
+            Take the checkpoint at a prompt's last page boundary inside the chunk that goes past it,
+            instead of ending the chunk there and ingesting the tokens after it in a pass of their own:
+            every module with recurrent state copies its state at the boundary while the pass goes on
+            (cache/recurrent_capture.py), and the chunk's record stashes the copies, in the format of a
+            regular stash. The checkpoint is the one the shorter pass would have left for the same inputs;
+            the tokens after it are computed as part of a longer chunk (as with another max_chunk_size).
+            Costs a copy of the state on the device for the length of the chunk (the size of a checkpoint)
+            and one more stop of the GDN scan and of a PLE layer's row slabs. Not with tensor parallelism,
+            a recurrent draft model or a recurrent module that does not copy its state
+            (captures_recurrent_state); a job with embeddings ends its chunk there as before.
+            recurrent_checkpoint_in_pass_reason says why it is off, recurrent_capture_stats counts the
+            checkpoints taken this way ("captured") and the captures a layer was missing from, which take
+            none ("incomplete"). EXL3_RECURRENT_CHECKPOINT_IN_PASS=1 in the environment turns it on for
+            callers that do not pass the argument. Default False
 
         :param kwargs:
         """
@@ -666,6 +684,25 @@ class Generator:
         # write candidate or a queued write withdrawn, a written copy removed, a write under way left
         self.tail_stats = {"stashes": 0, "replaced": 0, "t_stash": 0.0,
                            "disk_withdrawn": 0, "disk_dropped": 0, "disk_left": 0}
+
+        # The prompt's last-page checkpoint taken inside the chunk that goes past it (Job.can_capture_recurrent,
+        # Job.stash_captured). Read at every chunk's plan, so it can be switched while jobs run
+        if not recurrent_checkpoint_in_pass:
+            recurrent_checkpoint_in_pass = \
+                os.environ.get("EXL3_RECURRENT_CHECKPOINT_IN_PASS", "0").strip() not in ("", "0")
+        self.recurrent_checkpoint_in_pass = False
+        self.recurrent_checkpoint_in_pass_reason = None
+        self.recurrent_capture_stats = {"captured": 0, "incomplete": 0}
+        self._capture_warned = False
+        if recurrent_checkpoint_in_pass:
+            why = self._capture_unavailable()
+            if why is None:
+                self.recurrent_checkpoint_in_pass = True
+                print(" -- Recurrent checkpoint in pass: on (a prompt's last-page checkpoint is taken inside "
+                      "the chunk that goes past it)", flush = True)
+            else:
+                self.recurrent_checkpoint_in_pass_reason = why
+                print(f" !! Recurrent checkpoint in pass not available: {why}", flush = True)
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -1308,6 +1345,21 @@ class Generator:
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
         malloc_trim()
+
+
+    def _capture_unavailable(self) -> str | None:
+        """Why the recurrent checkpoint in pass cannot be on for this generator, None when it can"""
+        if self.recurrent_cache is None:
+            return "the model keeps no recurrent state, or the recurrent cache is off"
+        if getattr(self.model, "loaded_tp", False):
+            return "tensor parallelism (the recurrent states live in the rank processes)"
+        if self.draft_recurrent:
+            return "the draft model keeps recurrent state of its own"
+        missing = sorted({type(m).__name__ for m in self.model.get_recurrent_layers()
+                          if not getattr(m, "captures_recurrent_state", False)})
+        if missing:
+            return f"recurrent modules that do not copy their state: {', '.join(missing)}"
+        return None
 
 
     def recurrent_checkpoint(self):

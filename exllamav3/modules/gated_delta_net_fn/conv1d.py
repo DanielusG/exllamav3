@@ -393,6 +393,26 @@ def causal_conv1d_update_function_torch(
     return y
 
 
+def conv_window(
+    mixed_qkv: torch.Tensor,
+    end: int,
+    conv_kernel_size: int,
+    token_major: bool,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """
+    The conv_kernel_size inputs of batch row 0 before position `end`, channel-major (dim,
+    conv_kernel_size), copied into out (and converted to its dtype): what causal_conv1d_update
+    leaves in a slot's window after a pass that ends at `end`, its state write storing the inputs
+    (fork: the recurrent checkpoint in pass, cache/recurrent_capture.py). end >= conv_kernel_size.
+    mixed_qkv as causal_conv1d_update takes it: (bsz, seqlen, dim) token-major or (bsz, dim, seqlen)
+    """
+    assert conv_kernel_size <= end
+    w = mixed_qkv[0, end - conv_kernel_size : end, :].transpose(0, 1) if token_major else \
+        mixed_qkv[0, :, end - conv_kernel_size : end]
+    return out.copy_(w)
+
+
 def causal_conv1d_update(
     mixed_qkv: torch.Tensor,
     conv_state: torch.Tensor,
