@@ -44,6 +44,10 @@ Scenarios (--scenarios):
      long prompt beside two jobs with the switch off and on (memory per card)
  11  (on request) the decode step's host fast path (EXL3_HOST_FASTPATH, read at import): scenario 9's
      production generator and the fixed window in two processes that differ in the switch only
+  12 (on request) the decode MoE kernels under another environment (--s12-env, default
+     EXL3_MOE_COOP_WIDE=1, the coop launcher's wide tile): the same forced decode runs, a job alone
+     and two in one batch with W=3 and W=1 drafts (2 to 8 rows), in a process without and one with
+     the variables, judged within the noise of the shape and batch meters
 
 Run it with the production server STOPPED (it needs the cards), with the Python of the
 environment that has the wheel of BASE_RELEASE, from any directory (FORK.md, "The overnight exact
@@ -487,6 +491,7 @@ SCENARIO_TITLES = {
     9: "La combinazione di produzione: MTP a più bozze, verifica e aggiornamento in un colpo, finestra a costo, anello",
     10: "Più esperti in streaming nei pezzi di prompt accanto al decode",
     11: "Il lavoro dell'host del passo di decode tenuto fra le chiamate (EXL3_HOST_FASTPATH)",
+    12: "Il kernel MoE del decode con un'altra variabile d'ambiente",
 }
 
 
@@ -1001,8 +1006,104 @@ def build_plan(args) -> dict:
     # ---------------------------------------------------------------- scenario 11
     if 11 in sc:
         s11_plan(args, procs, comps)
+    # ---------------------------------------------------------------- scenario 12
+    if 12 in sc:
+        s12_plan(args, procs, comps)
 
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
+
+
+# The variables scenario 12 may not change: the exact mode's (EXACT_ENV) and what the child sets
+# for every process (child_env)
+S12_FIXED = tuple(EXACT_ENV) + ("EXL3_MOE_CPU_SLOTS", "EXL3_MOE_CPU_PROMOTE", "EXL3_MOE_HOST_CORES")
+
+
+def parse_env_assignments(text: str) -> dict:
+    """ "A=1,B=2" -> {"A": "1", "B": "2"}: EXL3_ variables only, none of S12_FIXED"""
+    out = {}
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        k, eq, v = item.partition("=")
+        k = k.strip()
+        if not eq or not re.fullmatch(r"EXL3_[A-Z0-9_]+", k):
+            raise ValueError(f"assegnamento non valido: {item!r} (EXL3_NOME=VALORE)")
+        if k in S12_FIXED:
+            raise ValueError(f"{k} è fissato per ogni processo del controllo, lo scenario 12 non lo cambia")
+        out[k] = v.strip()
+    if not out:
+        raise ValueError("nessuna variabile")
+    return out
+
+
+S12_JOBS = {"a": "a", "ab": "ab"}
+S12_MAX_ROWS = 8            # BlockSparseMLP.MAX_BSZN: the decode-size path the variables act on
+
+
+def s12_plan(args, procs: list, comps: list):
+    """
+    Scenario 12: the decode MoE kernels under another environment (args.s12_env, default
+    EXL3_MOE_COOP_WIDE=1: the coop launcher's wide tile for every stage, which the extension reads
+    once per process). Two fork processes, `base` without the variables and `test` with them, the
+    same forced decode runs in each: a job alone and two jobs in one batch, with the MTP head
+    drafting W = args.s12_window (fixed) and W = 1 on the same caches, i.e. 1 + W rows per job:
+    with the default W = 3, 4 and 8 rows, and 2 and 4 with W = 1, every one on the decode-size
+    path (BlockSparseMLP's MAX_BSZN, 8 rows) the variables act on. No switch of the fork, no prompt
+    beside the decode: the decode alone. A different tile adds a row's products in another order,
+    so the logits are expected within the noise, not identical: judged against the bigger of two
+    differences upstream itself shows when a step's rows change, both in `base` (the shape meter:
+    the same forced tokens with W fixed against W = 1, scenario 9's; and the batch meter: `a` alone
+    against `a` beside `b`). Each run twice in `base`, the floor. The test process must have the
+    variables and the base one none of them, else the rows are errors.
+    """
+    PB, PT = "s12-fork-base", "s12-fork-test"
+    env = parse_env_assignments(args.s12_env)
+    W = args.s12_window
+    T = args.s12_tokens
+    gens = {f"w{W}": {}, "w1": {"draft_tokens": 1}} if W != 1 else {"w1": {}}
+    first = next(iter(gens))
+    forced = lambda wl: [jobspec(x, q(i), forced = ref(PB, f"s12.free.{x}", x)) for i, x in enumerate(S12_JOBS[wl])]
+
+    def process(name: str, penv: dict) -> Proc:
+        p = Proc(name, "fork", [12], env = penv, server_args = ["--draft-num-tokens", str(W)])
+        for g, sw in gens.items():
+            p.add(gen_step(f"g.{g}", 12, switches = sw))
+            if g == first:
+                p.add(run_step("s12.warm.a", 12, [jobspec("a", q(0), args.warmup_tokens)], warmup = True))
+                p.add(run_step("s12.warm.ab", 12, [jobspec(x, q(i), args.warmup_tokens) for i, x in enumerate("ab")],
+                               warmup = True))
+                if name == PB:
+                    for i, x in enumerate("ab"):
+                        p.add(run_step(f"s12.free.{x}", 12, [jobspec(x, q(i), T)]))
+            for wl in S12_JOBS:
+                for k in (1, 2):
+                    p.add(run_step(f"s12.{g}.{wl}.ref{k}", 12, forced(wl)))
+        p.prompts = prompt_specs(p.steps, {})
+        return p
+
+    procs.append(process(PB, {}))
+    procs.append(process(PT, dict(env)))
+    need = {"env": {"proc": PT, "vars": dict(env)}, "env_absent": {"proc": PB, "vars": sorted(env)}}
+    other = [g for g in gens if g != first]
+    for g in gens:
+        rows = {"a": 1 + (W if g == first else 1)}
+        for wl, jobs in S12_JOBS.items():
+            n_rows = len(jobs) * rows["a"]
+            for x in jobs:
+                yards = []
+                if other:
+                    yards.append((ref(PB, f"s12.{first}.{wl}.ref1", x), ref(PB, f"s12.{other[0]}.{wl}.ref1", x)))
+                if x == "a":
+                    yards.append((ref(PB, f"s12.{g}.a.ref1", "a"), ref(PB, f"s12.{g}.ab.ref1", "a")))
+                where = "da solo" if wl == "a" else "nel batch di due"
+                comps.append(cmp(12, f"s12.{g}.{wl}.{x}",
+                                 f"`{x}` {where}, W={rows['a'] - 1} ({n_rows} righe): con le variabili contro senza",
+                                 ref(PT, f"s12.{g}.{wl}.ref1", x), ref(PB, f"s12.{g}.{wl}.ref1", x),
+                                 expect = "noise", floor = (ref(PB, f"s12.{g}.{wl}.ref1", x), ref(PB, f"s12.{g}.{wl}.ref2", x)),
+                                 yards = yards, drafts = False, requires = need))
+    comps.append({"kind": "same_placement", "scenario": 12, "id": "s12.placement", "procs": [PB, PT]})
+    comps.append({"kind": "library", "scenario": 12, "id": "s12.library", "procs": {PB: "fork", PT: "fork"}})
 
 
 def parse_windows_list(text: str) -> list:
@@ -1812,6 +1913,17 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
         taken = sorted(int(k[1:]) for k, v in window.items() if k.startswith("w") and k[1:].isdigit() and v)
         if len(taken) < 2:
             out.append(f"una sola finestra presa ({taken}): le forme non sono cambiate")
+    # Scenario 12: the variables in the environment of the processes (the child's start record)
+    if req.get("env"):
+        got = (res.meta.get(req["env"]["proc"]) or {}).get("env") or {}
+        miss = [f"{k}={v}" for k, v in req["env"]["vars"].items() if got.get(k) != v]
+        if miss:
+            out.append(f"`{req['env']['proc']}` non aveva {', '.join(miss)} nell'ambiente (la prova confronta la stessa cosa)")
+    if req.get("env_absent"):
+        got = (res.meta.get(req["env_absent"]["proc"]) or {}).get("env") or {}
+        extra = [f"{k}={got[k]}" for k in req["env_absent"]["vars"] if k in got]
+        if extra:
+            out.append(f"`{req['env_absent']['proc']}` aveva {', '.join(extra)} nell'ambiente (il riferimento non è senza)")
     j = job_view(rec, job) or {}
     if req.get("resumed") and not j.get("cached_tokens"):
         out.append("nessun token ripreso dalla cache")
@@ -2490,6 +2602,17 @@ SCENARIO_TEXT = {
         "un passaggio della testa per job). Il carico dello scenario 9; i giri imposti prendono i token da `s3` libero "
         "del processo senza la via veloce. Atteso **identico** dappertutto, giri liberi e imposti. Il metro è il processo "
         "senza la via veloce ripetuto.",
+    12: "Due processi del fork senza interruttori: `s12-fork-base` senza variabili e `s12-fork-test` con quelle di "
+        "`--s12-env` (default `EXL3_MOE_COOP_WIDE=1`: la tile larga, 128 colonne e 4 x 4 warp, in ogni stadio dei kernel "
+        "MoE del decode; l'estensione legge la variabile una volta per processo). Gli stessi giri imposti in tutti e due: "
+        "`a` da solo e `a`/`b` in un batch, con la testa MTP che bozza W token fisso e W=1 sulle stesse cache (1 + W righe "
+        "per job: con W=3 4 e 8 righe, con W=1 2 e 4, tutte nel percorso del decode fino a 8 righe, quello su cui le "
+        "variabili agiscono). I token imposti vengono dai giri liberi di `a` e `b` da soli in `base`. Un'altra tile somma "
+        "i prodotti di una riga in un altro ordine: atteso **entro il rumore**, non identico, contro la più grande di due "
+        "differenze che upstream stesso mostra quando cambiano le righe di un passo, tutte e due in `base`: il metro delle "
+        "forme (gli stessi token con W fisso contro W=1, quello dello scenario 9) e il metro del batch (`a` da solo contro "
+        "`a` accanto a `b`). Ogni giro due volte in `base`: il pavimento. Errore se il processo di prova non aveva le "
+        "variabili o quello di riferimento ne aveva qualcuna.",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -3513,8 +3636,9 @@ def parse_cli(argv: list | None = None):
                       "sul modello di produzione, a server fermo. Rapporto in REPORT.md nella cartella del giro.")
     ap.add_argument("--scenarios", default = "1,2,3,4,5,6,7",
                     help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; a richiesta l'8, l'anello delle chiavi grezze "
-                           "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, e il 10, più esperti "
-                           "in streaming nei pezzi di prompt accanto al decode)")
+                           "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, il 10, più esperti "
+                           "in streaming nei pezzi di prompt accanto al decode, l'11, il lavoro dell'host del passo di "
+                           "decode tenuto fra le chiamate, e il 12, i kernel MoE del decode con le variabili di --s12-env)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -3579,6 +3703,12 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--s10-decoders", type = int_list, default = [1, 2], help = "job che generano accanto al documento nello scenario 10")
     ap.add_argument("--s10-long", type = int, default = 131073,
                     help = "token del prompt lungo dello scenario 10, accanto a 2 job (0 = niente: il giro c'è per la memoria)")
+    ap.add_argument("--s12-env", default = "EXL3_MOE_COOP_WIDE=1",
+                    help = "variabili del processo di prova dello scenario 12, VAR=VALORE separate da virgole "
+                           "(default EXL3_MOE_COOP_WIDE=1, la tile larga dei kernel MoE del decode)")
+    ap.add_argument("--s12-window", type = int, default = 3,
+                    help = "bozze MTP dello scenario 12 (--draft-num-tokens, W fisso; anche W=1 sulle stesse cache)")
+    ap.add_argument("--s12-tokens", type = int, default = 192, help = "token imposti per job nello scenario 12")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)
@@ -3616,6 +3746,13 @@ def parse_cli(argv: list | None = None):
         ap.error("--chunk: multiplo di 256")
     if args.s9_window < 1 or any(max(m) > args.s9_window for m in args.s9_mixed):
         ap.error("--s9-window: almeno 1, e i programmi di --s9-mixed non oltre")
+    try:
+        parse_env_assignments(args.s12_env)
+    except ValueError as e:
+        ap.error(f"--s12-env: {e}")
+    if args.s12_window < 1 or len(S12_JOBS["ab"]) * (1 + args.s12_window) > S12_MAX_ROWS:
+        ap.error(f"--s12-window: da 1 a {S12_MAX_ROWS // 2 - 1} (due job di 1 + W righe nel percorso del decode, "
+                 f"{S12_MAX_ROWS} righe al più)")
     return args
 
 
