@@ -935,7 +935,7 @@ offer beside a group in flight and a chunk under way; the switch). Marked `nogpu
 Off by default; with it off the generator behaves as upstream. The prompt's last page (branch
 `ckpt-in-pass`, the first case) is in `master` and in production since 2026-10-25; the same copy at
 the end of a chunk's passes, which lets the pipeline plan across the interval checkpoints (branch
-`ckpt-intervals`, below), is not merged.
+`ckpt-intervals`, below), is in `master` and in production since the evening of the same day.
 
 **What upstream does.** A recurrent checkpoint is a copy of the state at a page boundary, and a
 layer's state is whole only where a pass ends. So `Job._prefill_co` ends a chunk at the prompt's
@@ -1014,6 +1014,18 @@ record is the same). A copy a recurrent layer did not take loses that checkpoint
 was planned across it (`incomplete`); with GDN and PLE it does not happen (the copy does not depend on
 the pass's path). The prompt's last page is still a position the pipeline does not plan past when a
 chunk ends exactly there (the tokens after it are then a pass of under a page).
+
+On the cards (2026-10-25 evening, production stopped, the branch from a files-only copy, production's
+device split, cache size and checkpoint interval, the raw-key ring): scenario 14 identical bit for bit
+everywhere, the forced answer in flight against in line with the switch on (64 positions) and off, and
+the checkpoints at 32768, 40960 (copied at the chunk's end in flight) and at the last page, 36 of 36
+GDN states and the PLE state each; 10 chunks of the document planned ahead of the record of the one
+before them against 8 without the copies (the document and its answer in 24.4 s against 26.6, one
+sample in exact mode, not a speed measure). Scenario 13 run again on the branch, its run in flight now
+crossing an interval checkpoint too: as before (the capture against the cut within the noise, 0.142
+against a meter of 0.134 and 0.169 against 0.465; the capture repeated, on the thread, in flight and
+with the disk tier identical, checkpoints included). Merged into `master` and in production the same
+evening, on the user's verdict.
 
 **Cost.** Per prompt: the copies, on the cards, held from each layer's pass to the record: the
 checkpoint's size, 57 MiB on Flash-Next in fp16, spread over the cards by layer (with production's
