@@ -127,6 +127,9 @@ _ple_sub_range = int(os.environ.get("EXL3_PLE_SUB_CHUNK", "1024"))
 
 class PLELayer(Module):
 
+    # Fork: copies its state at a page boundary inside a prompt chunk (cache/recurrent_capture.py)
+    captures_recurrent_state = True
+
     def __init__(
         self,
         config: Config | None,
@@ -367,6 +370,8 @@ class PLELayer(Module):
         token_history: torch.Tensor,
         params: dict,
         conv_state: torch.Tensor | None = None,
+        split_at: int | None = None,
+        on_split = None,
     ):
         """
         streams: (bsz, seq, hc_mult, hidden) fp32 residual stack;
@@ -376,7 +381,14 @@ class PLELayer(Module):
         stream — see _short_conv). The layer sits at the front of the forward pass and was
         host-bound issued op-by-op from python; the whole sequence runs as one ext call
         (ple_forward_streams), with the op-by-op form kept below as the reference.
+
+        split_at, on_split: with 0 < split_at < seq (one sequence), on_split gets the conv state
+        after split_at positions, (bsz, hc_hidden, conv_state_len), as a pass of split_at positions
+        would leave it (fork: the recurrent checkpoint in pass, RecurrentCapture). The fast path
+        ends a row slab there, so the slabs up to it are those of such a pass
         """
+        if split_at is not None and not (streams.shape[0] == 1 and 0 < split_at < streams.shape[1]):
+            split_at = None
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
@@ -393,7 +405,11 @@ class PLELayer(Module):
             # returned conv stream is the last slab's: its trailing columns are all the caller
             # keeps (state and history writes)
             sub = _ple_sub_range if _ple_sub_range > 0 else seq
-            slabs = [(0, seq)] if bsz > 1 or seq <= sub else [(t0, min(t0 + sub, seq)) for t0 in range(0, seq, sub)]
+            if split_at is not None:
+                slabs = [(t0, min(t0 + sub, split_at)) for t0 in range(0, split_at, sub)] + \
+                        [(t0, min(t0 + sub, seq)) for t0 in range(split_at, seq, sub)]
+            else:
+                slabs = [(0, seq)] if bsz > 1 or seq <= sub else [(t0, min(t0 + sub, seq)) for t0 in range(0, seq, sub)]
             cs = conv_state.contiguous() if conv_state is not None else None
             delta = None
             for t0, t1 in slabs:
@@ -412,8 +428,15 @@ class PLELayer(Module):
                 )
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
+                if t1 == split_at and on_split is not None:
+                    on_split(cs.clone())
             return None, conv_stream
-        return self.forward_streams_reference(streams, emb, params, conv_state)
+        delta, conv_stream = self.forward_streams_reference(streams, emb, params, conv_state)
+        if split_at is not None and on_split is not None:
+            # The column stream holds the conv_state_len positions before each one: before split_at
+            # are its columns [split_at, split_at + conv_state_len)
+            on_split(conv_stream[:, :, split_at : split_at + self.conv_state_len].clone())
+        return delta, conv_stream
 
     def forward_streams_reference(self, streams, emb, params, conv_state = None):
         """Op-by-op form of forward_streams (torch + individual ext kernels)."""
@@ -513,7 +536,22 @@ class PLELayer(Module):
         if rsl is not None:
             conv_state, id_state = rsl.get_state_tensors()
             cs = torch.stack([conv_state[s, :, :win] for s in slots]).to(x.device)
-            delta, conv_stream = self.forward_streams(x, history, params, conv_state = cs)
+            # Fork: the recurrent checkpoint in pass (cache/recurrent_capture.py): this layer's state
+            # at a page boundary inside a prompt chunk, the conv window and the token-id context there
+            cap = params.get("recurrent_capture") if not save_history else None
+            if cap is not None and not cap.wants(bsz, seq):
+                cap = None
+            cap_conv = []
+            delta, conv_stream = self.forward_streams(
+                x, history, params, conv_state = cs,
+                split_at = cap.offset if cap is not None else None,
+                on_split = cap_conv.append,
+            )
+            if cap is not None and cap_conv:
+                # In the pool's dtypes, as the copy_ into the state rows below stores them
+                c = cap.offset
+                cap.take(rsl, (cap_conv[0][0].to(conv_state.dtype),
+                               history[0, c : c + ctx].to(id_state.dtype, copy = True)))
             for i, s in enumerate(slots):
                 if save_history:
                     w = min(conv_state.shape[-1], conv_stream.shape[-1])
