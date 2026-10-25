@@ -127,6 +127,7 @@ FORK_ENV_SWITCHES = (
     "EXL3_DRAFT_WINDOW", "EXL3_DRAFT_WINDOW_SET", "EXL3_DRAFT_WINDOW_SCHEDULE", "EXL3_MM_CONTENT_HASH",
     "EXL3_MOE_STREAM_T_BESIDE",
     "EXL3_HOST_FASTPATH",
+    "EXL3_RECURRENT_CHECKPOINT_IN_PASS",
 )
 
 PROMPTS = [
@@ -421,12 +422,17 @@ def jobspec(name: str, prompt: str, max_new: int | None = None, forced: dict | N
 
 def run_step(rid: str, scenario: int, jobs: list, *, forget: bool = True, switches: dict | None = None,
              until: dict | None = None, cancel: list | None = None, after_cancel: dict | None = None,
-             warmup: bool = False, disk_at_first_token: bool = False) -> dict:
-    return {
+             warmup: bool = False, disk_at_first_token: bool = False, keep_ckpt: dict | None = None) -> dict:
+    """keep_ckpt: {"tag", "job"}, the child keeps a host copy of the checkpoint at the last page boundary
+    of that job's prompt after the run, for a later ckpt_cmp step"""
+    st = {
         "op": "run", "id": rid, "scenario": scenario, "jobs": jobs, "forget": forget,
         "switches": switches or {}, "until": until, "cancel": cancel or [], "after_cancel": after_cancel,
         "warmup": warmup, "disk_at_first_token": disk_at_first_token,
     }
+    if keep_ckpt:
+        st["keep_ckpt"] = dict(keep_ckpt)
+    return st
 
 
 def gen_step(gid: str, scenario: int, switches: dict | None = None, disk: str | None = None,
@@ -492,6 +498,7 @@ SCENARIO_TITLES = {
     10: "Più esperti in streaming nei pezzi di prompt accanto al decode",
     11: "Il lavoro dell'host del passo di decode tenuto fra le chiamate (EXL3_HOST_FASTPATH)",
     12: "Il kernel MoE del decode con un'altra variabile d'ambiente",
+    13: "Checkpoint ricorrente dell'ultima pagina preso dentro la passata",
 }
 
 
@@ -1009,6 +1016,9 @@ def build_plan(args) -> dict:
     # ---------------------------------------------------------------- scenario 12
     if 12 in sc:
         s12_plan(args, procs, comps)
+    # ---------------------------------------------------------------- scenario 13
+    if 13 in sc:
+        s13_plan(args, procs, comps)
 
     return {"procs": [pr.as_dict() for pr in procs], "comparisons": comps, "scenarios": sorted(sc)}
 
@@ -1104,6 +1114,133 @@ def s12_plan(args, procs: list, comps: list):
                                  yards = yards, drafts = False, requires = need))
     comps.append({"kind": "same_placement", "scenario": 12, "id": "s12.placement", "procs": [PB, PT]})
     comps.append({"kind": "library", "scenario": 12, "id": "s12.library", "procs": {PB: "fork", PT: "fork"}})
+
+
+def s13_plan(args, procs: list, comps: list):
+    """
+    Scenario 13: the prompt's last-page recurrent checkpoint taken inside the pass
+    (Generator.recurrent_checkpoint_in_pass, cache/recurrent_capture.py) against the one taken after the
+    pass that ends there (upstream: the chunk is cut at the boundary). Two documents whose last page
+    boundary falls inside their last chunk (512 and 3840 tokens into it by default), their forced answers,
+    the checkpoints themselves tensor by tensor, the same with the prefill thread and the pipeline (the
+    copies are made on another thread's lanes there), the next turn resumed from each checkpoint, and from
+    the captured one read back from the disk tier by a second process.
+    """
+    PA, PB = "s13-fork-a", "s13-fork-b"
+    W = args.warmup_tokens
+    on = {"ckpt": True}
+    p13 = doc("s13", doc_length(args.s13_last, args.s13_pages), 2)
+    p13l = doc("s13l", doc_length(args.s13_long_last, args.s13_long_pages), 2)
+    turn_key = "turn/s13"
+    A = ref(PA, "s13.free", "x")
+    AL = ref(PA, "s13.long.free", "x")
+    B = ref(PA, "s13.t2.full.free", "y")
+    turn_spec = {"kind": "turn", "base": p13, "answer": A, "suffix": TURN_SUFFIX}
+    keep = lambda tag: {"tag": tag, "job": "x"}
+    fx = lambda: jobspec("x", p13, forced = A)
+    p = Proc(PA, "fork", [13], env = {"EXL3_DISK_CACHE_UNCACHE": "1"})
+    p.add(gen_step("g0", 13))
+    p.add(run_step("s13.warm.1", 10, [jobspec("a", q(0), W)], warmup = True))
+    p.add(run_step("s13.warm.r", 10, [jobspec("x", doc("s13w", doc_length(64, 8), 2), 8)], warmup = True))
+    # The first document: upstream's cut (twice: the floor), the capture (twice), a chunk of 2048 (the meter),
+    # the capture on the prefill thread and with two chunks in flight
+    p.add(run_step("s13.free", 10, [jobspec("x", p13, args.s13_answer)]))
+    for k in (1, 2):
+        p.add(run_step(f"s13.off{k}", 10, [fx()], keep_ckpt = keep(f"off{k}")))
+    for k in (1, 2):
+        p.add(run_step(f"s13.on{k}", 10, [fx()], switches = on, keep_ckpt = keep(f"on{k}")))
+    p.add(run_step("s13.c2048", 10, [fx()], switches = {"chunk": 2048}))
+    p.add(run_step("s13.thread", 10, [fx()], switches = {"ckpt": True, "thread": True}, keep_ckpt = keep("thread")))
+    p.add(run_step("s13.pipe", 10, [fx()], switches = {"ckpt": True, "pipeline": True}, keep_ckpt = keep("pipe")))
+    # The second document: the boundary deep in the last chunk
+    p.add(run_step("s13.long.free", 10, [jobspec("x", p13l, args.s13_long_answer)]))
+    for k in (1, 2):
+        p.add(run_step(f"s13.long.off{k}", 10, [jobspec("x", p13l, forced = AL)], keep_ckpt = keep(f"long_off{k}")))
+    p.add(run_step("s13.long.on", 10, [jobspec("x", p13l, forced = AL)], switches = on, keep_ckpt = keep("long_on")))
+    p.add(run_step("s13.long.c2048", 10, [jobspec("x", p13l, forced = AL)], switches = {"chunk": 2048}))
+    # The next turn: from its first token (the reference, repeated, and with chunks of 2048), resumed from
+    # upstream's checkpoint and from the captured one
+    p.add(run_step("s13.t2.full.free", 10, [jobspec("y", turn_key, args.s13_next)]))
+    p.add(run_step("s13.t2.full.ref2", 10, [jobspec("y", turn_key, forced = B)]))
+    p.add(run_step("s13.t2.full.c2048", 10, [jobspec("y", turn_key, forced = B)], switches = {"chunk": 2048}))
+    p.add(run_step("s13.t2.off.prep", 10, [fx()]))
+    p.add(run_step("s13.t2.off", 10, [jobspec("y", turn_key, forced = B)], forget = False))
+    p.add(run_step("s13.t2.on.prep", 10, [fx()], switches = on))
+    p.add(run_step("s13.t2.on", 10, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
+    # The disk tier shared with the next process: the first turn with the capture, then the close, which
+    # persists what is only in VRAM or RAM
+    p.add(gen_step("g1", 10, switches = on, disk = "s13"))
+    p.add(run_step("s13.disk", 10, [fx()], switches = on, keep_ckpt = keep("disk")))
+    p.add({"op": "ckpt_cmp", "id": "s13.ckpt", "scenario": 13,
+           "pairs": [["off2", "off1"], ["on2", "on1"], ["thread", "on1"], ["pipe", "on1"], ["disk", "on1"],
+                     ["on1", "off1"], ["long_off2", "long_off1"], ["long_on", "long_off1"]]})
+    p.add({"op": "close", "id": "s13.close", "scenario": 13})
+    p.add({"op": "disk_scan", "id": "s13.disk.scan", "scenario": 13, "disk": "s13"})
+    p.prompts = prompt_specs(p.steps, {turn_key: turn_spec})
+    procs.append(p)
+    pb = Proc(PB, "fork", [13], env = {"EXL3_DISK_CACHE_UNCACHE": "1"})
+    pb.add(gen_step("g0", 10, switches = on, disk = "s13"))
+    pb.add(run_step("s13.t2.restart", 10, [jobspec("y", turn_key, forced = B)], switches = on, forget = False))
+    pb.prompts = prompt_specs(pb.steps, {turn_key: turn_spec})
+    procs.append(pb)
+
+    off_floor = (ref(PA, "s13.off1", "x"), ref(PA, "s13.off2", "x"))
+    on_floor = (ref(PA, "s13.on1", "x"), ref(PA, "s13.on2", "x"))
+    meter = [(ref(PA, "s13.off1", "x"), ref(PA, "s13.c2048", "x"))]
+    lmeter = [(ref(PA, "s13.long.off1", "x"), ref(PA, "s13.long.c2048", "x"))]
+    tmeter = [(ref(PA, "s13.t2.full.free", "y"), ref(PA, "s13.t2.off", "y")),
+              (ref(PA, "s13.t2.full.free", "y"), ref(PA, "s13.t2.full.c2048", "y"))]
+    ck = ref(PA, "s13.ckpt", "")
+    comps += [
+        # The prompt's last chunk runs whole: the passes past the boundary are another shape, and the GDN
+        # scan goes on from the boundary's fp32 state instead of the fp16 one stored there, so only the
+        # noise of a different cut is expected; the meter is the same prompt with chunks of 2048
+        cmp(10, "s13.on", f"risposta imposta ({args.s13_answer} token) al documento di {prompt_spec_of(p13)['length']} "
+            "token: checkpoint preso dentro la passata contro taglio al confine",
+            ref(PA, "s13.on1", "x"), ref(PA, "s13.off1", "x"), expect = "noise", floor = off_floor, yards = meter,
+            drafts = False, requires = {"captured": True}),
+        cmp(10, "s13.on.rep", "la stessa con la cattura, ripetuta",
+            ref(PA, "s13.on2", "x"), ref(PA, "s13.on1", "x"), floor = off_floor, requires = {"captured": True}),
+        cmp(10, "s13.thread", "la cattura col prefill sul secondo thread, contro in linea",
+            ref(PA, "s13.thread", "x"), ref(PA, "s13.on1", "x"), floor = on_floor,
+            requires = {"captured": True, "thread": "on"}),
+        cmp(10, "s13.pipe", "la cattura con due pezzi in volo sulle due schede, contro in linea",
+            ref(PA, "s13.pipe", "x"), ref(PA, "s13.on1", "x"), floor = on_floor,
+            requires = {"captured": True, "pipeline": "on"}),
+        cmp(10, "s13.disk", "la cattura col tier su disco acceso, contro senza",
+            ref(PA, "s13.disk", "x"), ref(PA, "s13.on1", "x"), floor = on_floor, requires = {"captured": True}),
+        cmp(10, "s13.long", f"risposta imposta al documento di {prompt_spec_of(p13l)['length']} token (confine "
+            f"{args.s13_long_pages * 256 % args.chunk} token dentro l'ultimo pezzo): cattura contro taglio",
+            ref(PA, "s13.long.on", "x"), ref(PA, "s13.long.off1", "x"), expect = "noise",
+            floor = (ref(PA, "s13.long.off1", "x"), ref(PA, "s13.long.off2", "x")), yards = lmeter, drafts = False,
+            requires = {"captured": True}),
+        cmp(10, "s13.t2.full", "turno dopo da capo, ripetuto", ref(PA, "s13.t2.full.ref2", "y"),
+            ref(PA, "s13.t2.full.free", "y"), floor = None),
+        cmp(10, "s13.t2", "turno dopo ripreso dal checkpoint catturato contro ripreso da quello di upstream",
+            ref(PA, "s13.t2.on", "y"), ref(PA, "s13.t2.off", "y"), expect = "noise", yards = tmeter, drafts = False,
+            requires = {"resumed": True, "same_resume": ref(PA, "s13.t2.off", "y")}),
+        cmp(10, "s13.t2.restart", "turno dopo ripreso dal checkpoint catturato letto dal disco in un processo nuovo, "
+            "contro lo stesso ripreso dalla RAM",
+            ref(PB, "s13.t2.restart", "y"), ref(PA, "s13.t2.on", "y"), floor = None,
+            requires = {"resumed": True, "same_resume": ref(PA, "s13.t2.on", "y")}),
+        {"kind": "ckpt", "scenario": 13, "id": "s13.ckpt.repeat", "rec": ck,
+         "label": "i checkpoint dello stesso giro ripetuto, e della cattura sul thread, coi pezzi in volo e col disco",
+         "pairs": [["off2", "off1"], ["on2", "on1"], ["thread", "on1"], ["pipe", "on1"], ["disk", "on1"],
+                   ["long_off2", "long_off1"]], "expect": "identical"},
+        {"kind": "ckpt", "scenario": 13, "id": "s13.ckpt.capture", "rec": ck,
+         "label": "il checkpoint catturato contro quello preso dopo il taglio",
+         "pairs": [["on1", "off1"], ["long_on", "long_off1"]], "expect": "info",
+         "passes": [(ref(PA, "s13.on1", "x"), ref(PA, "s13.off1", "x")),
+                    (ref(PA, "s13.long.on", "x"), ref(PA, "s13.long.off1", "x"))]},
+        {"kind": "crc", "scenario": 13, "id": "s13.disk.crc", "label": "file delle pagine scritti dal tier su disco integri (CRC)",
+         "test": ref(PA, "s13.disk.scan", ""), "ref": ref(PA, "s13.disk.scan", "")},
+        {"kind": "resume", "scenario": 13, "id": "s13.resume",
+         "runs": [("ripreso dal checkpoint catturato (RAM)", ref(PA, "s13.t2.on", "y")),
+                  ("ripreso dal checkpoint catturato dopo il riavvio (disco)", ref(PB, "s13.t2.restart", "y")),
+                  ("ripreso come upstream", ref(PA, "s13.t2.off", "y")),
+                  ("da capo", ref(PA, "s13.t2.full.free", "y"))]},
+        {"kind": "library", "scenario": 13, "id": "s13.library", "procs": {PA: "fork", PB: "fork"}},
+    ]
 
 
 def parse_windows_list(text: str) -> list:
@@ -1607,6 +1744,8 @@ def estimate_plan(plan: dict, args) -> dict:
                 t = st["minutes"] * 60.0 + 180.0
             elif op == "reset_hist":
                 t = 1.0
+            elif op == "ckpt_cmp":
+                t = 10.0
             secs[s] = secs.get(s, 0.0) + t
         # The load is charged to the process's first scenario
         first = proc["scenarios"][0]
@@ -1914,6 +2053,11 @@ def requirement_problems(req: dict, rec: dict, job: str, res: Results) -> list:
                    "o nessuno doveva generare accanto")
     if req.get("tail_stashes") and not (stats.get("tail") or {}).get("stashes"):
         out.append("nessun checkpoint di coda preso")
+    if req.get("captured"):
+        cap = stats.get("capture") or {}
+        if not cap.get("captured"):
+            out.append("nessun checkpoint preso dentro la passata" +
+                       (f" ({cap['incomplete']} catture incomplete)" if cap.get("incomplete") else ""))
     # The MTP decode's switches (the fork's counters, the run's difference)
     verify, update, window = (stats.get(k) or {} for k in ("verify", "update", "window"))
     if req.get("verify_windows") and not verify.get("windows"):
@@ -2263,6 +2407,75 @@ def evaluate_stress(c: dict, res: Results) -> dict:
     return row
 
 
+def ckpt_pair(rec: dict | None, a: str, b: str) -> dict | None:
+    for pr in (rec or {}).get("pairs") or []:
+        if pr.get("a") == a and pr.get("b") == b:
+            return pr
+    return None
+
+
+def prefill_passes(rec: dict | None, job: str) -> int | None:
+    """Prefill results of a job in a run: one per chunk the library recorded for it (in line, one chunk a
+    job per iteration)"""
+    j = job_view(rec, job)
+    return None if j is None else len(j.get("prefill") or [])
+
+
+def evaluate_ckpt(c: dict, res: Results) -> dict:
+    """
+    Scenario 13: kept checkpoints compared tensor by tensor in the child (ckpt_cmp). `identical` pairs must
+    be bit for bit the same; `info` pairs (the captured checkpoint against upstream's) are reported, and
+    judged only on what must hold whatever the rounding: the same position and page, the same layers,
+    shapes and dtypes, the same token ids (PLE). `passes`: (test run, reference run) pairs whose job must
+    have had one prefill pass fewer with the capture.
+    """
+    row = {"id": c["id"], "scenario": c["scenario"], "label": c["label"], "expect": c.get("expect", "identical"), "notes": []}
+    rec = res.rec(c["rec"])
+    if rec is None or not rec.get("ok"):
+        row.update(verdict = ERR, why = "manca il confronto dei checkpoint")
+        return row
+    problems, rows = [], []
+    for a, b in c["pairs"]:
+        pr = ckpt_pair(rec, a, b)
+        if pr is None or pr.get("missing"):
+            problems.append(f"{a} / {b}: manca " + (", ".join(pr["missing"]) if pr else "il confronto"))
+            continue
+        pa, pb = pr.get("position") or [None, None]
+        if pa != pb:
+            problems.append(f"{a} / {b}: posizioni {pa} e {pb}")
+        if not pr.get("same_key"):
+            problems.append(f"{a} / {b}: pagine diverse")
+        if not pr.get("same_layers"):
+            problems.append(f"{a} / {b}: strati diversi")
+        for r in pr.get("rows") or []:
+            if not r.get("shape_dtype"):
+                problems.append(f"{a} / {b}: {r['kind']}[{r['index']}] di forma o tipo diversi")
+            elif r["dtype"] in ("int64", "int32") and r["identical"] != r["tensors"]:
+                problems.append(f"{a} / {b}: {r['kind']}[{r['index']}] (id dei token) diversi")
+            rows.append([f"{a} / {b}", f"{r['kind']}[{r['index']}]", r["dtype"], r["tensors"],
+                         f"{r['identical']} / {r['tensors']}",
+                         "-" if r["dtype"].startswith("int") else f"{r['max_abs']:.3g}",
+                         "-" if r["dtype"].startswith("int") else f"{r['max_ref']:.3g}"])
+        if c.get("expect") == "identical" and not pr.get("identical"):
+            problems.append(f"{a} / {b}: non identici")
+    row["table"] = rows
+    passes = []
+    for test, refr in c.get("passes") or []:
+        nt, nr = prefill_passes(res.rec(test), test["job"]), prefill_passes(res.rec(refr), refr["job"])
+        passes.append(f"`{test['run']}` {nt if nt is not None else '-'} contro `{refr['run']}` {nr if nr is not None else '-'}")
+        if nt is None or nr is None:
+            problems.append(f"manca un giro tra {test['run']} e {refr['run']}")
+        elif nt != nr - 1:
+            problems.append(f"passate di prefill di `{test['run']}` {nt}, di `{refr['run']}` {nr}: attesa una in meno")
+    if passes:
+        row["notes"].append("Passate di prefill registrate per il documento (una per pezzo): " + "; ".join(passes) + ".")
+    if problems:
+        row.update(verdict = FAIL if c.get("expect") == "info" else DIFF, why = "; ".join(problems))
+    else:
+        row["verdict"] = IDENT if c.get("expect") == "identical" else INFO
+    return row
+
+
 def evaluate_resume(c: dict, res: Results) -> dict:
     row = {"id": c["id"], "scenario": c["scenario"], "label": "da dove riparte il turno dopo", "expect": "info", "verdict": INFO, "notes": []}
     rows = []
@@ -2313,6 +2526,7 @@ def evaluate_raw_tail(c: dict, res: Results) -> dict:
 EVALUATORS = {
     "probs": evaluate_probs, "crc": evaluate_crc, "placement": evaluate_placement, "tokens": evaluate_tokens,
     "cancel": evaluate_cancel, "stress": evaluate_stress, "resume": evaluate_resume, "raw_tail": evaluate_raw_tail,
+    "ckpt": evaluate_ckpt,
 }
 
 
@@ -2350,6 +2564,7 @@ SWITCHES_OFF = {
     "mm_content_hash": False, "mm_content_digests": False,
     # The decode step's host fast path (EXL3_HOST_FASTPATH, read at import by the modules that have one)
     "host_fastpath": False,
+    "recurrent_checkpoint_in_pass": False,
 }
 
 
@@ -2631,6 +2846,19 @@ SCENARIO_TEXT = {
         "forme (gli stessi token con W fisso contro W=1, quello dello scenario 9) e il metro del batch (`a` da solo contro "
         "`a` accanto a `b`). Ogni giro due volte in `base`: il pavimento. Errore se il processo di prova non aveva le "
         "variabili o quello di riferimento ne aveva qualcuna.",
+    13: "Il checkpoint ricorrente dell'ultima pagina del prompt preso dentro la passata (`recurrent_checkpoint_in_pass`, "
+        "`EXL3_RECURRENT_CHECKPOINT_IN_PASS`): ogni strato con stato ricorrente ne copia lo stato al confine mentre la "
+        "passata prosegue, dove upstream taglia il pezzo al confine e fa una passata in più per i token dopo. Un "
+        "processo del fork, due documenti il cui ultimo confine di pagina cade dentro l'ultimo pezzo, le risposte "
+        "imposte coi due modi, i checkpoint stessi confrontati tensore per tensore, il turno dopo ripreso dall'uno e "
+        "dall'altro, e dal checkpoint catturato riletto dal tier su disco da un secondo processo. La cattura contro "
+        "il taglio è attesa solo **entro il rumore**: l'ultimo pezzo gira intero (passate di un'altra forma, e la "
+        "scansione GDN prosegue dallo stato fp32 al confine invece che da quello fp16 salvato lì), come quando "
+        "cambia la misura dei pezzi; il metro è lo stesso prompt con pezzi di 2048. Attesi **identici**: la cattura "
+        "ripetuta, sul thread di prefill, con due pezzi in volo e col tier su disco acceso (stessi checkpoint bit per "
+        "bit: le copie prese su un altro thread arrivano intere al record), e il turno ripreso dal disco contro "
+        "quello ripreso dalla RAM. Il confronto dei checkpoint catturati con quelli di upstream è informativo, "
+        "ma deve tenere posizione, pagina, strati, forme, tipi e id dei token, con una passata di prefill in meno.",
 }
 
 # Scenario 9's sub-tables: (group, title, what it compares, the verdict expected and why)
@@ -2845,6 +3073,12 @@ def scenario_section(s: int, plan: dict, res: Results, rows: list) -> list:
         elif kind == "resume":
             out += [f"**{r['label']}**", "", table(["turno", "token del prompt", "ripresi", "da rileggere", "da un checkpoint di coda",
                                                    "secondi al primo token"], r.get("table") or []), ""]
+        elif kind == "ckpt":
+            out += [headline(r), ""]
+            if r.get("table"):
+                out += [table(["coppia", "stato", "tipo", "tensori", "identici", "differenza massima",
+                               "valore massimo del riferimento"], r["table"]), ""]
+            out += [n for n in r.get("notes") or []] + ([""] if r.get("notes") else [])
         elif kind == "raw_tail":
             out += [headline(r), ""]
             if r.get("table"):
@@ -3656,7 +3890,8 @@ def parse_cli(argv: list | None = None):
                     help = "scenari da eseguire, es. 1,2 (default dall'1 al 7; a richiesta l'8, l'anello delle chiavi grezze "
                            "del QSA, il 9, la combinazione di produzione con la decodifica MTP nuova, il 10, più esperti "
                            "in streaming nei pezzi di prompt accanto al decode, l'11, il lavoro dell'host del passo di "
-                           "decode tenuto fra le chiamate, e il 12, i kernel MoE del decode con le variabili di --s12-env)")
+                           "decode tenuto fra le chiamate, il 12, i kernel MoE del decode con le variabili di --s12-env, "
+                           "e il 13, il checkpoint ricorrente preso dentro la passata)")
     ap.add_argument("--dry-run", action = "store_true", help = "stampa il piano, i controlli e la stima, non carica niente")
     ap.add_argument("--out", default = None, help = "cartella del giro (default ./exact-check-AAAAMMGG-HHMMSS)")
     ap.add_argument("--keep", action = "store_true", help = "non cancellare la cache su disco del giro alla fine")
@@ -3727,6 +3962,14 @@ def parse_cli(argv: list | None = None):
     ap.add_argument("--s12-window", type = int, default = 3,
                     help = "bozze MTP dello scenario 12 (--draft-num-tokens, W fisso; anche W=1 sulle stesse cache)")
     ap.add_argument("--s12-tokens", type = int, default = 192, help = "token imposti per job nello scenario 12")
+    ap.add_argument("--s13-pages", type = int, default = 50,
+                    help = "pagine intere del primo documento dello scenario 13 (il confine cade nell'ultimo pezzo)")
+    ap.add_argument("--s13-last", type = int, default = 99, help = "token dopo l'ultimo confine di pagina nel primo documento")
+    ap.add_argument("--s13-long-pages", type = int, default = 63, help = "pagine intere del secondo documento")
+    ap.add_argument("--s13-long-last", type = int, default = 200, help = "token dopo l'ultimo confine nel secondo documento")
+    ap.add_argument("--s13-answer", type = int, default = 256, help = "token della risposta imposta al primo documento")
+    ap.add_argument("--s13-long-answer", type = int, default = 64, help = "token della risposta imposta al secondo documento")
+    ap.add_argument("--s13-next", type = int, default = 32, help = "token del turno dopo nello scenario 13")
     ap.add_argument("--s6-rounds", type = int, default = 4)
     ap.add_argument("--s6-tokens", type = int, default = 160)
     ap.add_argument("--s7-minutes", type = float, default = 10.0)
@@ -3771,6 +4014,12 @@ def parse_cli(argv: list | None = None):
     if args.s12_window < 1 or len(S12_JOBS["ab"]) * (1 + args.s12_window) > S12_MAX_ROWS:
         ap.error(f"--s12-window: da 1 a {S12_MAX_ROWS // 2 - 1} (due job di 1 + W righe nel percorso del decode, "
                  f"{S12_MAX_ROWS} righe al più)")
+    for name, pages, last in (("--s13-pages/--s13-last", args.s13_pages, args.s13_last),
+                              ("--s13-long-pages/--s13-long-last", args.s13_long_pages, args.s13_long_last)):
+        # The boundary at pages * 256 must fall strictly inside a chunk of --chunk tokens (chunks start on
+        # multiples of it from the prompt's start): at a chunk's end there is nothing to capture
+        if not 1 <= last <= 255 or pages < 1 or (pages * 256) % args.chunk == 0:
+            ap.error(f"{name}: il confine di pagina deve cadere dentro un pezzo di --chunk, e da 1 a 255 token dopo")
     return args
 
 

@@ -846,6 +846,8 @@ class Child:
         # The CPU expert hosts' streaming thresholds as the process made them, for the runs
         # that change them (scenario 10): (host index, card) -> the card's own threshold
         self.stream_t_base = {}
+        # Checkpoints kept by a run (keep_ckpt) for a later ckpt_cmp: tag -> host copy
+        self.kept = {}
 
     # ---------------------------------------------------------------- records
     def write(self, rec: dict):
@@ -1015,7 +1017,8 @@ class Child:
         params = inspect.signature(Generator.__init__).parameters
         for key, arg in (("stagger", "stagger_decode"), ("thread", "prefill_thread"), ("pipeline", "prefill_pipeline"),
                          ("tail", "recurrent_tail_checkpoint"), ("verify", "mtp_batched_verify"),
-                         ("update", "mtp_batched_update"), ("window", "draft_window")):
+                         ("update", "mtp_batched_update"), ("window", "draft_window"),
+                         ("ckpt", "recurrent_checkpoint_in_pass")):
             if sw.get(key):
                 if arg not in params:
                     raise RunError(f"questa libreria non ha Generator({arg})")
@@ -1055,11 +1058,12 @@ class Child:
         self.gen_base = {"stagger": getattr(gen, "stagger_decode", False), "thread": getattr(gen, "prefill_thread", False),
                          "pipeline": getattr(gen, "prefill_pipeline", False),
                          "tail": getattr(gen, "tail_checkpoint_interval", 0), "chunk": gen.max_chunk_size,
-                         "stagger_min_jobs": getattr(gen, "stagger_min_jobs", None)}
+                         "stagger_min_jobs": getattr(gen, "stagger_min_jobs", None),
+                         "ckpt": getattr(gen, "recurrent_checkpoint_in_pass", False)}
         state = {}
         for name in ("stagger_decode", "prefill_thread", "prefill_pipeline", "tail_checkpoint_interval",
                      "mtp_batched_verify", "mtp_batched_update", "draft_window", "draft_window_schedule",
-                     "mm_content_hash"):
+                     "mm_content_hash", "recurrent_checkpoint_in_pass"):
             if hasattr(gen, name):
                 state[name] = getattr(gen, name)
         # The embeddings' content digests: process-wide, and left on by a generator made with mm_content_hash
@@ -1118,6 +1122,11 @@ class Child:
             gen.tail_checkpoint_interval = tail if gen.recurrent_cache is not None else 0
         elif tail:
             raise RunError("questa libreria non ha il checkpoint di coda")
+        ckpt = bool(sw.get("ckpt", base.get("ckpt", False)))
+        if hasattr(gen, "recurrent_checkpoint_in_pass"):
+            gen.recurrent_checkpoint_in_pass = ckpt
+        elif ckpt:
+            raise RunError("questa libreria non ha il checkpoint ricorrente dentro la passata")
         gen.max_chunk_size = int(sw.get("chunk") or base["chunk"])
         if base.get("stagger_min_jobs") is not None:
             gen.stagger_min_jobs = int(sw.get("stagger_min_jobs") or base["stagger_min_jobs"])
@@ -1194,7 +1203,8 @@ class Child:
     def stats(self) -> dict:
         gen = self.gen
         out = {}
-        for key, attr in (("side", "side_stats"), ("stagger", "stagger_stats"), ("tail", "tail_stats")):
+        for key, attr in (("side", "side_stats"), ("stagger", "stagger_stats"), ("tail", "tail_stats"),
+                          ("capture", "recurrent_capture_stats")):
             v = getattr(gen, attr, None)
             if isinstance(v, dict):
                 out[key] = dict(v)
@@ -1246,6 +1256,7 @@ class Child:
                 out[key] = None
         out["stagger"] = bool(getattr(gen, "stagger_decode", False))
         out["tail"] = getattr(gen, "tail_checkpoint_interval", None)
+        out["ckpt"] = getattr(gen, "recurrent_checkpoint_in_pass", None)
         out["head_first"] = getattr(gen, "_pipe_head_first", None)
         hosts = self.moe_hosts()
         if any(getattr(h, "beside_stats", None) is not None for h in hosts):
@@ -1378,6 +1389,92 @@ class Child:
         rec["ok"] = True
         return rec
 
+    # ---------------------------------------------------------------- checkpoints
+    def keep_checkpoint(self, keep: dict, rec: dict) -> dict:
+        """
+        After a run: a host copy of the recurrent checkpoint at the last page boundary of a job's prompt
+        (the one Job._prefill_co takes after the prompt's last pass, or inside it with
+        recurrent_checkpoint_in_pass), from the generator's checkpoint cache in RAM, kept under keep["tag"]
+        for a later ckpt_cmp. The run forgot every earlier checkpoint first (forget), so the most recent
+        one at that position is this run's.
+        """
+        torch = self.torch
+        gen = self.gen
+        tag, job = keep["tag"], keep["job"]
+        out = {"tag": tag, "job": job, "found": False}
+        jv = (rec.get("jobs") or {}).get(job) or {}
+        n = jv.get("prompt_tokens")
+        rc = getattr(gen, "recurrent_cache", None)
+        if not n or rc is None:
+            out["why"] = "nessun prompt o nessuna cache dei checkpoint"
+            return out
+        pos = (int(n) - 1) // 256 * 256
+        out["position"] = pos
+        hits = [(k, v) for k, v in rc.items() if isinstance(v, dict) and v.get("position") == pos]
+        out["candidates"] = len(hits)
+        if not hits:
+            out["why"] = f"nessun checkpoint in RAM alla posizione {pos}"
+            return out
+        key, stashed = hits[-1]
+        target = stashed.get("target") or {}
+        layers = self.container.cache.get_all_recurrent_layers()
+        copy, digest = {}, hashlib.sha1()
+        with torch.inference_mode():
+            for lk in layers:
+                ts = target.get(lk)
+                if ts is None:
+                    continue
+                ts = tuple(t.detach().to("cpu").clone() for t in ts)
+                copy[lk] = ts
+                for t in ts:
+                    digest.update(self._tensor_bytes(t))
+        self.kept[tag] = {"key": key, "position": stashed.get("position"), "tail": bool(stashed.get("tail")),
+                          "layers": copy, "classes": {lk: type(l).__name__ for lk, l in layers.items()}}
+        out.update(found = True, key = key.hex()[:16] if isinstance(key, (bytes, bytearray)) else str(key)[:16],
+                   layers = len(copy), missing = len(layers) - len(copy), sha1 = digest.hexdigest()[:16],
+                   tail = bool(stashed.get("tail")))
+        return out
+
+    def ckpt_cmp(self, step: dict) -> dict:
+        """Two kept checkpoints tensor by tensor: per kind of layer state and tensor, how many are
+        bit for bit the same and the largest difference, against the largest magnitude"""
+        torch = self.torch
+        rec = {"op": "ckpt_cmp", "id": step["id"], "scenario": step.get("scenario"), "ok": True, "pairs": []}
+        for a, b in step["pairs"]:
+            ka, kb = self.kept.get(a), self.kept.get(b)
+            pr = {"a": a, "b": b}
+            if ka is None or kb is None:
+                pr["missing"] = [t for t, k in ((a, ka), (b, kb)) if k is None]
+                rec["pairs"].append(pr)
+                continue
+            pr["position"] = [ka["position"], kb["position"]]
+            pr["same_key"] = ka["key"] == kb["key"]
+            pr["same_layers"] = sorted(map(str, ka["layers"])) == sorted(map(str, kb["layers"]))
+            rows = {}
+            for lk, ta in ka["layers"].items():
+                tb = kb["layers"].get(lk)
+                cls = ka["classes"].get(lk, "?")
+                for i, x in enumerate(ta):
+                    r = rows.setdefault(f"{cls}[{i}]", {"kind": cls, "index": i, "tensors": 0, "identical": 0,
+                                                       "shape_dtype": True, "max_abs": 0.0, "max_ref": 0.0,
+                                                       "dtype": str(x.dtype).replace("torch.", ""), "numel": 0})
+                    r["tensors"] += 1
+                    r["numel"] += x.numel()
+                    y = tb[i] if tb is not None and i < len(tb) else None
+                    if y is None or y.shape != x.shape or y.dtype != x.dtype:
+                        r["shape_dtype"] = False
+                        continue
+                    if torch.equal(x, y):
+                        r["identical"] += 1
+                    if x.is_floating_point():
+                        xd, yd = x.double(), y.double()
+                        r["max_abs"] = max(r["max_abs"], float((xd - yd).abs().max()) if x.numel() else 0.0)
+                        r["max_ref"] = max(r["max_ref"], float(yd.abs().max()) if x.numel() else 0.0)
+            pr["rows"] = list(rows.values())
+            pr["identical"] = pr["same_layers"] and all(r["shape_dtype"] and r["identical"] == r["tensors"] for r in rows.values())
+            rec["pairs"].append(pr)
+        return rec
+
     # ---------------------------------------------------------------- the steps
     def step(self, st: dict, x):
         op = st["op"]
@@ -1395,6 +1492,8 @@ class Child:
             rec = Runner(x).run(st)
             if rec.get("fatal"):
                 self.broken = rec.get("error")
+            elif rec.get("ok") and st.get("keep_ckpt"):
+                rec["ckpt"] = self.keep_checkpoint(st["keep_ckpt"], rec)
             return rec
         if op == "stress":
             rec = run_stress(x, st)
@@ -1407,6 +1506,8 @@ class Child:
             return self.reset_hist(st)
         if op == "sweep":
             return self.sweep(st)
+        if op == "ckpt_cmp":
+            return self.ckpt_cmp(st)
         raise RunError(f"operazione sconosciuta {op}")
 
     def main(self) -> int:

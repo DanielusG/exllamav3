@@ -930,6 +930,82 @@ idle flush and the flag through a new process; upstream's `rekey`; the generator
 offer beside a group in flight and a chunk under way; the switch). Marked `nogpu`; run with
 `--noconftest` without the compiled extension.
 
+### The prompt's last-page checkpoint taken inside the pass (`Generator(recurrent_checkpoint_in_pass = True)`, `EXL3_RECURRENT_CHECKPOINT_IN_PASS=1`)
+
+Off by default; with it off the generator behaves as upstream. Branch `ckpt-in-pass`, not merged:
+this is the first case of a piece of work (the prompt's last page only), to be judged before the
+same is done for the interval checkpoints and for the pipeline's planning (below).
+
+**What upstream does.** A recurrent checkpoint is a copy of the state at a page boundary, and a
+layer's state is whole only where a pass ends. So `Job._prefill_co` ends a chunk at the prompt's
+last page boundary, and the tokens past it (under a page) are a pass of their own: every prompt of
+a recurrent model, and every turn of a conversation, is ingested in one pass more than its chunks.
+On Qwen3.8-Flash-Next in layer split with the CPU expert worker that pass reads every layer's
+weights, waits for the worker in every MoE layer and crosses from one card to the other, for under
+256 tokens.
+
+**What the switch does.** When the boundary falls strictly inside a chunk the chunk is not cut:
+`_prefill_co` puts a `RecurrentCapture` (`cache/recurrent_capture.py`) in the chunk's params, every
+recurrent layer copies its state at the boundary while the pass goes on, and the chunk's record
+stashes the copies (`Job.stash_captured`) under the boundary page's hash, in the format of a regular
+stash: the same tensors, shapes and dtypes, so the checkpoint cache, the tail checkpoint
+(`_stash_with_tail` takes the state to stash) and the disk tier take it as they take one today.
+A chunk that ends at the boundary needs nothing and is left as it is.
+
+- *GDN* (`GatedDeltaNet`, KDA included): the conv window is the `conv_kernel_size` inputs before the
+  boundary (`gated_delta_net_fn.conv_window`: what the conv's state write leaves after a pass ending
+  there, the inputs converted to the pool's bf16); the scan already runs in sub-ranges of
+  `EXL3_GDN_SUB_CHUNK` (`_chunked_scan`), and ends one at the boundary (`_scan_ranges`) to hand the
+  fp32 state there to the layer, which stores it as the pool does (fp16 by default). Up to the
+  boundary the sub-ranges are those of a pass that ends there.
+- *PLE* (`PLELayer`): the fast path (`ple_forward_streams`) ends a row slab at the boundary (the slabs
+  up to it are those of a pass that ends there) and the layer copies the conv window there and the
+  token-id context; the op-by-op path slices its column stream.
+
+So, given the same inputs, each layer's copy is bit for bit the state a pass ending at the boundary
+stores (`tests/kernels/recurrent/test_recurrent_capture_cuda.py`, on the card). The inputs are not
+the same end to end: the chunk's passes are of another shape (n rows instead of c and n - c, and
+the GEMMs' and the MoE's sums depend on the row count in their last bits), and after the boundary the
+scan goes on from the fp32 state where upstream's next pass starts from the fp16 one in the pool. A
+checkpoint taken this way differs from upstream's as two cuts of a prompt differ (a chunk size of
+2048 against 4096); the exact check's scenario 13 measures by how much.
+
+A capture that a recurrent layer did not take (`RecurrentCapture.complete`) is not stashed: the next
+turn resumes from an earlier checkpoint, as when the checkpoint cache has let this one go
+(`recurrent_capture_stats["incomplete"]`, one warning). It does not happen with the layers above,
+whose chunked scans run for any pass of a page or more.
+
+When it applies (`Job.can_capture_recurrent`, `Generator._capture_unavailable`): a job of one
+sequence without embeddings (an image span moves the chunk's ends); every recurrent module of the
+model declaring `captures_recurrent_state` (GDN and PLE; not Mamba2: a model with one keeps
+upstream's cut, and the generator names the classes when it is made); no recurrent state on the
+draft side (an MTP head has none); no tensor parallelism (the states live in the rank processes).
+The generator's line at creation says `on` or why not; `gen.recurrent_checkpoint_in_pass` is read
+for every chunk, so it can be switched while jobs run. GDN's fused graph step (`bc_split`) is not
+taken by a pass with a capture (never the case: such a pass is longer than a page).
+
+**With the other fork features.** On the prefill thread and in the pipeline the copies are made on
+the thread that issues the layer, in the stream order of its passes; the record runs after the
+chunk's lane is synchronized (in the pipeline, after the chunk's last piece, which the first card's
+half precedes by an event), so the host copies read complete tensors, and the capture's buffers are
+released only after them. The pipeline still treats the prompt's last page as a position where a
+chunk has to end for the state to be whole (`_pipe_ahead` does not plan a chunk past it): the
+prompt's last two chunks still go one at a time. Taking the interval checkpoints
+(`recurrent_checkpoint_interval`, `_pp`) inside the passes too, and letting the pipeline plan across
+them, is the next step.
+
+**Cost.** Per prompt: the copies, on the cards, held from each layer's pass to the record: the
+checkpoint's size, 57 MiB on Flash-Next in fp16, spread over the cards by layer (with production's
+split 18 of the 36 GDN layers are on each card: about 28 MiB each), on top of the last chunk's
+activations; the record's host copies are the regular stash's. The pass saved: not measured on the cards yet.
+
+Tests: `tests/test_recurrent_capture.py` (no GPU, no extension: the scan split on the torch
+reference; stand-in recurrent modules in the real generator and job, in line, on the prefill
+thread and in the pipeline: one pass instead of two and the same checkpoint, the next turn resumed
+from it, an incomplete capture, the conditions, the modules that declare the capture),
+`tests/kernels/recurrent/test_recurrent_capture_cuda.py` (on the card: the scan's state and output
+rows, the conv window on each conv path, the PLE stream), the exact check's scenario 13.
+
 ### Expert placement that follows the decode (`EXL3_MOE_HIST_PREFILL_WEIGHT`)
 
 Off by default: at the default weight, 1, nothing of it runs and the placement is upstream's,
@@ -2401,6 +2477,7 @@ request (`--scenarios 10`): (10) more of a chunk's experts streamed while a deco
 workload, expected identical everywhere (about 10 minutes, two loads; "The decode step's host work,
 kept between calls", above). On request (`--scenarios 12`): (12) the decode MoE kernels under the
 environment of `--s12-env`, below.
+On request (`--scenarios 13`): (13) the prompt's last-page checkpoint taken inside the pass, below.
 
 **Scenario 9, the production combination** (`--scenarios 9`, about 17 minutes by the estimate: two
 loads, 78 runs, 87 comparisons). The MTP head drafting `--s9-window` tokens (3; the processes start
@@ -2475,6 +2552,24 @@ one. What it cannot tell: rows above 8 (the fused prefill tier, which the coop k
 a decode step with W = 0 (one row: kernel A rotates its input in every block, another path), and
 the staggered decode's groups (the same kernels at their groups' row counts).
 
+**Scenario 13, the last-page checkpoint taken inside the pass** (`--scenarios 13`, about 12 minutes
+by the estimate: two loads, 24 runs). In one process, two documents whose last page boundary falls
+inside their last chunk (`--s13-pages`/`--s13-last`: 12900 tokens, the boundary 512 tokens into a
+chunk of 611; `--s13-long-pages`/`--s13-long-last`: 16329 tokens, 3840 into a chunk of 4040), their
+forced answers with upstream's cut (twice) and with the capture (`gen.recurrent_checkpoint_in_pass`
+switched per run), the same with chunks of 2048 (the meter), the capture on the prefill thread and
+with two chunks in flight, and the next turn resumed from each checkpoint; then a generator with the
+disk tier, the first turn with the capture, the close; a second process resumes the next turn from
+the captured checkpoint read back from the disk. After each kept run the child copies the checkpoint
+at the prompt's last page boundary out of the checkpoint cache (`keep_ckpt`), and compares them
+tensor by tensor (`ckpt_cmp`). Expected within the noise (against the meter): the capture against the
+cut, for both documents and for the next turn. Expected identical: the capture repeated, on the thread,
+in flight and with the disk tier on (logits and checkpoints: the copies made on another thread reach
+the record whole), and the next turn from the disk against the one from RAM. The captured checkpoints
+against upstream's are reported per kind of layer state (the largest difference, against the largest
+value), and must keep the position, the page, the layers, the shapes, the dtypes and the token ids
+(PLE), with one prefill pass fewer for the document.
+
 **The switches.** A switch of this branch left off in a process with every switch off must read as
 off: the bookkeeping (`SWITCHES_OFF`, the child's `switches_state`) holds the MTP decode switches
 (`mtp_batched_verify`, `mtp_batched_update` off), the draft window (`"fixed"`, upstream's) and the
@@ -2487,8 +2582,10 @@ for content-addressed multimodal pages: `mm_content_hash` (the generator's switc
 others. No scenario turns it on: the check's prompts are text, whose pages hash the same either way.
 The host fast path too: `host_fastpath` (what the workspace cache's module read at import) must read
 off, and `EXL3_HOST_FASTPATH` is removed with the others; scenario 11 sets it in one of its two
-processes and warns when either did not read what it was given. Scenario 1 with every switch off
-reports nothing about switches (`tests/test_exact_check.py`).
+processes and warns when either did not read what it was given. The recurrent checkpoint in pass
+too: `recurrent_checkpoint_in_pass` must read off and `EXL3_RECURRENT_CHECKPOINT_IN_PASS` is removed
+with the others (scenario 13 turns it on per run). Scenario 1 with every switch off reports nothing
+about switches (`tests/test_exact_check.py`).
 
 What is pinned: `EXL3_MOE_STREAM_FUSED_T=0 EXL3_MOE_RECON_DET=1 EXL3_MOE_FUSED_DET=1` (the MoE paths
 whose sums depend on the arrival order of atomics; read on 1.6.2's sources, the same in 1.6.3) in
